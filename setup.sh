@@ -40,13 +40,48 @@ echo "==> Step 1/5: Configure environment"
 cd backend && python3 -m src.cli.setup_env
 cd ..
 
-# Step 2: Install Python dependencies
+# Step 2: Install Python dependencies from the tracked lock (backend/uv.lock).
+# uv is pinned in lockstep with backend/pyproject.toml [tool.uv]
+# required-version, CI and backend/Dockerfile (#1706); a different uv refuses
+# to run in backend/, so install exactly this one when none is present.
 echo ""
-echo "==> Step 2/5: Install Python dependencies"
-cd backend && pip install -e ".[dev]"
+echo "==> Step 2/5: Install Python dependencies (uv sync --locked)"
+UV_REQUIRED="0.11.19"
+if ! command -v uv >/dev/null 2>&1 || [ "$(uv --version 2>/dev/null | awk '{print $2}')" != "$UV_REQUIRED" ]; then
+  # Project-local install: a machine-wide uv of another version is left alone
+  # (no silent downgrade, no shell rc edits), and this script uses the pinned
+  # one from backend/.uv-bin. backend/.dockerignore and .gitignore skip it.
+  command -v curl >/dev/null 2>&1 || {
+    echo "✗ curl not found: it is needed to install uv ${UV_REQUIRED}."
+    echo "  Install curl, or install uv yourself (pip install \"uv==${UV_REQUIRED}\" inside a venv) and re-run."
+    exit 1
+  }
+  echo "Installing uv ${UV_REQUIRED} (the pinned version) into backend/.uv-bin..."
+  curl -LsSf "https://astral.sh/uv/${UV_REQUIRED}/install.sh" \
+    | env UV_INSTALL_DIR="$PWD/backend/.uv-bin" UV_NO_MODIFY_PATH=1 sh
+  export PATH="$PWD/backend/.uv-bin:$PATH"
+  echo "Later 'uv' commands in backend/ need this version too: put backend/.uv-bin on PATH,"
+  echo "or install uv ${UV_REQUIRED} for your user (curl -LsSf https://astral.sh/uv/${UV_REQUIRED}/install.sh | sh)."
+fi
+cd backend && uv sync --locked --extra dev
 cd ..
-echo "Installing kagura-memory SDK..."
-pip install kagura-memory
+echo "Backend dependencies are in backend/.venv (activate it, or run commands with 'uv run')."
+# The SDK is a command-line tool for you, not a backend dependency: install it
+# as a uv tool (its own environment, `kagura` on PATH) so it lands in a known
+# place — a bare `pip` would target whichever interpreter is first on PATH —
+# and so a later `uv sync` does not remove it from backend/.venv.
+# --upgrade makes a second run of this script succeed when the tool is already
+# installed. uv's tool bin directory is put on PATH for the rest of this
+# script; `uv tool update-shell` makes that permanent for your shell.
+echo "Installing kagura-memory SDK (uv tool install)..."
+uv tool install --upgrade kagura-memory
+UV_TOOL_BIN="$(uv tool dir --bin)"
+export PATH="$UV_TOOL_BIN:$PATH"
+if ! command -v kagura >/dev/null 2>&1; then
+  echo "✗ kagura was installed to $UV_TOOL_BIN but is not callable."
+  exit 1
+fi
+echo "kagura is in $UV_TOOL_BIN. If that directory is not on your PATH yet, run: uv tool update-shell"
 
 # Check for port conflicts before starting services
 echo ""
