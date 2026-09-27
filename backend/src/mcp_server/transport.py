@@ -25,11 +25,13 @@ from mcp_server.auth import (
     get_mcp_oauth_scopes,
 )
 from mcp_server.session import get_session_manager, is_server_minted_session_id
+from utils.exceptions import AuthenticationError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from mcp_server.session import MCPSession
+    from mcp_server.tools._errors import ToolFailure
     from services.guardrail_digest import DigestEntries, GuardrailSelection
 
 logger = logging.getLogger(__name__)
@@ -683,15 +685,140 @@ _SESSION_NOT_FOUND_MESSAGE = (
 )
 
 
-async def _send_session_creation_failed(send: Send) -> None:
+class _StartTrackingSend:
+    """ASGI ``send`` that remembers whether the response has started (#1742).
+
+    A failure after ``http.response.start`` cannot be answered with an error
+    body any more; only then is the exception re-raised.
+    """
+
+    def __init__(self, send: Send) -> None:
+        self._send = send
+        self.started = False
+
+    async def __call__(self, message: Any) -> None:
+        if message.get("type") == "http.response.start":
+            self.started = True
+        await self._send(message)
+
+
+def _jsonrpc_error_code(failure: "ToolFailure", *, era: Literal["legacy", "stateless"]) -> int:
+    """The JSON-RPC code for a classified failure: it never contradicts ``data``.
+
+    Session-based (legacy) connections keep the custom -32001 (timeout) and
+    -32002 (permission denied) of Issue #163; 2026-07-28 marks that sub-range
+    as legacy, so the stateless era uses the standard codes only.
+    """
+    if era == "legacy":
+        if failure.fields.get("cause") == "timeout":
+            return -32001  # Custom: Tool execution timeout
+        if failure.error == "permission_denied":
+            return -32002  # Custom: Permission denied
+    if failure.error == "validation_error":
+        return -32602  # Standard: Invalid params
+    return -32603  # Standard: Internal error
+
+
+async def _send_transport_failure(
+    send: Send,
+    exc: BaseException,
+    *,
+    body: Any,
+    era: Literal["legacy", "stateless"],
+    session_id: str | None = None,
+) -> None:
+    """Answer an exception outside tool dispatch as a JSON-RPC error (#1742).
+
+    Replaces the bare HTTP 500s (``text/plain`` "Internal Server Error", or
+    ``{"error": "Internal error"}`` when a session could not be opened). The
+    body is a JSON-RPC error whose ``data`` carries ``cause``,
+    ``correlation_id``, ``help`` and retry advice (``describe_transport_exception``);
+    the exception text stays in the server log under the ``correlation_id``.
+    HTTP 503 when a dependency was down or timed out (with ``Retry-After``
+    only when repeating the request is safe), 500 for anything else.
+
+    Args:
+        send: ASGI send callable.
+        exc: The exception.
+        body: The parsed JSON-RPC request, when there is one: its ``id``,
+            ``method`` and tool name shape the answer.
+        era: Which JSON-RPC code set applies.
+        session_id: Echoed in ``Mcp-Session-Id`` when a session was in use.
+    """
+    from mcp_server.tools._errors import (
+        CAUSE_INTERNAL_ERROR,
+        RETRY_AFTER_SECONDS,
+        describe_transport_exception,
+    )
+
+    request = body if isinstance(body, dict) else {}
+    params = request.get("params")
+    failure = describe_transport_exception(
+        exc,
+        method=request.get("method"),
+        tool_name=params.get("name") if isinstance(params, dict) else None,
+    )
+    cause = failure.fields.get("cause")
+    headers: list[list[bytes]] = []
+    if cause is None:
+        status = 400  # a refusal the service raised outside dispatch
+    elif cause == CAUSE_INTERNAL_ERROR:
+        status = 500
+    else:
+        status = 503
+        # Only when a repeat is safe: a write whose outcome is unknown keeps
+        # its verify-before-retry advice in ``data`` and gets no automatic
+        # retry hint an HTTP client might act on.
+        if failure.fields.get("retryable") is True:
+            headers.append([b"retry-after", str(RETRY_AFTER_SECONDS).encode()])
+    if session_id:
+        headers.append([b"mcp-session-id", session_id.encode()])
     await _send_json_error(
         send,
-        500,
-        {"error": "Internal error", "message": "Failed to create session."},
-        # #1456 review: the exception text stays in the caller's log line
-        # (with exc_info) and out of the client body — it can carry
-        # driver/DSN/path detail an MCP client has no business seeing, and
-        # nothing actionable for it either way.
+        status,
+        {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "error": {
+                "code": _jsonrpc_error_code(failure, era=era),
+                "message": failure.message,
+                "data": failure.jsonrpc_data(),
+            },
+        },
+        headers,
+    )
+
+
+# Seconds a client should wait after the MCP authentication 503 (#1742).
+_AUTH_RETRY_AFTER_SECONDS = 5
+
+
+async def _send_auth_unavailable(send: Send, exc: BaseException) -> None:
+    """503 for a request whose credentials could not be checked (#1742).
+
+    The token lookup failed (database down, an unexpected error): the
+    credential may well be valid, so this is not a 401 — no
+    ``WWW-Authenticate`` challenge that would make the client re-authorize,
+    and no exception text. The exception is logged under the
+    ``correlation_id`` the body carries.
+    """
+    from mcp_server.tools._errors import classify_cause, new_correlation_id
+
+    correlation_id = new_correlation_id()
+    logger.error(
+        f"MCP auth unavailable: cause={classify_cause(exc)}, "
+        f"correlation_id={correlation_id}, exc_type={type(exc).__name__}",
+        exc_info=exc,
+    )
+    await _send_json_error(
+        send,
+        503,
+        {
+            "error": "temporarily_unavailable",
+            "error_description": "Could not verify credentials right now; retry shortly.",
+            "correlation_id": correlation_id,
+        },
+        [[b"retry-after", str(_AUTH_RETRY_AFTER_SECONDS).encode()]],
     )
 
 
@@ -929,7 +1056,13 @@ async def _handle_batch(scope: Scope, send: Send, session: "MCPSession", batch: 
         if _is_jsonrpc_response(message):
             continue
         captured = _CapturedResponse()
-        await _dispatch_message(scope, captured, session, message)
+        try:
+            await _dispatch_message(scope, captured, session, message)
+        except Exception as e:
+            # #1742: this element's answer is a JSON-RPC error with a
+            # correlation_id; the elements before it ran and keep their answers.
+            captured = _CapturedResponse()
+            await _send_transport_failure(captured, e, body=message, era="legacy")
         payload = captured.payload
         if payload is None:  # a notification: 202, nothing to answer
             continue
@@ -1107,6 +1240,26 @@ async def _dispatch_message(scope: Scope, send: Send, session: "MCPSession", bod
             )
             return
 
+        # #1742: as on the stateless era (and the MCP SDK), ``arguments`` is
+        # an object or absent/null. A string used to reach the tool and come
+        # back as raw Python text; an integer, as -32603.
+        call_arguments = call_params.get("arguments")
+        if call_arguments is not None and not isinstance(call_arguments, dict):
+            await _send_json_error(
+                send,
+                200,  # HTTP 200 + JSON-RPC error, like the other errors of this handler
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: 'arguments' must be an object",
+                    },
+                },
+                [[b"mcp-session-id", session.session_id.encode()]],
+            )
+            return
+
         # #1686: the OAuth scope check, from this request's token — never the
         # session's, which may have been opened with another one.
         if await _reject_insufficient_scope(
@@ -1122,7 +1275,7 @@ async def _dispatch_message(scope: Scope, send: Send, session: "MCPSession", bod
             # Extract tool parameters
             params = body.get("params", {})
             tool_name = params.get("name")
-            arguments = params.get("arguments", {})
+            arguments = params.get("arguments") or {}
 
             logger.info(f"MCP calling tool: {tool_name}")
 
@@ -1147,20 +1300,13 @@ async def _dispatch_message(scope: Scope, send: Send, session: "MCPSession", bod
             # are custom); message and ``data`` come from the shared error
             # vocabulary, which logs the exception with a correlation_id and
             # never returns an unexpected exception's text or type.
-            from mcp_server.tools._errors import CAUSE_TIMEOUT, describe_tool_exception
+            from mcp_server.tools._errors import describe_tool_exception
 
             failure = describe_tool_exception(tool_name, e)
             # The numeric code follows the classification, so it never
             # contradicts ``data`` (a ValueError subclass is a server failure,
             # an httpx timeout is a timeout).
-            if failure.fields.get("cause") == CAUSE_TIMEOUT:
-                error_code = -32001  # Custom: Tool execution timeout
-            elif failure.error == "permission_denied":
-                error_code = -32002  # Custom: Permission denied
-            elif failure.error == "validation_error":
-                error_code = -32602  # Standard: Invalid params
-            else:
-                error_code = -32603  # Standard: Internal error
+            error_code = _jsonrpc_error_code(failure, era="legacy")
 
             error_response = {
                 "jsonrpc": "2.0",
@@ -1425,46 +1571,12 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                     return
             else:
                 # OAuth2 authentication: Allow workspace switching if user is a member
+                from uuid import UUID
+
+                from db.base import get_db
+
                 try:
-                    from uuid import UUID
-
-                    from db.base import get_db
-
                     workspace_uuid = UUID(workspace_id_from_url)
-
-                    # Check if user is a member of the workspace
-                    async with contextlib.aclosing(get_db()) as sessions:
-                        async for db in sessions:
-                            from sqlalchemy import select
-
-                            from models.auth import WorkspaceMember
-
-                            result = await db.execute(
-                                select(WorkspaceMember).where(
-                                    WorkspaceMember.workspace_id == workspace_uuid,
-                                    WorkspaceMember.user_id == user_id,
-                                )
-                            )
-                            member = result.scalar_one_or_none()
-
-                            if member:
-                                workspace_id = workspace_uuid
-                                logger.info(f"MCP OAuth2 workspace switch: {workspace_id_from_url}")
-                            else:
-                                logger.warning(
-                                    f"MCP OAuth2 not a member: url={workspace_id_from_url}, user={user_id}"
-                                )
-                                await _send_json_error(
-                                    send,
-                                    403,
-                                    {
-                                        "error": "access_denied",
-                                        "error_description": "You are not a member of this workspace.",
-                                    },
-                                )
-                                return
-                            break
-
                 except ValueError:
                     logger.warning(f"MCP invalid workspace UUID in URL: {workspace_id_from_url}")
                     await _send_json_error(
@@ -1477,7 +1589,41 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                     )
                     return
 
-    except Exception as auth_error:
+                # Check if user is a member of the workspace. A failed query
+                # raises to the 503 below (#1742), never a 400 or 403.
+                async with contextlib.aclosing(get_db()) as sessions:
+                    async for db in sessions:
+                        from sqlalchemy import select
+
+                        from models.auth import WorkspaceMember
+
+                        result = await db.execute(
+                            select(WorkspaceMember).where(
+                                WorkspaceMember.workspace_id == workspace_uuid,
+                                WorkspaceMember.user_id == user_id,
+                            )
+                        )
+                        member = result.scalar_one_or_none()
+
+                        if member:
+                            workspace_id = workspace_uuid
+                            logger.info(f"MCP OAuth2 workspace switch: {workspace_id_from_url}")
+                        else:
+                            logger.warning(
+                                f"MCP OAuth2 not a member: url={workspace_id_from_url}, user={user_id}"
+                            )
+                            await _send_json_error(
+                                send,
+                                403,
+                                {
+                                    "error": "access_denied",
+                                    "error_description": "You are not a member of this workspace.",
+                                },
+                            )
+                            return
+                        break
+
+    except AuthenticationError as auth_error:
         from utils.exceptions import InvalidTokenError, TokenExpiredError, TokenRevokedError
 
         # Authentication failed - send 401 with RFC 6750 compliant headers
@@ -1512,6 +1658,12 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
             [[b"www-authenticate", www_authenticate]],
         )
         return
+    except Exception as auth_error:
+        # #1742: the credentials could not be checked (a failed token or
+        # membership lookup), which says nothing about whether they are valid.
+        # 503, not a 401 that would make the client re-authorize.
+        await _send_auth_unavailable(send, auth_error)
+        return
 
     # Era split (#1544). Runs after authentication and the workspace checks
     # above, so both eras inherit them, and BEFORE any session handling: a
@@ -1519,6 +1671,7 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
     # an ``Mcp-Session-Id``, and a stale one on it is ignored rather than 404'd.
     # ``/mcp/`` is what the FastAPI routes normalize to; ``/mcp`` is the raw
     # ASGI mount.
+    parsed_body: Any = None  # the JSON-RPC request, for a transport failure's answer (#1742)
     if method == "POST" and path in ("/mcp", "/mcp/"):
         body_bytes = await _read_body(receive)
         try:
@@ -1529,9 +1682,10 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
         if _is_modern_request(parsed_body):
             from mcp_server.transport_stateless import handle_stateless_post
 
+            tracked = _StartTrackingSend(send)
             try:
                 await handle_stateless_post(
-                    send,
+                    tracked,
                     parsed_body,
                     headers,
                     user_id=user_id,
@@ -1539,8 +1693,11 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                     query_string=scope.get("query_string", b""),  # #1601 tool profile
                 )
             except Exception as e:
-                logger.error(f"MCP stateless handler exception: {e}", exc_info=True)
-                raise
+                if tracked.started:
+                    logger.error(f"MCP stateless handler exception: {e}", exc_info=True)
+                    raise
+                # #1742: a JSON-RPC error with a correlation_id, not a bare 500.
+                await _send_transport_failure(send, e, body=parsed_body, era="stateless")
             return
 
         receive = _replay_receive(body_bytes)
@@ -1576,15 +1733,21 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                 )
             except Exception as e:
                 logger.error(f"MCP {method} /mcp session creation failed: {e}", exc_info=True)
-                await _send_session_creation_failed(send)
+                await _send_transport_failure(send, e, body=parsed_body, era="legacy")
                 return
             logger.info(f"MCP {method} /mcp: created new session: {session.session_id}")
         else:
             # Ownership before activity: only the caller's own session is
             # touched, so a rejected one still idles out.
-            lookup, session = await session_manager.get_owned_session(
-                session_id, user_id, workspace_id
-            )
+            try:
+                lookup, session = await session_manager.get_owned_session(
+                    session_id, user_id, workspace_id
+                )
+            except Exception as e:
+                # #1742: same answer as a failure opening a session.
+                logger.error(f"MCP {method} /mcp session lookup failed: {e}", exc_info=True)
+                await _send_transport_failure(send, e, body=parsed_body, era="legacy")
+                return
             if lookup == "terminated":
                 # #1740: ended by DELETE — the spec's 404, never re-adopted.
                 logger.info(f"MCP {method} /mcp: session {session_id} was terminated")
@@ -1612,7 +1775,7 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                     session = None
                 except Exception as e:
                     logger.error(f"MCP {method} /mcp session creation failed: {e}", exc_info=True)
-                    await _send_session_creation_failed(send)
+                    await _send_transport_failure(send, e, body=parsed_body, era="legacy")
                     return
                 else:
                     logger.info(
@@ -1645,6 +1808,8 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
     logger.info(f"MCP handling: {method} {normalized_path} (session={session.session_id})")
 
     # Handle request based on method
+    tracked_send = _StartTrackingSend(send)
+    send = tracked_send
     try:
         # =====================================================================
         # NEW: Streamable HTTP Transport (MCP Spec 2025-03-26)
@@ -1666,5 +1831,10 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
             await error_response(modified_scope, receive, send)
 
     except Exception as e:
-        logger.error(f"MCP handler exception: {e}", exc_info=True)
-        raise
+        if tracked_send.started:
+            logger.error(f"MCP handler exception: {e}", exc_info=True)
+            raise
+        # #1742: a JSON-RPC error with a correlation_id, not a bare 500.
+        await _send_transport_failure(
+            send, e, body=parsed_body, era="legacy", session_id=session.session_id
+        )

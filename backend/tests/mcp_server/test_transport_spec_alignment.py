@@ -378,6 +378,30 @@ async def test_a_2025_03_26_session_accepts_a_request_batch(app):
 
 
 @pytest.mark.asyncio
+async def test_a_failing_batch_element_gets_its_own_jsonrpc_error(app, monkeypatch):
+    """#1742: an exception while serving one element is that element's
+    JSON-RPC error (cause, correlation_id), not a 500 for the whole batch."""
+    session = await _initialize(app)
+
+    def broken_tools(_query_string):
+        raise RuntimeError("tools/list exploded at /srv/app/x.py")
+
+    monkeypatch.setattr(
+        "mcp_server.tools._profiles.select_tool_definitions", broken_tools, raising=True
+    )
+    send = await app.call([_rpc("ping", 1), _rpc("tools/list", 2)], headers=session)
+
+    assert send.status == 200
+    by_id = {r["id"]: r for r in send.body}
+    assert by_id[1]["result"] == {}
+    error = by_id[2]["error"]
+    assert error["code"] == -32603
+    assert error["data"]["cause"] == "internal_error"
+    assert error["data"]["correlation_id"]
+    assert "/srv/app" not in json.dumps(send.body)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "batch",
     [
