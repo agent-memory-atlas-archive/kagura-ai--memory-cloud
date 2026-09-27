@@ -102,7 +102,19 @@ function ProviderGlyph({ provider }: { provider: Provider }) {
   return provider === "google" ? <GoogleGlyph /> : <GitHubGlyph />;
 }
 
-export default function ConnectedAccounts() {
+interface ConnectedAccountsProps {
+  /**
+   * Called after a provider was unlinked, so sections that depend on the
+   * linked providers (the Password section's Remove guard, #1678) re-read
+   * them. Linking needs no callback: it leaves the page for the IdP and the
+   * profile reloads on return.
+   */
+  onProvidersChanged?: () => void;
+}
+
+export default function ConnectedAccounts({
+  onProvidersChanged,
+}: ConnectedAccountsProps = {}) {
   const t = useTranslations("connectedAccounts");
   const tCommon = useTranslations("common");
   const { user } = useAuth();
@@ -139,11 +151,13 @@ export default function ConnectedAccounts() {
 
   const linkedSet = new Set(linked.map((p) => p.provider));
 
-  // A password user always retains a fallback sign-in method, so unlinking the
-  // last OAuth provider is safe. An OAuth-only user with a single linked
-  // provider must keep it — disable Disconnect to pre-empt the backend 409
-  // (which is still handled defensively in handleDisconnectConfirm).
-  const hasPassword = user?.auth_method === "password";
+  // A user with a password always retains a fallback sign-in method, so
+  // unlinking the last OAuth provider is safe. An OAuth-only user with a single
+  // linked provider must keep it — disable Disconnect to pre-empt the backend
+  // 409 (which is still handled defensively in handleDisconnectConfirm).
+  // #1678: `has_password` is authoritative (an OAuth user may have added a
+  // password); an older backend only sends `auth_method`.
+  const hasPassword = user?.has_password ?? user?.auth_method === "password";
   const isOnlyMethod = !hasPassword && linkedSet.size <= 1;
 
   const handleConnect = async (provider: Provider) => {
@@ -174,6 +188,7 @@ export default function ConnectedAccounts() {
       await apiClient.post("/api/v1/me/account/unlink-provider", { provider });
       toast({ title: t("disconnectSuccess", { provider: t(provider) }) });
       setDisconnectTarget(null);
+      onProvidersChanged?.();
       await loadProviders();
     } catch (error) {
       // 409 = would leave zero auth methods. Surface the API's intent via an

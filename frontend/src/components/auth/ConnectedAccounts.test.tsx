@@ -34,6 +34,7 @@ vi.mock("next-intl", () => ({
 let mockUser: {
   auth_method?: "password" | "oauth";
   auth_provider?: "google" | "github" | null;
+  has_password?: boolean;
 } | null = { auth_method: "password", auth_provider: null };
 vi.mock("@/contexts/AuthContext", () => ({
   useAuth: () => ({ user: mockUser }),
@@ -225,6 +226,43 @@ describe("ConnectedAccounts — disconnect", () => {
     expect(screen.getByText("lastMethodHint")).toBeTruthy();
   });
 
+  it("keeps Disconnect enabled for an OAuth user who added a password (#1678)", async () => {
+    mockUser = {
+      auth_method: "oauth",
+      auth_provider: "google",
+      has_password: true,
+    };
+    mockApiGet.mockResolvedValueOnce({
+      providers: [{ provider: "google" }],
+    });
+
+    render(<ConnectedAccounts />);
+
+    const disconnectBtn = await screen.findByRole("button", {
+      name: /^disconnectButton\|google$/,
+    });
+    expect((disconnectBtn as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText("lastMethodHint")).toBeNull();
+  });
+
+  it("treats has_password=false as authoritative over auth_method (#1678)", async () => {
+    mockUser = {
+      auth_method: "password",
+      auth_provider: null,
+      has_password: false,
+    };
+    mockApiGet.mockResolvedValueOnce({
+      providers: [{ provider: "github" }],
+    });
+
+    render(<ConnectedAccounts />);
+
+    const disconnectBtn = await screen.findByRole("button", {
+      name: /^disconnectButton\|github$/,
+    });
+    expect((disconnectBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("toasts success and reloads providers on a successful disconnect", async () => {
     // Password user with both linked → unlink google succeeds.
     mockApiGet
@@ -255,6 +293,47 @@ describe("ConnectedAccounts — disconnect", () => {
     await waitFor(() => {
       expect(mockApiGet).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+describe("ConnectedAccounts — tells the page when the providers change (#1678)", () => {
+  async function disconnectGoogle() {
+    const disconnectBtn = await screen.findByRole("button", {
+      name: /^disconnectButton\|google$/,
+    });
+    fireEvent.click(disconnectBtn);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^disconnectConfirm$/ }),
+    );
+  }
+
+  it("calls onProvidersChanged after a successful disconnect", async () => {
+    mockApiGet
+      .mockResolvedValueOnce({
+        providers: [{ provider: "google" }, { provider: "github" }],
+      })
+      .mockResolvedValueOnce({ providers: [{ provider: "github" }] });
+    mockApiPost.mockResolvedValueOnce({ status: "ok" });
+    const onProvidersChanged = vi.fn();
+
+    render(<ConnectedAccounts onProvidersChanged={onProvidersChanged} />);
+    await disconnectGoogle();
+
+    await waitFor(() => expect(onProvidersChanged).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not call it when the disconnect fails", async () => {
+    mockApiGet.mockResolvedValue({
+      providers: [{ provider: "google" }, { provider: "github" }],
+    });
+    mockApiPost.mockRejectedValueOnce(new FakeApiError(409));
+    const onProvidersChanged = vi.fn();
+
+    render(<ConnectedAccounts onProvidersChanged={onProvidersChanged} />);
+    await disconnectGoogle();
+
+    await screen.findByText("lastMethodError");
+    expect(onProvidersChanged).not.toHaveBeenCalled();
   });
 });
 

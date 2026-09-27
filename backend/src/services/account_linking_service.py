@@ -125,20 +125,31 @@ class AccountLinkingService:
             ConflictError: Removing it would leave the user with no usable
                 sign-in method (409).
         """
-        rows = await self.list_providers(user_id)
+        # Lock the user row BEFORE reading the methods: a concurrent password
+        # removal (PasswordAccountService.remove) or unlink locks it too, so
+        # the later of the two sees the earlier one's commit and refuses
+        # rather than both removing a method (#1678).
         user = (
-            await self.db.execute(select(User).where(User.user_id == user_id))
+            await self.db.execute(
+                select(User)
+                .where(User.user_id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         if user is None:
             # The user row is gone (deleted mid-flow). 404 gracefully rather
             # than letting NoResultFound bubble out as a global 503.
             raise NotFoundException("User", resource_id=user_id)
+        rows = await self.list_providers(user_id)
 
         target = next((r for r in rows if r.provider == provider), None)
         if target is None:
             raise NotFoundException("OAuth provider", resource_id=provider)
 
-        has_password = user.auth_method == "password" and user.password_hash is not None
+        # #1678: any account with a password can sign in with it (by login id
+        # or verified email), whatever its original ``auth_method``.
+        has_password = user.password_hash is not None
         # As of #938 the ensure_user legacy ``users.user_id``-as-sub fallback is
         # gone (the e37_517 backfill saturated — a prod probe confirmed 0
         # un-migrated google/github users), so every usable OAuth sign-in method

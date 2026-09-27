@@ -17,16 +17,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlalchemy import create_engine, select  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
-from auth.password import (  # noqa: E402
-    PASSWORD_MAX_BYTES,
-    PASSWORD_NOT_ENCODABLE_MESSAGE,
-    PASSWORD_TOO_LONG_MESSAGE,
-    hash_password,
-    is_password_too_long,
+from auth.password import hash_password  # noqa: E402
+from auth.password_policy import (  # noqa: E402
+    PASSWORD_REQUIREMENT_LINES,
+    PasswordPolicyError,
+    validate_password_policy,
 )
 from cli.db import get_sync_database_url  # noqa: E402
 from models.auth import User  # noqa: E402
-from utils.utf8 import is_utf8_encodable  # noqa: E402
+from services.email_action_token_service import (  # noqa: E402
+    PASSWORD_LINK_PURPOSES,
+    invalidation_statement,
+)
 
 _project_root = Path(__file__).parent.parent.parent.parent
 
@@ -83,37 +85,16 @@ def reset_password():
         if choice in ("1", "3"):
             while True:
                 print("\nPassword requirements:")
-                print("  - Minimum 12 characters")
-                print("  - At least 1 uppercase letter (A-Z)")
-                print("  - At least 1 lowercase letter (a-z)")
-                print("  - At least 1 digit (0-9)")
-                print("  - At least 1 special character (!@#$%^&*...)")
-                print(f"  - Maximum {PASSWORD_MAX_BYTES} bytes when UTF-8 encoded")
+                for line in PASSWORD_REQUIREMENT_LINES:
+                    print(f"  - {line}")
                 password = getpass.getpass("\n  New Password: ")
 
-                errors = []
-                if len(password) < 12:
-                    errors.append("at least 12 characters")
-                if not any(c.isupper() for c in password):
-                    errors.append("1 uppercase letter")
-                if not any(c.islower() for c in password):
-                    errors.append("1 lowercase letter")
-                if not any(c.isdigit() for c in password):
-                    errors.append("1 digit")
-                if not any(not c.isalnum() for c in password):
-                    errors.append("1 special character")
-                if errors:
-                    print(f"  ✗ Missing: {', '.join(errors)}. Try again.")
-                    continue
-
-                # getpass on a pipe can return a lone surrogate (#1718).
-                if not is_utf8_encodable(password):
-                    print(f"  ✗ {PASSWORD_NOT_ENCODABLE_MESSAGE} Try again.")
-                    continue
-
-                # bcrypt hashes at most 72 bytes; refuse before the confirmation prompt (#1707).
-                if is_password_too_long(password):
-                    print(f"  ✗ {PASSWORD_TOO_LONG_MESSAGE} Try again.")
+                # The shared policy: composition, UTF-8 (#1718), bcrypt's 72 bytes
+                # (#1707) — refused before the confirmation prompt.
+                try:
+                    validate_password_policy(password)
+                except PasswordPolicyError as exc:
+                    print(f"  ✗ {exc} Try again.")
                     continue
 
                 password_confirm = getpass.getpass("  Confirm:      ")
@@ -124,6 +105,11 @@ def reset_password():
                 break
 
             user.password_hash = hash_password(password)
+            # Kill emailed reset / set-up links in the same commit (#1678): one
+            # issued before this reset must not overwrite the new password.
+            db.execute(
+                invalidation_statement(user_id=user.user_id, purposes=PASSWORD_LINK_PURPOSES)
+            )
             print("  ✓ Password updated.")
 
         # Disable MFA

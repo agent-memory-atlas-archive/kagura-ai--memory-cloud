@@ -18,6 +18,8 @@ Security features:
 - First user auto-assigned ADMIN role
 """
 
+import asyncio
+import functools
 import os
 import re
 import secrets
@@ -41,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import auth.oauth_endpoints as oauth_endpoints
 from auth.dependencies import SessionUser
 from auth.oauth2 import OAuth2Manager
-from auth.password import verify_password
+from auth.password import hash_password, verify_password
 from auth.roles import get_role_manager
 from auth.session import SessionManager
 from auth.totp import verify_totp
@@ -50,6 +52,7 @@ from db.base import get_db
 from models.auth import User
 from services.account_linking_service import AccountLinkingService
 from services.beta_invite_service import BETA_INVITE_TOKEN_PATTERN
+from services.password_account_service import find_password_user_by_email
 from services.signup_gate_service import check_signup_access
 from services.terms_service import TermsService, current_terms_version
 from services.workspace_service import WorkspaceService
@@ -70,6 +73,9 @@ from utils.utf8 import is_utf8_encodable
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+
+# The browser session cookie (Issue #115 renamed it from ``session_id``).
+SESSION_COOKIE_NAME = "kagura_session"
 
 # Google OAuth2 subrouter (provider-specific endpoints)
 google_router = APIRouter(prefix="/google", tags=["authentication", "google-oauth2"])
@@ -561,7 +567,7 @@ async def google_login(
         # append to. Only meaningful when the caller already has one; without a
         # cookie there is nothing to add to and this degrades to a normal login.
         if add_account:
-            current_session = request.cookies.get("kagura_session")
+            current_session = request.cookies.get(SESSION_COOKIE_NAME)
             if current_session:
                 _remember_add_account_intent(state, current_session)
 
@@ -1063,7 +1069,7 @@ async def logout(
         raise HTTPException(status_code=500, detail="Session manager not initialized")
 
     # Read session_id from cookie (Issue #115: renamed to kagura_session)
-    session_id = request.cookies.get("kagura_session")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
 
     if not session_id:
         # Nothing to end. Idempotent success — see the docstring.
@@ -1111,7 +1117,7 @@ async def logout(
     # Full sign-out: `scope="all"`, the last account, or the fail-safe above.
     _session_manager.delete_session(session_id)
     logger.info(f"User logged out: session={session_id[:8]}...")
-    response.delete_cookie(key="kagura_session", path="/")
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
 
     return {
         "success": True,
@@ -1179,7 +1185,7 @@ def _take_add_account_intent(state: str, request: Request) -> tuple[str, str | N
 
     # Possession of `state` is not authority: the callback must arrive from the
     # browser that actually holds the session.
-    cookie_session = request.cookies.get("kagura_session")
+    cookie_session = request.cookies.get(SESSION_COOKIE_NAME)
     if not cookie_session or cookie_session != intended:
         logger.warning("add_account_intent_rejected_cookie_mismatch")
         return ("unusable", None)
@@ -1519,7 +1525,7 @@ async def list_signed_in_accounts(request: Request, user: SessionUser):
     # absent cookie here is a contradiction rather than an anonymous caller.
     # Answer 401 as the dependency itself would, instead of an empty list that
     # would read as "signed in with no accounts".
-    session_id = request.cookies.get("kagura_session")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1558,7 +1564,7 @@ async def switch_active_account(
     if not _session_manager:
         raise HTTPException(status_code=500, detail="Session manager not initialized")
 
-    session_id = request.cookies.get("kagura_session")
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1634,6 +1640,9 @@ async def get_current_user_info(
             # Issue #514: surface auth_method + auth_provider for sign-in-method display
             "auth_method": db_user.auth_method if db_user else "oauth",
             "auth_provider": db_user.auth_provider if db_user else None,
+            # Issue #1678: ``auth_method`` is the ORIGINAL sign-in method; this
+            # says whether the account can sign in with a password now.
+            "has_password": bool(db_user and db_user.password_hash is not None),
             # Issue #953: surface the protected-initial-admin flag so the frontend
             # can hide the self-serve account-deletion control. The backend hard-
             # blocks erasure of this account (InitialAdminCannotBeErasedError —
@@ -1729,7 +1738,7 @@ async def github_login(
     # #1488: see the Google login for why the session id (not just a flag) is
     # what gets stored.
     if add_account:
-        current_session = request.cookies.get("kagura_session")
+        current_session = request.cookies.get(SESSION_COOKIE_NAME)
         if current_session:
             _remember_add_account_intent(state, current_session)
 
@@ -2154,7 +2163,7 @@ def _set_session_cookie(response: Response, session_id: str) -> None:
         return
     is_production = os.getenv("ENVIRONMENT", "development") == "production"
     response.set_cookie(
-        key="kagura_session",
+        key=SESSION_COOKIE_NAME,
         value=session_id,
         path="/",
         httponly=True,
@@ -2229,12 +2238,53 @@ _MAX_LOGIN_ATTEMPTS = 5
 _LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
 
 
-def _check_login_rate_limit(login_id: str) -> None:
-    """Check brute-force protection. Raises 429 if too many attempts."""
+def _normalize_login_identifier(identifier: str) -> str:
+    """Normalize a login id / email for rate-limit keys (#1678).
+
+    ``Admin`` and ``admin `` share one failure counter, and so do the case
+    variants of an email address.
+    """
+    return identifier.strip().lower()
+
+
+def _login_rate_key(identifier: str, user: User | None) -> str:
+    """The failure counter a sign-in attempt counts against (#1678).
+
+    An identifier that resolves to an account counts against the ACCOUNT, so
+    its login id and its email share one budget and a success clears it.
+    Anything else counts against the normalized identifier. The two
+    namespaces are disjoint: a typed ``user:<id>`` is an identifier, never an
+    account's counter.
+
+    There is deliberately no per-client-address counter: behind a reverse
+    proxy that does not forward the client address, every request shares the
+    proxy's, and such a counter becomes a global lockout.
+    """
+    if user is not None:
+        return f"user:{user.user_id}"
+    return f"id:{_normalize_login_identifier(identifier)}"
+
+
+def _login_client_ip(request: Request) -> str:
+    """Client address for audit rows and per-client limits.
+
+    ``request.client`` is what the ASGI server resolved — behind a trusted
+    proxy uvicorn's ``--proxy-headers`` / ``--forwarded-allow-ips`` already
+    applied ``X-Forwarded-For`` — the same source the device-flow and DCR
+    limiters use.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+def _check_login_rate_limit(rate_key: str) -> None:
+    """Check brute-force protection. Raises 429 if too many attempts.
+
+    Args:
+        rate_key: The counter to check (see ``_login_rate_key``).
+    """
     if not _session_manager:
         return
-    key = f"{_LOGIN_ATTEMPT_PREFIX}{login_id}"
-    attempts = _session_manager._redis.get(key)
+    attempts = _session_manager._redis.get(f"{_LOGIN_ATTEMPT_PREFIX}{rate_key}")
     if attempts and int(attempts) >= _MAX_LOGIN_ATTEMPTS:
         raise HTTPException(
             status_code=429,
@@ -2242,22 +2292,62 @@ def _check_login_rate_limit(login_id: str) -> None:
         )
 
 
-def _record_login_failure(login_id: str) -> None:
-    """Record a failed login attempt."""
+def _record_login_failure(rate_key: str) -> None:
+    """Record a failed login attempt against ``rate_key``."""
     if not _session_manager:
         return
-    key = f"{_LOGIN_ATTEMPT_PREFIX}{login_id}"
+    key = f"{_LOGIN_ATTEMPT_PREFIX}{rate_key}"
     pipe = _session_manager._redis.pipeline()
     pipe.incr(key)
     pipe.expire(key, _LOGIN_LOCKOUT_SECONDS)
     pipe.execute()
 
 
-def _clear_login_failures(login_id: str) -> None:
-    """Clear failed login attempts on success."""
+def _clear_login_failures(rate_key: str) -> None:
+    """Clear the failed attempts counted against ``rate_key`` on success."""
     if not _session_manager:
         return
-    _session_manager._redis.delete(f"{_LOGIN_ATTEMPT_PREFIX}{login_id}")
+    _session_manager._redis.delete(f"{_LOGIN_ATTEMPT_PREFIX}{rate_key}")
+
+
+@functools.cache
+def _dummy_password_hash() -> str:
+    """A bcrypt hash of a random secret, computed once (#1678).
+
+    Checked against on a sign-in miss so an unknown identifier costs the same
+    bcrypt work as a wrong password — response time does not reveal whether an
+    account exists.
+    """
+    return hash_password(secrets.token_urlsafe(16))
+
+
+async def resolve_password_login_user(db: AsyncSession, identifier: str) -> User | None:
+    """Find the account a password sign-in identifier names (#1678).
+
+    Resolution order:
+
+    1. An exact ``login_id`` match on an account with a password — the CLI
+       admins' arbitrary login ids keep working unchanged.
+    2. Otherwise, when the identifier looks like an email address, the
+       account whose ``lower(email)`` equals ``lower(trim(identifier))``, whose
+       email is verified and which has a password. ``@local`` addresses (CLI
+       admins) never match. More than one match — accounts whose emails
+       differ only by case — fails closed.
+
+    Args:
+        db: The async session.
+        identifier: What the person typed as "Login ID or email".
+
+    Returns:
+        The user, or ``None`` when nothing (or more than one thing) matches.
+    """
+    result = await db.execute(
+        select(User).where(User.login_id == identifier, User.password_hash.is_not(None))
+    )
+    user = result.scalar_one_or_none()
+    if user is not None or "@" not in identifier:
+        return user
+    return await find_password_user_by_email(db, identifier)
 
 
 # #1665: a password login that stops at the MFA step carries its terms
@@ -2307,7 +2397,15 @@ async def password_login(
     request: Request,
     return_to: str | None = Query(None),
 ):
-    """Authenticate with login_id and password."""
+    """Authenticate with a login ID or a verified email, and a password.
+
+    ``login_id`` carries either an admin login ID or (#1678) the verified
+    email of an account that has a password — see
+    ``resolve_password_login_user``. Every failure is the same generic 401;
+    an unknown identifier costs the same bcrypt work as a wrong password.
+    Failures count per resolved account, or per normalized identifier when
+    nothing resolves.
+    """
     if not _session_manager:
         raise HTTPException(status_code=500, detail="Session manager not initialized")
 
@@ -2317,25 +2415,27 @@ async def password_login(
     if not is_utf8_encodable(body.login_id):
         raise InvalidCredentialsError()
 
-    # Brute-force protection
-    _check_login_rate_limit(body.login_id)
-
+    user: User | None = None
     async for db in get_db():
-        result = await db.execute(
-            select(User).where(User.login_id == body.login_id, User.auth_method == "password")
-        )
-        user = result.scalar_one_or_none()
+        user = await resolve_password_login_user(db, body.login_id)
         break
 
+    # Brute-force protection: one budget per account (see _login_rate_key).
+    rate_key = _login_rate_key(body.login_id, user)
+    _check_login_rate_limit(rate_key)
+
+    # bcrypt is CPU-bound for ~100 ms+: run it off the event loop.
     if not user or not user.password_hash:
-        _record_login_failure(body.login_id)
+        dummy_hash = await asyncio.to_thread(_dummy_password_hash)
+        await asyncio.to_thread(verify_password, body.password, dummy_hash)
+        _record_login_failure(rate_key)
         raise InvalidCredentialsError()
 
-    if not verify_password(body.password, user.password_hash):
-        _record_login_failure(body.login_id)
+    if not await asyncio.to_thread(verify_password, body.password, user.password_hash):
+        _record_login_failure(rate_key)
         raise InvalidCredentialsError()
 
-    _clear_login_failures(body.login_id)
+    _clear_login_failures(rate_key)
 
     # MFA check
     if user.totp_enabled and user.totp_secret:
@@ -2367,7 +2467,7 @@ async def password_login(
     )
     _set_session_cookie(response, session_id)
 
-    logger.info(f"Password login successful: {user.email}")
+    logger.info("password_login_successful", user_id=user.user_id)
     return response
 
 
