@@ -20,14 +20,70 @@ whole point of the gating work in #469.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from contextlib import suppress
+from functools import cache
+from typing import TYPE_CHECKING, Any
 
 import resend
 
 from services.email_service import redact_recipient
 from utils.logger import get_logger
 
+if TYPE_CHECKING:
+    from services.security_notification_service import SecurityOccurrence
+
 logger = get_logger(__name__)
+
+
+# Timeout of one SDK HTTP request, applied to the connect and to the read
+# separately. Twice it stays under ``EMAIL_SEND_TIMEOUT_SECONDS``, so the SDK
+# reports a connect failure (definite) or a read failure (uncertain) itself
+# before a caller's ``wait_for`` backstop has to guess.
+_HTTP_TIMEOUT_SECONDS = 4
+
+
+@cache
+def _uncertain_error_types() -> tuple[type[BaseException], ...]:
+    """Transport errors raised while waiting for or reading the response.
+
+    ``requests`` and ``urllib3`` come with the SDK's default client and are
+    not dependencies of this project: whichever is missing is skipped.
+    """
+    types: list[type[BaseException]] = []
+    with suppress(ImportError):
+        import requests
+
+        types += [requests.exceptions.ReadTimeout, requests.exceptions.ChunkedEncodingError]
+    with suppress(ImportError):
+        import urllib3
+
+        types.append(urllib3.exceptions.ProtocolError)
+    with suppress(ImportError):
+        import httpx
+
+        types += [httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError]
+    return tuple(types)
+
+
+def _may_have_been_delivered(exc: BaseException) -> bool:
+    """Whether a send failure may have happened after Resend took the request.
+
+    The SDK wraps transport errors (``ResendError`` raised while handling a
+    ``RuntimeError`` caused by the ``requests`` / ``httpx`` exception), so the
+    whole chain is searched. A failure while waiting for or reading the
+    response is uncertain: a read timeout, a read error, a response cut short,
+    or the connection dropped mid-request. Failing to connect (refused, DNS,
+    connect timeout) and an API error response are definite failures.
+    """
+    uncertain = _uncertain_error_types()
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, uncertain):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class ResendEmailService:
@@ -51,6 +107,11 @@ class ResendEmailService:
         # this attribute and the email_service singleton via
         # services.email_service.reset_email_service_for_testing.
         resend.api_key = normalized_api_key
+        # Also process-wide: bound the SDK's requests (its default is 30 s per
+        # phase, longer than any caller waits).
+        client_class = getattr(resend, "RequestsClient", None)
+        if client_class is not None:
+            resend.default_http_client = client_class(timeout=_HTTP_TIMEOUT_SECONDS)
         self._from_email = normalized_from_email
 
     async def _send(
@@ -61,6 +122,7 @@ class ResendEmailService:
         text: str,
         log_event: str,
         log_context: dict[str, Any],
+        raise_if_uncertain: bool = False,
     ) -> bool:
         params: dict[str, Any] = {
             "from": self._from_email,
@@ -83,6 +145,13 @@ class ResendEmailService:
             status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
             if isinstance(status_code, (int, str)):
                 error_fields["status_code"] = status_code
+            if raise_if_uncertain and _may_have_been_delivered(exc):
+                logger.warning(
+                    f"{log_event}_uncertain",
+                    **error_fields,
+                    **log_context,
+                )
+                raise TimeoutError(f"{log_event}: provider response timed out") from None
             logger.warning(
                 f"{log_event}_failed",
                 **error_fields,
@@ -450,4 +519,43 @@ class ResendEmailService:
                 "purpose": "set_password",
                 "template": "password_setup",
             },
+        )
+
+    async def send_security_notification(
+        self,
+        *,
+        to_email: str,
+        event: str,
+        occurrences: list[SecurityOccurrence],
+        digest: bool,
+        window_minutes: int,
+        profile_page_url: str,
+        total: int | None = None,
+    ) -> bool:
+        # The body lists IPs and user agents: it goes to the recipient only,
+        # never into log_context; the recipient is logged as a digest.
+        from services.security_notification_service import render_security_notification
+
+        subject, text = render_security_notification(
+            event,
+            occurrences,
+            digest=digest,
+            window_minutes=window_minutes,
+            profile_page_url=profile_page_url,
+            total=total,
+        )
+        return await self._send(
+            to_email=to_email,
+            subject=subject,
+            text=text,
+            log_event="security_notification_email",
+            log_context={
+                "recipient_hash": redact_recipient(to_email),
+                "security_event": event,
+                "digest": digest,
+                "template": "security_notification",
+            },
+            # After a read timeout the notice may already be out; the caller
+            # treats TimeoutError as "may have been sent" and never resends.
+            raise_if_uncertain=True,
         )

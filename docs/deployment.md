@@ -426,6 +426,38 @@ the purpose and a keyed hash of the recipient — never the address, the token o
 the link — so under `logging` the links cannot be delivered and self-service
 reset / set-up do not work.
 
+**Security-change notifications (Issue #1752).** After a password is set,
+changed, reset or removed, a Google / GitHub identity is linked or unlinked, an
+OAuth / MCP client is authorized (by consent when it grants something new — a
+first authorization, a broader scope, or a client changed since the last grant
+— and by device-flow approval every time), an API key is created or regenerated
+(connector write keys included), an OAuth client is registered or its secret
+regenerated, or a provider sign-in changes the account's email address (the
+previous address is told), the account owner is
+emailed a notice (UTC time, IP address, user agent, key or client name, and the
+acting admin for admin actions — never a secret, token or link other than the
+plain `FRONTEND_URL/profile` page). The notices cannot be turned off. They go
+only to a verified address (`users.email_verified_at`: set by an emailed
+password link, or by an OAuth sign-in whose provider attests the address as
+verified; migration `e88_1752_verified_backfill` marks the OAuth accounts
+created before sign-in set it), never to
+`@local`. The first three occurrences of the same event for the same account
+within `SECURITY_NOTIFICATION_WINDOW_SECONDS` (default 600, at most 3600) are
+each sent at once; later ones are sent as one digest when the window closes.
+The window lives in
+Redis and a job checks it every minute; when Redis is unavailable every
+occurrence is sent at once. A digest keeps the first 20 occurrences and counts
+the rest; an email whose send definitely fails — a notice or a digest — is
+retried up to twice (after one, then two minutes), then dropped with a
+`security_notification_digest_dropped`
+log line. A send whose answer never came may still be delivered, so it is not retried.
+Pending windows are kept in Redis for 7 days, so a stalled job loses nothing
+that recent; a window older than that is dropped with a
+`security_notification_window_expired` warning. Operator
+CLI actions (`reset_password`, `create_admin`) send no notice. A send failure is logged and never affects the
+change. Under `EMAIL_PROVIDER=logging` each notice is one
+`security_notification_email` log line (event and a keyed recipient hash only).
+
 ## Hosted-mode UI gates (Issue #1571)
 
 The web UI reads `GET /api/v1/system/info` → `features.*` at runtime, so a

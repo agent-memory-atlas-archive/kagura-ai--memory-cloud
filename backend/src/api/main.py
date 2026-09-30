@@ -105,6 +105,7 @@ async def lifespan(app: FastAPI):
         schedule_mcp_tasks,
         schedule_neural_tasks,
         schedule_resource_indexer_jobs,
+        schedule_security_notification_tasks,
         schedule_semantic_edge_reverify_tasks,
         schedule_sleep_tasks,
         start_scheduler,
@@ -115,6 +116,7 @@ async def lifespan(app: FastAPI):
     schedule_mcp_tasks(scheduler)
     schedule_credentials_tasks(scheduler)
     schedule_device_code_tasks(scheduler)
+    schedule_security_notification_tasks(scheduler)
     schedule_email_action_token_tasks(scheduler)
     schedule_embedding_tasks(scheduler)
     schedule_resource_indexer_jobs(scheduler)

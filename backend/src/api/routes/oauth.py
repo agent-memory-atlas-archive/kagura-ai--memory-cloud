@@ -33,7 +33,17 @@ from pathlib import Path
 from urllib.parse import parse_qsl, unquote_plus, urlencode, urlparse, urlsplit, urlunsplit
 
 from authlib.oauth2.rfc6749.errors import OAuth2Error
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -57,6 +67,11 @@ from db.redis import increment_counter
 from models.api_base import TZAwareBaseModel
 from models.auth import OAuth2Client, OAuth2DeviceCode, OAuth2Token, User, generate_user_code
 from models.schemas import TokenIntrospectionResponse
+from services.security_notification_service import (
+    SecurityEvent,
+    is_new_client_authorization,
+    schedule_security_notification,
+)
 from utils.datetime import to_utc_iso, utcnow
 from utils.exceptions import AuthenticationError, AuthorizationError, RedisError
 from utils.logger import get_logger
@@ -475,10 +490,14 @@ async def list_oauth2_clients(
 )
 async def create_oauth2_client(
     request: Request,
+    background_tasks: BackgroundTasks,
     data: OAuth2ClientCreateRequest,
     user: SessionUser,
 ) -> OAuth2ClientWithSecretResponse:
     """Register a new OAuth2 client.
+
+    Issue #1752: the owner is emailed a security notice after the commit
+    (a new client secret was minted on the account).
 
     Args:
         data: Client registration data
@@ -543,6 +562,13 @@ async def create_oauth2_client(
         db_session.add(client)
         db_session.commit()
         db_session.refresh(client)
+        schedule_security_notification(
+            background_tasks,
+            user_id=user_id,
+            event=SecurityEvent.OAUTH_CLIENT_CREATED,
+            request=request,
+            client_name=client.client_name,
+        )
 
         logger.info(
             "oauth2_client_created",
@@ -1163,12 +1189,14 @@ async def hide_oauth2_client_secret(
 )
 async def regenerate_oauth2_client_secret(
     request: Request,
+    background_tasks: BackgroundTasks,
     client_id: str,
     user: SessionUser,
 ) -> OAuth2ClientWithSecretResponse:
     """Regenerate OAuth2 client secret.
 
-    Issue #169: Secret regeneration feature.
+    Issue #169: Secret regeneration feature. Issue #1752: the owner is emailed
+    a security notice after the commit.
 
     WARNING: This immediately invalidates the old secret. Update all applications.
 
@@ -1218,6 +1246,13 @@ async def regenerate_oauth2_client_secret(
 
         db_session.commit()
         db_session.refresh(client)
+        schedule_security_notification(
+            background_tasks,
+            user_id=current_user_id,
+            event=SecurityEvent.OAUTH_SECRET_REGENERATED,
+            request=request,
+            client_name=client.client_name,
+        )
 
         logger.info(
             "oauth2_client_secret_regenerated",
@@ -1851,15 +1886,54 @@ def _run_oauth_sync(action: str, request, **kwargs):
         db_session.close()
 
 
+def _consent_is_new(client_id: str | None, user_id: str | None, scope: str | None) -> bool:
+    """Whether this consent grants ``client_id`` something new (Issue #1752).
+
+    New means a first authorization, a scope the user has not granted this
+    client before, or a client changed since the user's last grant
+    (:func:`is_new_client_authorization`). Runs on its own sync session (call
+    it via ``asyncio.to_thread``). A failed check answers True: an extra
+    notice is better than a missed one.
+    """
+    if not client_id or not user_id:
+        return False
+    session = None
+    try:
+        session = get_sync_session()
+        return is_new_client_authorization(
+            session, client_id=client_id, user_id=user_id, scope=scope
+        )
+    except Exception as exc:
+        logger.warning("oauth_first_authorization_check_failed", error_type=type(exc).__name__)
+        return True
+    finally:
+        if session is not None:
+            session.close()
+
+
+def _grant_issued(location: str) -> bool:
+    """Whether an authorization redirect carries a code (not an error)."""
+    params = dict(parse_qsl(urlsplit(location).query))
+    return "code" in params and "error" not in params
+
+
 @router.post("/authorize")
 async def oauth_authorize_post(
     request: Request,
+    background_tasks: BackgroundTasks,
 ):
     """Process authorization consent.
 
     OAuth2 params (client_id, redirect_uri, etc.) must be in query string,
     not in POST body. This is required by Authlib 1.6.5 which generates
     payload from query params for authorization endpoint.
+
+    Issue #1752: the user is emailed a security notice once the
+    authorization code is stored, when the consent grants the client
+    something new — a first authorization, a scope the user has not granted
+    it before, or a client changed (name, redirect URIs, scope) since the
+    user's last grant. An unchanged repeat consent adds little: the code can
+    only reach the client's registered redirect URI.
     """
     import asyncio
 
@@ -1907,6 +1981,11 @@ async def oauth_authorize_post(
             status_code=303,  # See Other: POST→GET redirect
         )
 
+    # Decided before the grant writes its authorization code (Issue #1752).
+    new_authorization = await asyncio.to_thread(
+        _consent_is_new, client_id, user.user_id, request.query_params.get("scope")
+    )
+
     # Run Authlib operations in thread pool to avoid blocking event loop
     try:
         response = await asyncio.to_thread(
@@ -1916,6 +1995,14 @@ async def oauth_authorize_post(
         # Use 303 See Other to convert POST to GET redirect
         # Claude.ai callback expects GET, not POST
         if hasattr(response, "location") and response.location:
+            if new_authorization and user.user_id and _grant_issued(response.location):
+                schedule_security_notification(
+                    background_tasks,
+                    user_id=user.user_id,
+                    event=SecurityEvent.OAUTH_CLIENT_AUTHORIZED,
+                    request=request,
+                    client_id=client_id,
+                )
             return RedirectResponse(response.location, status_code=303)
 
         # No location - should not happen in normal flow
@@ -2514,11 +2601,17 @@ def _get_user_from_session(request: Request) -> dict | None:
 async def device_confirm(
     request: Request,
     body: DeviceConfirmRequest,
+    background_tasks: BackgroundTasks,
 ) -> DeviceConfirmResponse:
     """User consent endpoint for device authorization.
 
     Requires session authentication. Sets authorized_at or denied_at on the
-    device code record so the polling CLI receives the decision.
+    device code record so the polling CLI receives the decision. Every
+    approval emails the user a security notice after the commit (Issue #1752):
+    a device code can be phished (the attacker starts the flow and gets the
+    victim to approve the code), so unlike authorization-code consent this is
+    not limited to the first grant; coalescing bounds the volume. Scheduling
+    the notice touches no DB, so nothing here runs sync DB work for it.
     """
     user = _get_user_from_session(request)
     if not user:
@@ -2573,6 +2666,14 @@ async def device_confirm(
             status_str = "denied"
 
         db_session.commit()
+        if status_str == "approved" and device.user_id:
+            schedule_security_notification(
+                background_tasks,
+                user_id=device.user_id,
+                event=SecurityEvent.OAUTH_CLIENT_AUTHORIZED,
+                request=request,
+                client_id=device.client_id,
+            )
 
         # A user_code is logged by its prefix, as /device/audit-unauth does (#779).
         logger.info(

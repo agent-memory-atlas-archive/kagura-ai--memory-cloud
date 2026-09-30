@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,11 @@ from db.base import get_db
 from models.api_base import TZAwareBaseModel
 from services.account_erasure_service import AccountErasureService
 from services.account_linking_service import AccountLinkingService
+from services.security_notification_service import (
+    PROVIDER_SIGN_IN_LABELS,
+    SecurityEvent,
+    schedule_security_notification,
+)
 from utils.datetime import to_utc_iso
 from utils.logger import get_logger
 
@@ -351,6 +356,7 @@ async def link_provider(
 async def unlink_provider(
     body: UnlinkProviderRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     user: SessionUser,
     db: AsyncSession = Depends(get_db),
 ) -> UnlinkProviderResponse:
@@ -362,6 +368,8 @@ async def unlink_provider(
 
         - 404 (NotFoundException): the provider is not linked to this account.
         - 409 (ConflictError): removing it would leave zero sign-in methods.
+
+    On success the owner is emailed a security notice (Issue #1752).
     """
     service = AccountLinkingService(db)
     await service.unlink(
@@ -369,6 +377,13 @@ async def unlink_provider(
         provider=body.provider,
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
+    )
+    schedule_security_notification(
+        background_tasks,
+        user_id=user["user_id"],
+        event=SecurityEvent.SIGN_IN_METHOD_REMOVED,
+        request=request,
+        sign_in_method=PROVIDER_SIGN_IN_LABELS.get(body.provider, body.provider),
     )
     return UnlinkProviderResponse(status="ok")
 
