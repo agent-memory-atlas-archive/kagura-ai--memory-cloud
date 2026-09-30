@@ -1073,16 +1073,18 @@ export default function ConnectorsPage() {
       <FeatureGateNotice gate={gate} scope="create" />
 
       {/* #1389: provider picker rendered from the CONNECTOR_PROVIDERS
-          descriptor — Slack live, Discord/Teams disabled coming-soon — so
-          Slack-hardcoded JSX stops multiplying (#1390). */}
+          descriptor so Slack-hardcoded JSX stops multiplying (#1390).
+          #1757: only enabled providers render — no "coming soon" promise
+          for Discord/Teams without a committed date. Enabling one later
+          means wiring its connect flow (the descriptor's installUrl) and
+          then flipping `enabled`. */}
       <div className="mb-4 flex flex-wrap justify-end gap-2">
-        {CONNECTOR_PROVIDERS.map((provider) => (
+        {CONNECTOR_PROVIDERS.filter((p) => p.enabled).map((provider) => (
           <Button
             key={provider.key}
-            variant={provider.enabled ? "default" : "outline"}
-            disabled={!provider.enabled || !canCreate}
+            disabled={!canCreate}
             onClick={
-              provider.enabled && canCreate
+              canCreate
                 ? () => {
                     // Routing lives in the descriptor: a provider enabled
                     // without its own flow yields a no-op, never another
@@ -1094,9 +1096,7 @@ export default function ConnectorsPage() {
             }
           >
             <provider.icon className="h-4 w-4" aria-hidden="true" />
-            {provider.enabled
-              ? t("connectProvider", { name: provider.name })
-              : `${provider.name} — ${t("comingSoon")}`}
+            {t("connectProvider", { name: provider.name })}
           </Button>
         ))}
       </div>
