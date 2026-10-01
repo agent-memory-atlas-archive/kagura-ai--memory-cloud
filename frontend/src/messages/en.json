@@ -1075,6 +1075,8 @@
     "memoryUsageByContext": "Memory usage by context",
     "contextName": "Context Name",
     "owner": "Owner",
+    "ownerYou": "You",
+    "ownerUnnamed": "Another member",
     "memoriesCount": "Memories",
     "storageMB": "Storage (MB)",
     "lastActivity": "Last Activity",
@@ -1368,6 +1370,7 @@
   "contexts": {
     "title": "Contexts",
     "subtitle": "Manage your memory collections. Each context stores memories in a separate namespace.",
+    "subtitleInWorkspace": "Contexts in {workspace}. Each context stores memories in a separate namespace.",
     "create": "Create Context",
     "edit": "Edit Context",
     "delete": "Delete Context",
@@ -1590,6 +1593,16 @@
     "closeTemplate": "Close",
     "workspaceRole": "Workspace Role",
     "owner": "Owner",
+    "ownerYou": "You",
+    "ownerUnnamed": "Another member",
+    "ownerFilter": {
+      "label": "Filter by owner",
+      "all": "All",
+      "mine": "Created by me",
+      "shared": "Shared with me",
+      "empty": "No contexts match this filter.",
+      "showAll": "Show all"
+    },
     "admin": "Admin",
     "member": "Member",
     "viewer": "Viewer",
