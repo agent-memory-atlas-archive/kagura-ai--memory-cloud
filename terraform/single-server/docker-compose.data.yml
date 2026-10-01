@@ -77,11 +77,21 @@ services:
     container_name: kagura-redis
     restart: always
     logging: *default-logging
-    command: ["redis-server", "--appendonly", "yes"]
+    # Optional password (#1794). REDIS_PASSWORD unset or empty renders an empty
+    # requirepass — no auth, as before; set, Redis refuses unauthenticated
+    # commands and the API's default REDIS_URL carries the same password
+    # (x-api-env). Keep the command exec-form with redis-server first: the
+    # image's entrypoint drops root only for that shape.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
+    environment:
+      # For the healthcheck. Not REDISCLI_AUTH: an empty one would make every
+      # interactive redis-cli print a failed AUTH on a Redis without a password.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Match the reply: redis-cli exits 0 on NOAUTH / WRONGPASS as well.
+      test: ["CMD-SHELL", "[ -z \"$$REDIS_PASSWORD\" ] || export REDISCLI_AUTH=\"$$REDIS_PASSWORD\"; redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
