@@ -344,23 +344,34 @@ async def _pending_grants(db: AsyncSession, user_id: str) -> tuple[int, int]:
     return int(codes or 0), int(devices or 0)
 
 
-async def _wait_until_blocked(async_engine, timeout: float = 10.0) -> None:
-    """Wait until some backend of this database is waiting on a row lock."""
+async def _wait_until_blocked(
+    async_engine, timeout: float = 10.0, *, blocked_by: int | None = None
+) -> None:
+    """Wait until some backend of this database is waiting on a row lock.
+
+    With ``blocked_by`` (a backend pid), wait for a backend that pid is
+    blocking — so another test's lock wait cannot satisfy the probe.
+    """
     factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
     deadline = asyncio.get_running_loop().time() + timeout
+    query = text(
+        "SELECT count(*) FROM pg_stat_activity "
+        "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+        + (
+            " AND pg_blocking_pids(pid) @> ARRAY[CAST(:pid AS int)]"
+            if blocked_by is not None
+            else ""
+        )
+    )
+    params = {"pid": blocked_by} if blocked_by is not None else {}
     async with factory() as probe:
         while True:
-            waiting = await probe.scalar(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE datname = current_database() AND wait_event_type = 'Lock'"
-                )
-            )
+            waiting = await probe.scalar(query, params)
             await probe.rollback()
             if waiting:
                 return
             if asyncio.get_running_loop().time() > deadline:
-                raise AssertionError("the reset never waited on a lock")
+                raise AssertionError("nobody waited on the lock")
             await asyncio.sleep(0.05)
 
 
@@ -454,16 +465,25 @@ class TestResetRevokesOAuthGrants:
         assert old.refresh_token_revoked_at == rotated_at
         assert not old.is_refresh_token_active() and old.is_revoked()
 
-    async def test_codes_go_before_the_token_update(self) -> None:
-        # The DELETEs wait for an in-flight exchange; the UPDATE, a later
-        # statement, then sees the token it stored.
+    async def test_reset_revokes_through_the_shared_revoker_in_lock_order(self) -> None:
+        # One revoker owns the order (#1770): the owner's users row FOR UPDATE
+        # first (every grant writer share-locks it before writing), then the
+        # DELETEs, which wait for an in-flight exchange, then the UPDATE — a
+        # later statement that sees the token the exchange stored.
         db = AsyncMock()
         db.execute = AsyncMock(return_value=type("R", (), {"rowcount": 0})())
         await PasswordAccountService(db)._revoke_oauth_grants("u-order")
-        tables = [call.args[0].table.name for call in db.execute.await_args_list]
-        kinds = [type(call.args[0]).__name__ for call in db.execute.await_args_list]
-        assert kinds == ["Delete", "Delete", "Update"]
-        assert tables == ["oauth_authorization_codes", "oauth_device_codes", "oauth_tokens"]
+        statements = [call.args[0] for call in db.execute.await_args_list]
+        kinds = [type(stmt).__name__ for stmt in statements]
+        assert kinds == ["Select", "Delete", "Delete", "Update"]
+        lock, *writes = statements
+        assert lock.get_final_froms()[0].name == "users"
+        assert lock._for_update_arg is not None and not lock._for_update_arg.read
+        assert [w.table.name for w in writes] == [
+            "oauth_authorization_codes",
+            "oauth_device_codes",
+            "oauth_tokens",
+        ]
 
     async def test_a_code_exchange_racing_the_reset_is_revoked(
         self, db_session: AsyncSession, made: _Made, oauth_client: str, async_engine
@@ -596,6 +616,270 @@ class TestResetRevokesOAuthGrants:
 
         db_session.expire_all()
         assert await find_active_oauth_token(token, db_session) is not None
+
+
+def _fake_session_store(monkeypatch, uid: str) -> dict[str, dict]:
+    """One live browser session for ``uid``; the simulated reset clears it."""
+    from types import SimpleNamespace
+
+    from api.routes import auth as auth_routes
+
+    sessions: dict[str, dict] = {"sid-1": {"user_id": uid}}
+    manager = SimpleNamespace(
+        session_holds_user=lambda sid, uid: sessions.get(sid, {}).get("user_id") == uid
+    )
+    monkeypatch.setattr(auth_routes, "get_session_manager", lambda: manager)
+    return sessions
+
+
+async def _writer_waits_on_a_reset(async_engine, uid: str, sessions: dict, writer) -> object:
+    """Run ``writer(sync_session)`` in a thread while a simulated reset holds the user row.
+
+    The reset: ``users FOR UPDATE``, revoke, drop the browser sessions, commit.
+    The writer is released only after the sessions are gone; on any failure
+    the sessions are cleared before the lock is released and the thread is
+    always joined, so a stray writer cannot commit a grant.
+    """
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from tests.conftest import TEST_DATABASE_URL
+
+    sync_engine = create_engine(TEST_DATABASE_URL.replace("+asyncpg", "+psycopg2"))
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        sync = sessionmaker(bind=sync_engine)()
+        try:
+            outcome["result"] = writer(sync)
+        finally:
+            sync.close()
+
+    thread = threading.Thread(target=run)
+    factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with factory() as reset:
+            reset_pid = await reset.scalar(text("SELECT pg_backend_pid()"))
+            await reset.execute(select(User.user_id).where(User.user_id == uid).with_for_update())
+            thread.start()
+            try:
+                await _wait_until_blocked(async_engine, blocked_by=reset_pid)
+                assert thread.is_alive()
+                await reset.execute(
+                    delete(OAuth2AuthorizationCode).where(OAuth2AuthorizationCode.user_id == uid)
+                )
+                await reset.execute(delete(OAuth2DeviceCode).where(OAuth2DeviceCode.user_id == uid))
+            finally:
+                sessions.clear()  # before the lock is released, whatever happened above
+            await reset.commit()
+    finally:
+        if thread.is_alive() or thread.ident is not None:
+            await asyncio.to_thread(thread.join, 10)
+        sync_engine.dispose()
+    return outcome.get("result")
+
+
+class TestGrantWritersRacingTheReset:
+    """A consent or device approval racing the reset leaves no usable grant (#1770).
+
+    Both writers share-lock the owner's ``users`` row before they write and
+    re-check the browser session afterwards. The two orders:
+
+    - writer first: the reset waits on the user row, then its revocation
+      covers the grant the writer committed;
+    - reset first: the writer waits on the user row; by the time it gets it
+      the reset has deleted the sessions, so the re-check fails and nothing
+      is written.
+    """
+
+    async def test_a_consent_racing_the_reset_is_deleted(
+        self, db_session: AsyncSession, made: _Made, oauth_client: str, async_engine
+    ) -> None:
+        user = await _user(db_session, made)
+        uid = user.user_id
+        service = PasswordAccountService(db_session, email_service=_email())
+        pending = await service.request_reset(email=user.email)
+        assert pending is not None
+        code = f"consent-{uuid4().hex}"
+
+        factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+        async with factory() as consent:
+            # save_authorization_code: owner KEY SHARE, session check, INSERT.
+            await consent.execute(
+                select(User.user_id)
+                .where(User.user_id == uid)
+                .with_for_update(read=True, key_share=True)
+            )
+            reset = asyncio.create_task(
+                service.complete_reset(raw_token=_token_from(pending.reset_url), new_password=NEW)
+            )
+            await _wait_until_blocked(async_engine)  # the reset waits on the user row
+            assert not reset.done()
+            consent.add(
+                OAuth2AuthorizationCode(
+                    code=code,
+                    client_id=oauth_client,
+                    user_id=uid,
+                    redirect_uri="https://client.example/cb",
+                    scope="memory:read",
+                    expires_at=utcnow() + timedelta(minutes=5),
+                )
+            )
+            await consent.commit()
+        await asyncio.wait_for(reset, timeout=10)
+
+        db_session.expire_all()
+        assert (
+            await db_session.scalar(
+                select(OAuth2AuthorizationCode).where(OAuth2AuthorizationCode.code == code)
+            )
+        ) is None
+
+    async def test_a_device_approval_racing_the_reset_is_deleted(
+        self, db_session: AsyncSession, made: _Made, oauth_client: str, async_engine
+    ) -> None:
+        user = await _user(db_session, made)
+        uid = user.user_id
+        suffix = uuid4().hex
+        db_session.add(
+            OAuth2DeviceCode(
+                device_code=f"dc-{suffix}",
+                user_code=suffix[:8].upper(),
+                client_id=oauth_client,
+                user_id=None,  # pending: nobody has approved it yet
+                scope="memory:read",
+                expires_at=utcnow() + timedelta(minutes=10),
+            )
+        )
+        await db_session.commit()
+        service = PasswordAccountService(db_session, email_service=_email())
+        pending = await service.request_reset(email=user.email)
+        assert pending is not None
+
+        factory = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+        async with factory() as approval:
+            # device_confirm: owner KEY SHARE first, then the device-code row.
+            await approval.execute(
+                select(User.user_id)
+                .where(User.user_id == uid)
+                .with_for_update(read=True, key_share=True)
+            )
+            await approval.execute(
+                select(OAuth2DeviceCode)
+                .where(OAuth2DeviceCode.device_code == f"dc-{suffix}")
+                .with_for_update()
+            )
+            reset = asyncio.create_task(
+                service.complete_reset(raw_token=_token_from(pending.reset_url), new_password=NEW)
+            )
+            await _wait_until_blocked(async_engine)  # the reset waits on the user row
+            assert not reset.done()
+            await approval.execute(
+                update(OAuth2DeviceCode)
+                .where(OAuth2DeviceCode.device_code == f"dc-{suffix}")
+                .values(user_id=uid, authorized_at=utcnow())
+            )
+            await approval.commit()
+        await asyncio.wait_for(reset, timeout=10)
+
+        db_session.expire_all()
+        assert (
+            await db_session.scalar(
+                select(OAuth2DeviceCode).where(OAuth2DeviceCode.device_code == f"dc-{suffix}")
+            )
+        ) is None
+
+    async def test_a_consent_that_waited_on_the_reset_writes_no_code(
+        self, db_session: AsyncSession, made: _Made, oauth_client: str, async_engine, monkeypatch
+    ) -> None:
+        """The real grant, on a real sync session, against a reset holding the user row."""
+        from types import SimpleNamespace
+
+        from authlib.oauth2.rfc6749.errors import AccessDeniedError
+        from authlib.oauth2.rfc6749.requests import BasicOAuth2Payload
+
+        from auth.oauth2_server import AuthorizationCodeGrant, _OAuthUser
+
+        user = await _user(db_session, made)
+        uid = user.user_id
+        client = await db_session.scalar(
+            select(OAuth2Client).where(OAuth2Client.client_id == oauth_client)
+        )
+        assert client is not None
+        code = f"late-{uuid4().hex}"
+        sessions = _fake_session_store(monkeypatch, uid)
+
+        def consent(sync) -> str:
+            grant = AuthorizationCodeGrant.__new__(AuthorizationCodeGrant)
+            grant.server = SimpleNamespace(db_session=sync)
+            request = SimpleNamespace(
+                client=client,
+                user=_OAuthUser(user_id=uid, email=user.email, session_id="sid-1"),
+                payload=BasicOAuth2Payload(
+                    {"redirect_uri": "https://client.example/cb", "scope": "memory:read"}
+                ),
+            )
+            try:
+                grant.save_authorization_code(code, request)
+                return "saved"
+            except AccessDeniedError:
+                sync.rollback()
+                return "denied"
+
+        outcome = await _writer_waits_on_a_reset(async_engine, uid, sessions, consent)
+
+        assert outcome == "denied"
+        assert (
+            await db_session.scalar(
+                select(OAuth2AuthorizationCode).where(OAuth2AuthorizationCode.code == code)
+            )
+        ) is None
+
+    async def test_a_device_approval_that_waited_on_the_reset_approves_nothing(
+        self, db_session: AsyncSession, made: _Made, oauth_client: str, async_engine, monkeypatch
+    ) -> None:
+        """The real approval body, on a real sync session, against a reset holding the user row."""
+        from fastapi import HTTPException
+
+        from api.routes.oauth import _confirm_device_sync
+
+        user = await _user(db_session, made)
+        uid = user.user_id
+        suffix = uuid4().hex
+        user_code = suffix[:8].upper()
+        db_session.add(
+            OAuth2DeviceCode(
+                device_code=f"dc-{suffix}",
+                user_code=user_code,
+                client_id=oauth_client,
+                user_id=None,
+                scope="memory:read",
+                expires_at=utcnow() + timedelta(minutes=10),
+            )
+        )
+        await db_session.commit()
+        sessions = _fake_session_store(monkeypatch, uid)
+
+        def approve(sync) -> str:
+            monkeypatch.setattr("api.routes.oauth.get_sync_session", lambda: sync)
+            try:
+                status_str, _, _ = _confirm_device_sync(
+                    user_id=uid, session_id="sid-1", user_code=user_code, approve=True
+                )
+                return status_str
+            except HTTPException as exc:
+                return f"http {exc.status_code}"
+
+        outcome = await _writer_waits_on_a_reset(async_engine, uid, sessions, approve)
+
+        assert outcome == "http 401"
+        db_session.expire_all()
+        device = await db_session.scalar(
+            select(OAuth2DeviceCode).where(OAuth2DeviceCode.device_code == f"dc-{suffix}")
+        )
+        assert device is not None and device.authorized_at is None and device.user_id is None
 
 
 class TestBackgroundResetRequest:

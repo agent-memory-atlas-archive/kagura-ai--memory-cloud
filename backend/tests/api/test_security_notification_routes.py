@@ -382,6 +382,8 @@ class TestOAuthRoutes:
         monkeypatch.setattr(
             oauth_routes, "_get_user_from_session", lambda request: {"user_id": "u-1"}
         )
+        # The approving browser session is still there (#1770 re-check).
+        monkeypatch.setattr(oauth_routes, "browser_session_is_live", lambda sid, uid: True)
         return session
 
     @pytest.mark.asyncio
@@ -522,6 +524,19 @@ async def oauth_rows(db_session: AsyncSession) -> AsyncIterator[dict]:
             scope="memory:read memory:write",
         )
     )
+    # The approving user must exist: a device approval share-locks the
+    # owner's row and refuses when it is gone (#1770).
+    db_session.add(
+        User(
+            user_id=rows["user_id"],
+            email=f"{rows['user_id']}@example.test",
+            name="Notice User",
+            role="user",
+            is_initial_admin=False,
+            auth_method="oauth",
+            auth_provider="google",
+        )
+    )
     await db_session.commit()
     yield rows
     await db_session.rollback()
@@ -530,6 +545,7 @@ async def oauth_rows(db_session: AsyncSession) -> AsyncIterator[dict]:
     await db_session.execute(
         delete(OAuth2Client).where(OAuth2Client.client_id == rows["client_id"])
     )
+    await db_session.execute(delete(User).where(User.user_id == rows["user_id"]))
     await db_session.commit()
 
 
@@ -946,6 +962,7 @@ class TestDeviceApprovalCommitsDespiteNoticeFailure:
             "_get_user_from_session",
             lambda request: {"user_id": oauth_rows["user_id"]},
         )
+        monkeypatch.setattr(oauth_routes, "browser_session_is_live", lambda sid, uid: True)
         tasks = MagicMock()
         tasks.add_task.side_effect = RuntimeError("queue broken")
 

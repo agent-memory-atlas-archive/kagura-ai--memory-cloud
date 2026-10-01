@@ -73,6 +73,17 @@ def db_factory() -> Iterator[sessionmaker]:
     with factory() as db:
         db.add_all(
             [
+                # The approving user must exist: the approval share-locks the
+                # owner's row and refuses when it is gone (#1770).
+                User(
+                    user_id="device-user",
+                    email="device-user@example.test",
+                    name="Device User",
+                    role="user",
+                    is_initial_admin=False,
+                    auth_method="oauth",
+                    auth_provider="google",
+                ),
                 OAuth2Client(
                     client_id=CLI_CLIENT, client_name="Test CLI", scope=CLI_SCOPE, **common
                 ),
@@ -109,6 +120,8 @@ def api(db_factory: sessionmaker, monkeypatch: pytest.MonkeyPatch) -> Iterator[T
             "api.routes.oauth._get_user_from_session",
             return_value={"user_id": "device-user", "email": "device-user@example.test"},
         ),
+        # The approving browser session is still there (#1770 re-check).
+        patch("api.routes.oauth.browser_session_is_live", return_value=True),
     ):
         # Authlib refuses the token endpoint over plain http.
         yield TestClient(app, base_url="https://testserver")

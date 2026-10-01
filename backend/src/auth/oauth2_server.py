@@ -39,6 +39,7 @@ from typing import Any, cast
 from authlib.oauth2 import OAuth2Request
 from authlib.oauth2.rfc6749 import grants
 from authlib.oauth2.rfc6749.errors import (
+    AccessDeniedError,
     InvalidGrantError,
     InvalidRequestError,
     InvalidScopeError,
@@ -52,6 +53,8 @@ from authlib.oauth2.rfc7636.challenge import (
     compare_s256_code_challenge,
 )
 from authlib.oauth2.rfc8628 import DeviceCodeGrant as _DeviceCodeGrant
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -303,19 +306,91 @@ class S256CodeChallenge(CodeChallenge):
             raise InvalidGrantError(description="Code challenge failed.")
 
 
+def browser_session_is_live(session_id: str | None, user_id: str) -> bool:
+    """Is ``user_id`` still signed in on browser session ``session_id``?
+
+    The check a grant writer runs AFTER it has taken the owner's ``users``
+    row ``FOR KEY SHARE`` (#1770): a password reset deletes the account's
+    sessions before it commits and releases its ``FOR UPDATE``, so a writer
+    that waited on the lock asks this and is told no. Membership is judged
+    the way the reset judges it (any account on the session, not only the
+    active one — a tab that switched accounts mid-consent does not refuse a
+    user who is still signed in), without refreshing the session's TTL.
+    Fails closed: no cookie, no session store, no session, not a member → False.
+    """
+    if not session_id:
+        return False
+    # Lazy: the routes package imports this module's siblings at load time.
+    from api.routes.auth import get_session_manager
+
+    manager = get_session_manager()
+    if manager is None:
+        logger.error("grant_session_check_unavailable", user_id=user_id)
+        return False
+    return bool(manager.session_holds_user(session_id, user_id))
+
+
+class TemporarilyUnavailableError(OAuth2Error):
+    """RFC 6749 §4.1.2.1 ``temporarily_unavailable``: the owner row was held too long."""
+
+    error = "temporarily_unavailable"
+
+
+class OwnerLockTimeout(Exception):
+    """The owner's ``users`` row stayed locked for longer than a grant may wait."""
+
+
+# How long a grant writer waits on the owner's row. A reset or an erasure
+# holds it for the length of its transaction; a writer that waits longer
+# than this is parked on a worker thread for nothing the client can use, so
+# it gives up and the client retries. Postgres syntax; the sync engine is
+# Postgres everywhere but the SQLite unit fixtures, which skip the SET.
+_GRANT_LOCK_TIMEOUT_SQL = text("SET LOCAL lock_timeout = '5000ms'")
+_PG_LOCK_NOT_AVAILABLE = "55P03"
+
+
+def share_lock_owner(session: Session, user_id: str) -> bool:
+    """``users FOR KEY SHARE`` for ``user_id``, waiting at most the grant timeout.
+
+    Returns whether the row exists (an erasure deletes it inside the
+    transaction that held it). Raises ``OwnerLockTimeout`` when the wait ran
+    out; any other database error propagates.
+    """
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(_GRANT_LOCK_TIMEOUT_SQL)
+    try:
+        owner = (
+            session.query(User.user_id)
+            .filter_by(user_id=user_id)
+            .with_for_update(read=True, key_share=True)
+            .first()
+        )
+    except OperationalError as exc:
+        if getattr(exc.orig, "pgcode", None) == _PG_LOCK_NOT_AVAILABLE:
+            raise OwnerLockTimeout() from exc
+        raise
+    return owner is not None
+
+
 class _OAuthUser:
     """Minimal user object for Authlib grant interfaces.
 
     Provides both ``user_id`` attribute (used by ``save_token``) and
     ``get_user_id()`` method (used by ``DeviceCodeGrant.query_user_grant``).
+    ``session_id`` is the browser session the consent was given in;
+    ``save_authorization_code`` re-checks it under the owner lock (#1770).
     """
 
-    def __init__(self, user_id: str = "", email: str | None = None):
+    def __init__(self, user_id: str = "", email: str | None = None, session_id: str | None = None):
         self.user_id = user_id
         self.email = email
+        self.session_id = session_id
 
     def get_user_id(self) -> str:
         return self.user_id
+
+    def session_is_live(self) -> bool:
+        return browser_session_is_live(self.session_id, self.user_id)
 
 
 # ============================================================================
@@ -581,6 +656,47 @@ class AuthorizationCodeGrant(_ResourceBoundGrant, grants.AuthorizationCodeGrant)
         if not user_id:
             logger.error("Cannot save authorization code: user_id not found")
             raise ValueError("User ID required for authorization")
+
+        # #1770: serialize with a password reset or an account erasure, then
+        # make sure the consent is still backed by a live session of a user
+        # who still exists. The owner's ``users`` row is share-locked first
+        # (users → codes, the order every grant path keeps; see
+        # services/oauth_grant_revocation.py). A reset that got there first
+        # holds it FOR UPDATE until it has deleted the codes AND the browser
+        # sessions, so once this lock is granted a vanished session means the
+        # reset ran; an erasure deletes the row itself. Either way: write
+        # nothing and send the client access_denied — with the redirect URI
+        # the request validated, so Authlib answers with the redirect and not
+        # a bare error body — instead of a code the revocation could not see.
+        # A consent that locked first commits before the reset's DELETE,
+        # which then covers it.
+        # Authlib copies the request's state onto the error before it builds
+        # the redirect, so only the redirect URI is passed here.
+        redirect_uri = request_data.get("redirect_uri")
+        try:
+            owner_exists = share_lock_owner(self.server.db_session, user_id)
+        except OwnerLockTimeout:
+            logger.warning(
+                "authorization_code_refused",
+                client_id=client_id,
+                user_id=user_id,
+                reason="owner_lock_timeout",
+            )
+            raise TemporarilyUnavailableError(
+                description="The account is being updated; please try again.",
+                redirect_uri=redirect_uri,
+            ) from None
+        check = getattr(request.user, "session_is_live", None)
+        if not owner_exists or check is None or not check():
+            logger.warning(
+                "authorization_code_refused",
+                client_id=client_id,
+                user_id=user_id,
+                reason="session_gone" if owner_exists else "user_gone",
+            )
+            raise AccessDeniedError(
+                description="The session is no longer valid.", redirect_uri=redirect_uri
+            )
 
         # Create authorization code record (expires in 10 minutes)
         auth_code = OAuth2AuthorizationCode(

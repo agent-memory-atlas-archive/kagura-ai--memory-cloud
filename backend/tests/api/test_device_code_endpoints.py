@@ -35,6 +35,13 @@ def _under_rate_limit():
         yield counter
 
 
+@pytest.fixture(autouse=True)
+def _browser_session_live():
+    """The approving browser session is still there (#1770 re-check)."""
+    with patch("api.routes.oauth.browser_session_is_live", return_value=True) as live:
+        yield live
+
+
 def _device_settings(**overrides):
     values = {
         "oauth_device_code_expires_in": 600,
@@ -305,6 +312,142 @@ class TestDeviceConfirmEndpoint:
         data = resp.json()
         assert data["status"] == "denied"
         assert test_device_code.denied_at is not None
+
+    def test_confirm_approve_refuses_when_the_session_is_gone(
+        self, test_device_code, _browser_session_live
+    ):
+        # #1770: the owner lock is granted only after a racing reset has
+        # committed — and it deleted the browser sessions first. Approve
+        # nothing, roll back, do not commit.
+        _browser_session_live.return_value = False
+        with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
+            mock_get_user.return_value = {"user_id": "test_user_123"}
+            with patch("api.routes.oauth.get_sync_session") as mock_session_fn:
+                mock_db = MagicMock()
+                mock_q = MagicMock()
+                mock_q.filter_by().with_for_update().first.return_value = test_device_code
+                mock_db.query.return_value = mock_q
+                mock_session_fn.return_value = mock_db
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/oauth/device/confirm",
+                    json={"user_code": "TST12345", "approve": True},
+                )
+
+        assert resp.status_code == 401
+        assert test_device_code.authorized_at is None
+        assert test_device_code.user_id is None
+        assert mock_db.rollback.called
+        mock_db.commit.assert_not_called()
+        _browser_session_live.assert_called_once()
+        assert _browser_session_live.call_args.args[1] == "test_user_123"
+
+    def test_confirm_approve_refuses_when_the_user_row_is_gone(self, test_device_code):
+        # #1770: an erasure deletes the users row inside the transaction that
+        # holds it FOR UPDATE; an approval that waited on it finds no owner
+        # and must not approve a code for an erased account, even if the
+        # browser session has not been swept yet.
+        with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
+            mock_get_user.return_value = {"user_id": "test_user_123"}
+            with patch("api.routes.oauth.get_sync_session") as mock_session_fn:
+                mock_db = MagicMock()
+
+                def query(model):
+                    q = MagicMock()
+                    is_user = "user_id" in (getattr(model, "__name__", None) or str(model))
+                    q.filter_by.return_value.with_for_update.return_value.first.return_value = (
+                        None if is_user else test_device_code
+                    )
+                    return q
+
+                mock_db.query.side_effect = query
+                mock_session_fn.return_value = mock_db
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/oauth/device/confirm",
+                    json={"user_code": "TST12345", "approve": True},
+                )
+
+        assert resp.status_code == 401
+        assert test_device_code.authorized_at is None
+        mock_db.commit.assert_not_called()
+
+    def test_confirm_approve_answers_503_when_the_owner_lock_times_out(self, test_device_code):
+        # A reset or erasure held the owner row past the grant's wait.
+        from auth.oauth2_server import OwnerLockTimeout
+
+        with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
+            mock_get_user.return_value = {"user_id": "test_user_123", "session_id": "sid"}
+            with (
+                patch("api.routes.oauth.get_sync_session") as mock_session_fn,
+                patch("api.routes.oauth.share_lock_owner", side_effect=OwnerLockTimeout()),
+            ):
+                mock_db = MagicMock()
+                mock_session_fn.return_value = mock_db
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/oauth/device/confirm",
+                    json={"user_code": "TST12345", "approve": True},
+                )
+
+        assert resp.status_code == 503
+        assert resp.headers.get("retry-after") == "5"
+        assert test_device_code.authorized_at is None
+        mock_db.commit.assert_not_called()
+
+    def test_confirm_approve_share_locks_the_owner_before_the_device_row(self, test_device_code):
+        # #1770: users → codes, the order every grant path and the reset keep.
+        order: list[str] = []
+        with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
+            mock_get_user.return_value = {"user_id": "test_user_123"}
+            with patch("api.routes.oauth.get_sync_session") as mock_session_fn:
+                mock_db = MagicMock()
+
+                def query(model):
+                    q = MagicMock()
+                    name = getattr(model, "__name__", None) or str(model)
+                    q.filter_by.return_value.with_for_update.side_effect = lambda **kw: (
+                        order.append((name, kw)) or q
+                    )
+                    q.first.return_value = test_device_code
+                    return q
+
+                mock_db.query.side_effect = query
+                mock_session_fn.return_value = mock_db
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/oauth/device/confirm",
+                    json={"user_code": "TST12345", "approve": True},
+                )
+
+        assert resp.status_code == 200
+        assert len(order) == 2
+        assert order[0][1] == {"read": True, "key_share": True}
+        assert "user_id" in order[0][0]  # the users.user_id column
+        assert order[1][1] == {}  # the device-code row, FOR UPDATE
+
+    def test_confirm_deny_takes_no_owner_lock(self, test_device_code):
+        # A denial writes no grant, so it does not serialize with the reset.
+        with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
+            mock_get_user.return_value = {"user_id": "test_user_123"}
+            with patch("api.routes.oauth.get_sync_session") as mock_session_fn:
+                mock_db = MagicMock()
+                mock_q = MagicMock()
+                mock_q.filter_by().with_for_update().first.return_value = test_device_code
+                mock_db.query.return_value = mock_q
+                mock_session_fn.return_value = mock_db
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/oauth/device/confirm",
+                    json={"user_code": "TST12345", "approve": False},
+                )
+
+        assert resp.status_code == 200
+        assert mock_db.query.call_count == 1
 
     def test_confirm_unauthenticated(self):
         with patch("api.routes.oauth._get_user_from_session") as mock_get_user:
@@ -667,6 +810,19 @@ class TestDeviceSignInWithinLimits:
             model.__table__.create(engine)
         factory = sessionmaker(bind=engine, expire_on_commit=False)
         with factory() as db:
+            # The approving user must exist: the approval share-locks the
+            # owner's row and refuses when it is gone (#1770).
+            db.add(
+                User(
+                    user_id="device_flow_user",
+                    email="user@example.test",
+                    name="Device User",
+                    role="user",
+                    is_initial_admin=False,
+                    auth_method="oauth",
+                    auth_provider="google",
+                )
+            )
             db.add(
                 OAuth2Client(
                     client_id="device-flow-test-cli",
