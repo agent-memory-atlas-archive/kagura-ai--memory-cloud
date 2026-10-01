@@ -97,8 +97,20 @@ export function ContextBreakdownTable({
       context.created_by_name,
       { you: t("ownerYou"), unnamed: t("ownerUnnamed") },
     );
-  const visibilityLabel = (context: DashboardContextStats) =>
-    context.is_private ? t("privateContext") : t("sharedContext");
+  // #1777: beside the name, only a context someone else created gets a
+  // marker. A workspace-shared one reads "Shared by {creator}"; another
+  // member's private context — which a workspace owner sees by privilege,
+  // not because anyone shared it — reads "Created by {creator}". The
+  // viewer's own rows and rows with no known creator show nothing extra.
+  const creatorMarker = (context: DashboardContextStats): string | null => {
+    if (contextOwnerKind(context.created_by, currentUserId) !== "shared") {
+      return null;
+    }
+    const name = context.created_by_name || t("ownerUnnamed");
+    return context.is_private
+      ? t("createdByName", { name })
+      : t("sharedBy", { name });
+  };
 
   const [sortBy, setSortBy] = useState<SortColumn>("memory");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
@@ -303,17 +315,17 @@ export function ContextBreakdownTable({
                       <TableRow key={context.context_id}>
                         <TableCell className="font-medium">
                           <div className="flex items-center gap-2">
-                            {/* Decorative: the text label beside the name
-                                says the same thing (#1755). */}
                             {context.is_private ? (
                               <Lock
                                 className="h-3 w-3 text-gray-400"
-                                aria-hidden="true"
+                                aria-label={t("privateContext")}
+                                role="img"
                               />
                             ) : (
                               <Users
                                 className="h-3 w-3 text-blue-500"
-                                aria-hidden="true"
+                                aria-label={t("sharedContext")}
+                                role="img"
                               />
                             )}
                             <Link
@@ -322,10 +334,13 @@ export function ContextBreakdownTable({
                             >
                               {context.context_name}
                             </Link>
-                            {/* #1755: the icon alone did not say what it meant */}
-                            <span className="text-xs text-gray-500 dark:text-gray-400">
-                              {visibilityLabel(context)}
-                            </span>
+                            {/* #1777: who this context came from, when it
+                                is not the viewer's own */}
+                            {creatorMarker(context) && (
+                              <span className="text-xs text-gray-500 dark:text-gray-400">
+                                {creatorMarker(context)}
+                              </span>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell className="text-right">
