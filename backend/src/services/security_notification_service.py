@@ -202,13 +202,19 @@ class SecurityEvent(StrEnum):
     SIGN_IN_METHOD_ADDED = "sign_in_method_added"
     OAUTH_CLIENT_CREATED = "oauth_client_created"
     EMAIL_CHANGED = "email_changed"
+    NEW_DEVICE_SIGN_IN = "new_device_sign_in"
 
 
 # The label of the sign-in method line, per event.
 _SIGN_IN_METHOD_LABELS: dict[SecurityEvent, str] = {
     SecurityEvent.SIGN_IN_METHOD_ADDED: "Added:  ",
     SecurityEvent.EMAIL_CHANGED: "Via:    ",
+    SecurityEvent.NEW_DEVICE_SIGN_IN: "Via:    ",
 }
+
+# Events that are a sign-in, not a change to the account (#1769): the email's
+# opening line and the digest wording say so.
+_SIGN_IN_EVENTS = frozenset({SecurityEvent.NEW_DEVICE_SIGN_IN})
 
 # How a linked / unlinked sign-in provider is named in a notice.
 PROVIDER_SIGN_IN_LABELS = {"google": "Google sign-in", "github": "GitHub sign-in"}
@@ -262,6 +268,11 @@ _EVENT_TEXT: dict[SecurityEvent, tuple[str, str]] = {
         "The email address of your Kagura account was changed",
         "The account's email address was changed to the one a sign-in provider "
         "reported. Security notices now go to the new address, not to this one.",
+    ),
+    # #1769: a browser sign-in from a device the account had not used before.
+    SecurityEvent.NEW_DEVICE_SIGN_IN: (
+        "New sign-in to your Kagura account from an unrecognized device",
+        "Your account was signed in to from a browser it had not been used on before.",
     ),
 }
 
@@ -455,13 +466,20 @@ def render_security_notification(
     count = max(total or 0, len(occurrences))
     listed = occurrences[:_DIGEST_MAX_OCCURRENCES]
 
+    what = "sign-in" if event in _SIGN_IN_EVENTS else "change"
     lines: list[str] = []
     if digest:
         subject = f"{subject} ({count} more {'time' if count == 1 else 'times'})"
         lines += [
             "This is a follow-up to the security notices we sent you a few minutes ago.",
-            f"Since then the same change happened {count} more "
+            f"Since then the same {what} happened {count} more "
             f"{'time' if count == 1 else 'times'}, within {window_minutes} minutes of the first:",
+        ]
+    elif event in _SIGN_IN_EVENTS:
+        lines += [
+            "Your Kagura Memory Cloud account was signed in to from a device we had not",
+            "seen before. If this was you — a new browser, computer or phone, or a browser",
+            "whose cookies were cleared — no action is needed.",
         ]
     else:
         lines += [
@@ -488,7 +506,7 @@ def render_security_notification(
         lines.append("")
     if not listed:
         lines += [
-            f"  {count} {'occurrence' if count == 1 else 'occurrences'} of this change "
+            f"  {count} {'occurrence' if count == 1 else 'occurrences'} of this {what} "
             "could not be listed: their details",
             "  expired before this email was sent.",
             "",
@@ -496,11 +514,25 @@ def render_security_notification(
     elif count > len(listed):
         lines += [f"  ... and {count - len(listed)} more.", ""]
 
+    lines.append("Wasn't you?")
+    if event in _SIGN_IN_EVENTS:
+        lines += [
+            'If the account has a password, reset it with "Forgot password?" on the',
+            "sign-in page: a reset signs every browser out and revokes the account's",
+            "connected apps (changing the password from your profile keeps this",
+            "browser signed in). If you sign in with Google or GitHub, secure that",
+            "account first — its password and its sessions. Then review your sign-in",
+            "methods on your profile page, and your keys and apps under",
+            "Integrations > API Keys and OAuth Apps in your workspace. Remove",
+            "anything you do not recognize:",
+        ]
+    else:
+        lines += [
+            "Sign in and review your sign-in methods on your profile page, and your",
+            "keys and apps under Integrations > API Keys and OAuth Apps in your",
+            "workspace. Remove anything you do not recognize:",
+        ]
     lines += [
-        "Wasn't you?",
-        "Sign in and review your sign-in methods on your profile page, and your",
-        "keys and apps under Integrations > API Keys and OAuth Apps in your",
-        "workspace. Remove anything you do not recognize:",
         "",
         f"  {profile_page_url}",
         "",
@@ -509,7 +541,8 @@ def render_security_notification(
         "password. We never ask for your password or keys by email.",
         "",
         "You receive this notice for every security-sensitive change to your",
-        "account; it cannot be turned off.",
+        "account and every sign-in from an unrecognized device; it cannot be",
+        "turned off.",
     ]
     return subject, "\n".join(lines) + "\n"
 
@@ -712,6 +745,7 @@ def spawn_security_notification(
     *,
     user_id: str,
     event: SecurityEvent,
+    request: Request | Any = None,
     ip: str | None = None,
     user_agent: str | None = None,
     key_name: str | None = None,
@@ -722,8 +756,9 @@ def spawn_security_notification(
 ) -> None:
     """Start the notice for a committed change made outside an HTTP route.
 
-    For callers without ``BackgroundTasks`` (MCP tools). Same arguments and
-    the same never-raise contract as :func:`schedule_security_notification`.
+    For callers without ``BackgroundTasks`` (MCP tools, or a route that has
+    already built its response). Same arguments and the same never-raise
+    contract as :func:`schedule_security_notification`.
     """
     try:
         task = asyncio.get_running_loop().create_task(
@@ -732,7 +767,7 @@ def spawn_security_notification(
                 event,
                 **_notice_kwargs(
                     user_id,
-                    request=None,
+                    request=request,
                     ip=ip,
                     user_agent=user_agent,
                     key_name=key_name,

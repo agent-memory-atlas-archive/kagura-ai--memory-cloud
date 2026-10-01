@@ -48,7 +48,28 @@ We aim to acknowledge reports within 48 hours and provide a fix within 7 days fo
     an OAuth client is registered or its secret regenerated — also when a
     workspace admin or owner does it, whom the email then names;
   - a provider sign-in changes the account's email address: the previous
-    address is told, and the notices still pending go to it.
+    address is told, and the notices still pending go to it;
+  - a browser signs in (password, with or without MFA, Google or GitHub)
+    from a device the account has not signed in from before. The browser is
+    recognized by a long-lived HttpOnly device cookie; only the keyed HMAC of
+    its value is stored, with first/last sign-in times — not the IP address
+    or user agent. Those go into the email and, like every notice's details,
+    sit in the notice queue (Redis) only while a notice is coalesced or
+    retried, at most about eight days. The user agent is not part of the
+    match — it is spoofable. An account's first browser
+    sign-in ever registers the device silently (so the device the account
+    was created from sends nothing); from then on the account stays armed. A
+    password reset forgets every known device but not that the account is
+    armed, so the next sign-in from each browser — the attacker's included,
+    even when it comes first — is reported. Devices not seen for
+    `KNOWN_DEVICE_RETENTION_DAYS` (default 180, at most 365) are forgotten by
+    a daily job and reported again on their next sign-in, at most
+    `KNOWN_DEVICE_MAX_PER_USER` (default 20) are kept per account, and
+    account erasure deletes them. An authenticated password change keeps the
+    known devices: it already signs the other browsers out, and forgetting
+    them would report every one of the owner's own browsers again. CLI / MCP
+    sign-ins (device flow, token endpoint) carry no cookie and are not
+    covered.
 
   Each email lists the UTC time, IP address, user agent and the key or client
   name. It never carries a secret, token, key value or action link; the

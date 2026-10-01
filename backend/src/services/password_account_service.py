@@ -62,6 +62,7 @@ from services.email_service import (
     EmailService,
     get_email_service,
 )
+from services.known_device_service import known_devices_delete
 from services.oauth_grant_revocation import revoke_oauth_grants
 from utils.datetime import utcnow
 from utils.exceptions import (
@@ -292,6 +293,9 @@ class PasswordAccountService:
         user.password_hash = password_hash
         await self._invalidate_password_links(user.user_id)
         tokens_revoked = await self._revoke_oauth_grants(user.user_id)
+        # #1769: forget every known browser, so the next sign-in from each —
+        # the attacker's included — is a new device and emails the owner.
+        await self.db.execute(known_devices_delete(user.user_id))
         self._audit(user.user_id, _AUDIT_ACTOR_LINK, "password_reset", ip_address, user_agent)
         await self._revoke_then_commit(user.user_id, revoke_sessions)
         logger.info(

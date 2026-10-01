@@ -45,13 +45,14 @@ from auth.dependencies import SessionUser
 from auth.oauth2 import OAuth2Manager
 from auth.password import hash_password, verify_password
 from auth.roles import get_role_manager
-from auth.session import SessionManager
+from auth.session import SessionManager, browser_cookie_attrs
 from auth.totp import verify_totp
 from config.settings import TERMS_VERSION_RE
 from db.base import get_db
 from models.auth import User
 from services.account_linking_service import AccountLinkingService
 from services.beta_invite_service import BETA_INVITE_TOKEN_PATTERN
+from services.known_device_service import note_browser_sign_in
 from services.password_account_service import find_password_user_by_email
 from services.security_notification_service import (
     PROVIDER_SIGN_IN_LABELS,
@@ -1012,6 +1013,10 @@ async def google_callback(
         # the divergence — and gives multi-account (#1488) a single place to
         # change.
         _set_session_cookie(redirect, session_id)
+        # #1769: alert the owner when this browser has not signed in before.
+        await _note_provider_sign_in(
+            request, redirect, provider="google", idp_sub=user_info["sub"], method="Google"
+        )
 
         logger.info(f"OAuth2 login successful: {user_info['email']} (role={role})")
 
@@ -1480,6 +1485,30 @@ async def _owning_user(db: AsyncSession, provider: str, idp_sub: str) -> tuple[s
             )
         ).first()
     return (row[0], row[1]) if row is not None else None
+
+
+async def _note_provider_sign_in(
+    request: Request, response: Response, *, provider: str, idp_sub: str, method: str
+) -> None:
+    """Record the device of an OAuth sign-in for the account that owns the identity.
+
+    A provider linked to another account (#517) signs in to that account's
+    ``user_id``, not to the sub, so the owner is resolved the way
+    :func:`_owning_user` does before the device is recorded (#1769). Never
+    raises — the sign-in stands.
+    """
+    owner_id = idp_sub
+    try:
+        async for db in get_db():
+            owner = await _owning_user(db, provider, idp_sub)
+            if owner is not None:
+                owner_id = owner[0]
+            break
+    except Exception as exc:
+        logger.error(
+            "sign_in_owner_lookup_failed", provider=provider, error_type=type(exc).__name__
+        )
+    await note_browser_sign_in(request, response, user_id=owner_id, sign_in_method=method)
 
 
 async def _record_terms_acceptance(
@@ -2069,6 +2098,10 @@ async def github_callback(
         # `secure=False`, so the OAuth session cookie had no Secure attribute in
         # production. Route it through the shared helper.
         _set_session_cookie(redirect, session_id)
+        # #1769: alert the owner when this browser has not signed in before.
+        await _note_provider_sign_in(
+            request, redirect, provider="github", idp_sub=user_info["sub"], method="GitHub"
+        )
 
         logger.info(f"GitHub OAuth2 login successful: {user_info['email']} (role={role})")
         return redirect
@@ -2180,15 +2213,11 @@ def _set_session_cookie(response: Response, session_id: str) -> None:
     """Set session cookie on response."""
     if not _session_manager:
         return
-    is_production = os.getenv("ENVIRONMENT", "development") == "production"
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=session_id,
-        path="/",
-        httponly=True,
-        secure=is_production,
-        samesite="lax",
         max_age=_session_manager.session_ttl,
+        **browser_cookie_attrs(),
     )
 
 
@@ -2485,6 +2514,8 @@ async def password_login(
         media_type="application/json",
     )
     _set_session_cookie(response, session_id)
+    # #1769: alert the owner when this browser has not signed in before.
+    await note_browser_sign_in(request, response, user_id=user.user_id, sign_in_method="Password")
 
     logger.info("password_login_successful", user_id=user.user_id)
     return response
@@ -2552,6 +2583,8 @@ async def mfa_verify(
         media_type="application/json",
     )
     _set_session_cookie(response, session_id)
+    # #1769: the second factor passed — only now is this a sign-in to record.
+    await note_browser_sign_in(request, response, user_id=user.user_id, sign_in_method="Password")
 
     logger.info(f"MFA verification successful: {user.email}")
     return response
