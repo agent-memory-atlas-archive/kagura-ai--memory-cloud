@@ -35,6 +35,8 @@ from services.security_notification_service import (
     schedule_security_notification,
 )
 from services.slack_channels import (
+    PRIVATE_CHANNELS_SCOPE,
+    SLACK_CHANNEL_TYPES_PUBLIC,
     SlackChannel,
     SlackChannelsPage,
     SlackRateLimited,
@@ -309,6 +311,13 @@ class ConnectorChannelsResponse(BaseModel):
 
     channels: list[ConnectorChannel]
     next_cursor: str | None = None
+    # #1778: scopes this listing lacked. ``["groups:read"]`` means the install
+    # predates the private-channel listing and the page is public-only; the
+    # picker says so and points at reconnecting Slack. Reported here rather
+    # than via the pending-install summary (#1758) because the granted scopes
+    # are not persisted on the connector — the listing itself is the only
+    # place an existing install reveals its grant.
+    missing_scopes: list[str] = Field(default_factory=list)
 
 
 _CREATE_CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
@@ -685,13 +694,18 @@ async def list_connector_channels(
     q: Annotated[str | None, Query(max_length=_CHANNELS_QUERY_MAX_LEN)] = None,
     db: AsyncSession = Depends(get_db),
 ) -> ConnectorChannelsResponse:
-    """List a Slack connector's public channels for the settings picker (#1391).
+    """List a Slack connector's channels for the settings picker (#1391, #1778).
 
     Server-side proxy of Slack ``conversations.list`` using the connector's
     Fernet-decrypted bot token — the token never reaches the browser. Read-only
     and workspace-admin scoped; a cross-workspace / unknown connector is a
     uniform 404. The optional ``q`` filters the fetched page by name
     (case-insensitive substring); Slack's API has no name filter.
+
+    Public channels and the private channels the bot is a member of are
+    listed (#1778). An install granted before ``groups:read`` was requested
+    still gets its public listing, with ``missing_scopes=["groups:read"]`` so
+    the picker can explain the gap and suggest reconnecting.
 
     Errors degrade gracefully to the manual-ID entry lane rather than 5xx:
     a token missing the ``channels:read`` scope (legacy installs) is a 409
@@ -733,6 +747,8 @@ async def list_connector_channels(
             page = SlackChannelsPage(
                 channels=[SlackChannel(**c) for c in payload["channels"]],
                 next_cursor=payload.get("next_cursor"),
+                # Required key: a pre-#1778 entry (public-only) must miss.
+                private_listing=bool(payload["private_listing"]),
             )
         except (ValueError, KeyError, TypeError):
             # A corrupt / schema-drifted cache entry must never fail the
@@ -740,8 +756,17 @@ async def list_connector_channels(
             page = None
 
     if page is None:
+        # #1778: a connector whose last page came from the public-only retry
+        # is marked for the cache TTL, so its next pages ask for public
+        # channels straight away — one Tier-2 call per page, and a public-only
+        # cursor is never replayed into a mixed request. Same TTL as the pages
+        # so a reconnect that just widened the grant is picked up within it.
+        types_key = f"slack_channels_types:{connector_id}"
+        public_only = (await get_cache(types_key)) == SLACK_CHANNEL_TYPES_PUBLIC
         try:
-            page = await fetch_slack_channels(bot_token=bot_token, cursor=cursor)
+            page = await fetch_slack_channels(
+                bot_token=bot_token, cursor=cursor, public_only=public_only
+            )
         except SlackRateLimited as exc:
             # Surface Slack's Tier-2 rate limit as a 429 with Retry-After
             # passthrough so the frontend shows the manual-entry fallback
@@ -773,9 +798,17 @@ async def list_connector_channels(
                             for c in page.channels
                         ],
                         "next_cursor": page.next_cursor,
+                        # #1778: cached with the page so a legacy install's
+                        # two-request miss (mixed, then public-only) is paid
+                        # once per TTL, not on every dialog open.
+                        "private_listing": page.private_listing,
                     }
                 ),
             )
+            if not page.private_listing:
+                await get_redis_client().setex(
+                    types_key, _CHANNELS_CACHE_TTL_SECONDS, SLACK_CHANNEL_TYPES_PUBLIC
+                )
         except Exception:
             logger.warning("slack_channels_cache_write_failed", connector_id=str(connector_id))
 
@@ -791,6 +824,7 @@ async def list_connector_channels(
             for c in channels
         ],
         next_cursor=page.next_cursor,
+        missing_scopes=[] if page.private_listing else [PRIVATE_CHANNELS_SCOPE],
     )
 
 
