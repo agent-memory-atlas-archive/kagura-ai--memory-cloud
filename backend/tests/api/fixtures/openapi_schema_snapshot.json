@@ -5753,9 +5753,6 @@
             },
             "type": "array"
           },
-          "id": {
-            "type": "integer"
-          },
           "is_visible": {
             "type": "boolean"
           },
@@ -5816,7 +5813,6 @@
           "client_name",
           "created_at",
           "grant_types",
-          "id",
           "is_visible",
           "owner_id",
           "provider",
@@ -5905,9 +5901,6 @@
             },
             "type": "array"
           },
-          "id": {
-            "type": "integer"
-          },
           "is_visible": {
             "type": "boolean"
           },
@@ -5968,7 +5961,6 @@
           "client_name",
           "created_at",
           "grant_types",
-          "id",
           "is_visible",
           "owner_id",
           "provider",
@@ -9078,16 +9070,12 @@
             },
             "type": "array"
           },
-          "initial_admin_id": {
-            "type": "integer"
-          },
           "total": {
             "type": "integer"
           }
         },
         "required": [
           "admins",
-          "initial_admin_id",
           "total"
         ],
         "type": "object"
@@ -9891,26 +9879,26 @@
           "created_at": {},
           "current_workspace_id": {},
           "email": {},
-          "id": {},
           "last_login_at": {},
           "locale": {},
           "name": {},
           "picture": {},
           "role": {},
-          "timezone": {}
+          "timezone": {},
+          "user_id": {}
         },
         "required": [
           "auth_method",
           "created_at",
           "current_workspace_id",
           "email",
-          "id",
           "last_login_at",
           "locale",
           "name",
           "picture",
           "role",
-          "timezone"
+          "timezone",
+          "user_id"
         ],
         "type": "object"
       },
@@ -9985,7 +9973,6 @@
         "properties": {
           "created_at": {},
           "email": {},
-          "id": {},
           "is_active": {},
           "is_initial_admin": {},
           "last_login_at": {},
@@ -9998,7 +9985,6 @@
         "required": [
           "created_at",
           "email",
-          "id",
           "is_active",
           "is_initial_admin",
           "last_login_at",
