@@ -309,10 +309,12 @@ class RoleManager:
             # google/github users, so every such identity has a
             # ``user_oauth_providers`` row and this lookup is authoritative.
             # (``users.auth_provider`` is retained as the denormalized "primary"
-            # pointer that account-linking writes — only the READ-dependence is
-            # removed here.) A known provider that somehow still lacks a row falls
-            # through to the new-user path below, whose IntegrityError(user_id)
-            # retry re-resolves the existing user without creating a duplicate.
+            # pointer that account-linking writes. It no longer resolves the
+            # owner, but #1811 reads it again to decide whether this sign-in
+            # may sync email/name — see ``_sync_existing_user``.) A known
+            # provider that somehow still lacks a row falls through to the
+            # new-user path below, whose IntegrityError(user_id) retry
+            # re-resolves the existing user without creating a duplicate.
             if known_provider:
                 link = (
                     await db.execute(
@@ -339,6 +341,7 @@ class RoleManager:
                     email_verified=email_verified,
                     ip_address=ip_address,
                     user_agent=user_agent,
+                    sync_profile=user.auth_provider == auth_provider,
                 )
 
             # New user path. Determine role: first user = ADMIN, others = USER.
@@ -398,6 +401,7 @@ class RoleManager:
                         email_verified=email_verified,
                         ip_address=ip_address,
                         user_agent=user_agent,
+                        sync_profile=existing.auth_provider == auth_provider,
                     )
                 if not _is_email_unique_violation(exc):
                     raise
@@ -425,8 +429,16 @@ class RoleManager:
         email_verified: bool,
         ip_address: str | None,
         user_agent: str | None,
+        sync_profile: bool,
     ) -> Role:
         """Sync mutable attributes (email, name) on an existing user row.
+
+        ``sync_profile`` is False when the identity signing in is not the
+        account's primary one (#1811): a provider linked to the account
+        (#517) whose name differs from ``users.auth_provider``. Its email and
+        name then never overwrite the owner's, so no audit row or notice is
+        written; ``last_login_at`` is still updated, and ``email_verified_at``
+        is set only when it attests the account's own address.
 
         Email syncs only when ``email_verified`` is True AND the value
         differs. Name syncs whenever provided and different. UPDATE-collision
@@ -443,9 +455,15 @@ class RoleManager:
 
         from models.auth import AuditLog
 
-        sync_email = email_verified and user.email != new_email
-        sync_name = new_name is not None and user.name != new_name
-        if email_verified and not sync_email and user.email_verified_at is None:
+        sync_email = sync_profile and email_verified and user.email != new_email
+        sync_name = sync_profile and new_name is not None and user.name != new_name
+        if not sync_profile:
+            logger.debug(
+                "oauth_profile_sync_skipped_linked_provider",
+                auth_provider=auth_provider,
+                user_id=user.user_id,
+            )
+        if email_verified and user.email == new_email and user.email_verified_at is None:
             user.email_verified_at = utcnow()
 
         if not sync_email and not sync_name:
