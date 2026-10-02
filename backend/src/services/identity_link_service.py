@@ -71,15 +71,6 @@ async def lock_identity_links(db: AsyncSession) -> None:
     await db.execute(_LINK_LOCK_SQL)
 
 
-def _forget_cached_tags() -> None:
-    """Drop this process's tag-vocabulary cache, which is keyed by one user id
-    and would otherwise keep serving a former link's tags until its TTL.
-    Other API processes keep theirs for that TTL (two minutes)."""
-    from services.tag_resolution import clear_vocabulary_cache
-
-    clear_vocabulary_cache()
-
-
 def linked_ids_subquery(user_id: str) -> Any:
     """``SELECT user_id`` of every account linked to ``user_id`` (itself included
     when it is linked at all). Empty for an account with no links."""
@@ -244,7 +235,6 @@ class IdentityLinkService:
         self._audit(users[user_id], "identity_linked", other_user_id, ip_address, user_agent)
         self._audit(users[other_user_id], "identity_linked", user_id, ip_address, user_agent)
         await self.db.commit()
-        _forget_cached_tags()
         logger.info("identity_linked", user_id=user_id, linked_user_id=other_user_id)
         return True
 
@@ -255,11 +245,16 @@ class IdentityLinkService:
         *,
         ip_address: str | None = None,
         user_agent: str | None = None,
-    ) -> None:
+    ) -> frozenset[str]:
         """Take ``other_user_id`` out of ``user_id``'s link set.
 
         Either side can cut the link from its own session. A set left with one
-        account is removed.
+        account is removed. In a larger set the other remaining accounts lose
+        ``other_user_id`` too, so each of them is audited like the two named.
+
+        Returns:
+            The accounts ``other_user_id`` was linked to until now
+            (``user_id`` among them).
 
         Raises:
             NotFoundException: ``other_user_id`` is not linked to ``user_id``
@@ -271,7 +266,50 @@ class IdentityLinkService:
             # naming accounts it is not linked to never queues behind it.
             raise NotFoundException("Linked account")
         await lock_identity_links(self.db)
-        rows = (
+        rows = await self._locked_set_rows(user_id)
+        members = {row.user_id for row in rows}
+        if other_user_id not in members or user_id not in members:
+            raise NotFoundException("Linked account")
+
+        former = await self._take_out(other_user_id, rows, ip_address, user_agent)
+        logger.info("identity_unlinked", user_id=user_id, unlinked_user_id=other_user_id)
+        return former
+
+    async def leave(
+        self,
+        user_id: str,
+        *,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> frozenset[str]:
+        """Take ``user_id`` out of its own link set; the others stay linked.
+
+        ``unlink`` takes one other account out of the caller's set, so an
+        account in a set of three could only get out by unlinking both
+        others — which also separated those two from each other (#1807).
+        A set left with one account is removed.
+
+        Returns:
+            The accounts ``user_id`` was linked to until now.
+
+        Raises:
+            NotFoundException: ``user_id`` is not in a link set.
+        """
+        if await linked_user_ids(self.db, user_id) == {user_id}:
+            # Answered before the deployment-wide lock is taken, as in unlink.
+            raise NotFoundException("Identity link")
+        await lock_identity_links(self.db)
+        rows = await self._locked_set_rows(user_id)
+        if user_id not in {row.user_id for row in rows}:
+            # Left (or was unlinked) between the check above and the lock.
+            raise NotFoundException("Identity link")
+        former = await self._take_out(user_id, rows, ip_address, user_agent)
+        logger.info("identity_link_left", user_id=user_id, former_links=len(former))
+        return former
+
+    async def _locked_set_rows(self, user_id: str) -> list[IdentityLink]:
+        """Every row of ``user_id``'s set, locked. Call under the link lock."""
+        return list(
             (
                 await self.db.execute(
                     select(IdentityLink)
@@ -282,29 +320,30 @@ class IdentityLinkService:
             .scalars()
             .all()
         )
-        members = {row.user_id: row for row in rows}
-        if other_user_id not in members or user_id not in members:
-            raise NotFoundException("Linked account")
 
-        group_id = members[user_id].group_id
-        await self.db.execute(delete(IdentityLink).where(IdentityLink.user_id == other_user_id))
-        if len(members) <= 2:
-            await self.db.execute(delete(IdentityLink).where(IdentityLink.group_id == group_id))
-
+    async def _take_out(
+        self,
+        departing: str,
+        rows: list[IdentityLink],
+        ip_address: str | None,
+        user_agent: str | None,
+    ) -> frozenset[str]:
+        """Remove ``departing`` from the set ``rows``, audit it on both sides
+        with every account it leaves, commit. Returns those accounts."""
+        former = frozenset(row.user_id for row in rows) - {departing}
+        await _remove_from_set(self.db, departing, rows)
         users = {
             u.user_id: u
             for u in (
-                await self.db.execute(
-                    select(User).where(User.user_id.in_([user_id, other_user_id]))
-                )
+                await self.db.execute(select(User).where(User.user_id.in_([departing, *former])))
             ).scalars()
         }
-        for actor, target in ((user_id, other_user_id), (other_user_id, user_id)):
-            if actor in users:
-                self._audit(users[actor], "identity_unlinked", target, ip_address, user_agent)
+        for other in sorted(former):
+            for actor, target in ((departing, other), (other, departing)):
+                if actor in users:
+                    self._audit(users[actor], "identity_unlinked", target, ip_address, user_agent)
         await self.db.commit()
-        _forget_cached_tags()
-        logger.info("identity_unlinked", user_id=user_id, unlinked_user_id=other_user_id)
+        return former
 
     def _audit(
         self,
@@ -329,6 +368,32 @@ class IdentityLinkService:
         )
 
 
+async def _remove_from_set(db: AsyncSession, user_id: str, members: list[IdentityLink]) -> int:
+    """Delete ``user_id``'s row from the set ``members`` (every row of it).
+
+    A set left with one account is removed. Rows of the remaining accounts
+    stop naming ``user_id`` in ``linked_by``: NULL, the value the foreign key
+    leaves when the account that made a link is deleted (#1807). Writing NULL
+    rather than another id also keeps this off the ``users`` rows — a
+    non-NULL value would make the foreign-key check lock one while the link
+    lock is held, the reverse of the order erasure and admin delete take.
+    Runs under :func:`lock_identity_links`.
+
+    Returns:
+        How many rows were deleted.
+    """
+    await db.execute(delete(IdentityLink).where(IdentityLink.user_id == user_id))
+    remaining = [row for row in members if row.user_id != user_id]
+    if len(remaining) <= 1:
+        for row in remaining:
+            await db.execute(delete(IdentityLink).where(IdentityLink.id == row.id))
+        return 1 + len(remaining)
+    for row in remaining:
+        if row.linked_by == user_id:
+            row.linked_by = None
+    return 1
+
+
 async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str, int]:
     """Before ``user_id`` is erased or deleted: keep its link set's data reachable.
 
@@ -349,7 +414,7 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
     otherwise publish them by making the context shared.
 
     Then ``user_id`` leaves its set, a set left with one account is removed,
-    and ``linked_by`` no longer names ``user_id`` on any row.
+    and ``linked_by`` no longer names ``user_id`` on any row (NULL instead).
 
     Does not commit: it runs inside the caller's transaction, after the
     caller has locked the ``users`` row.
@@ -362,7 +427,16 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
     from models.memory import Memory
 
     await lock_identity_links(db)
-    others = sorted((await linked_user_ids(db, user_id)) - {user_id})
+    link_rows = list(
+        (
+            await db.execute(
+                select(IdentityLink).where(IdentityLink.user_id.in_(linked_ids_subquery(user_id)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    others = sorted(row.user_id for row in link_rows if row.user_id != user_id)
     handed_over = 0
     if others:
         contexts = (
@@ -433,25 +507,5 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
             context.created_by = eligible[0][1]
             handed_over += 1
 
-    group_id = (
-        await db.execute(select(IdentityLink.group_id).where(IdentityLink.user_id == user_id))
-    ).scalar_one_or_none()
-    removed = 0
-    if group_id is not None:
-        await db.execute(delete(IdentityLink).where(IdentityLink.user_id == user_id))
-        removed = 1
-        remaining = (
-            (await db.execute(select(IdentityLink).where(IdentityLink.group_id == group_id)))
-            .scalars()
-            .all()
-        )
-        if len(remaining) <= 1:
-            await db.execute(delete(IdentityLink).where(IdentityLink.group_id == group_id))
-            removed += len(remaining)
-        else:
-            for row in remaining:
-                if row.linked_by == user_id:
-                    row.linked_by = row.user_id
-    if handed_over or removed:
-        _forget_cached_tags()
+    removed = await _remove_from_set(db, user_id, link_rows) if link_rows else 0
     return {"contexts_handed_over": handed_over, "identity_links_removed": removed}

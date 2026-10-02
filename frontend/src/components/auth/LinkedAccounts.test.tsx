@@ -88,6 +88,7 @@ vi.mock("@/lib/auth/clearClientState", () => ({
 
 const LINKS = "/api/v1/me/account/identity-links";
 const UNLINK = "/api/v1/me/account/identity-links/unlink";
+const LEAVE = "/api/v1/me/account/identity-links/leave";
 
 const ADMIN = {
   user_id: "local:admin",
@@ -487,7 +488,10 @@ describe("LinkedAccounts — unlink", () => {
     expect(await screen.findByText("unlinkNotLinkedError|Admin")).toBeTruthy();
     expect(screen.getByRole("alertdialog")).toBeTruthy();
     expect(mockToast).not.toHaveBeenCalled();
-    expect(mockRefetchUser).not.toHaveBeenCalled();
+    // Unlinked elsewhere: the list and the auth user are re-read.
+    await waitFor(() => {
+      expect(mockRefetchUser).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("shows the generic error inside the open dialog on any other failure", async () => {
@@ -502,6 +506,96 @@ describe("LinkedAccounts — unlink", () => {
 
     expect(await screen.findByText("unlinkError|Admin")).toBeTruthy();
     expect(mockToast).not.toHaveBeenCalled();
+  });
+});
+
+// ---------- leave (#1807) -----------------------------------------------------
+
+describe("LinkedAccounts — leave", () => {
+  const GITHUB = {
+    user_id: "github:2",
+    email: "gh@example.com",
+    name: "Hub",
+    linked_at: "2026-01-02T00:00:00Z",
+  };
+
+  it("is offered only once two or more accounts are linked", async () => {
+    mockApiGet.mockResolvedValueOnce({ linked: [ADMIN], linkable: [] });
+
+    render(<LinkedAccounts />);
+    await screen.findByRole("button", { name: /^unlinkButtonLabel\|Admin$/ });
+
+    expect(screen.queryByRole("button", { name: /^leaveButton$/ })).toBeNull();
+  });
+
+  it("asks first, then POSTs leave and refreshes the list and the auth user", async () => {
+    mockApiGet
+      .mockResolvedValueOnce({ linked: [ADMIN, GITHUB], linkable: [] })
+      .mockResolvedValueOnce({ linked: [], linkable: [] });
+    mockApiPost.mockResolvedValueOnce({ status: "ok" });
+
+    render(<LinkedAccounts />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^leaveButton$/ }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText("leaveTitle")).toBeTruthy();
+    expect(mockApiPost).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^leaveButton$/ }),
+    );
+
+    await waitFor(() => {
+      expect(mockApiPost).toHaveBeenCalledWith(LEAVE, {});
+    });
+    await waitFor(() => {
+      expect(mockToast).toHaveBeenCalledWith({ title: "leaveSuccess" });
+    });
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledTimes(2);
+    });
+    expect(mockRefetchUser).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the error inside the open dialog on failure", async () => {
+    mockApiGet.mockResolvedValueOnce({ linked: [ADMIN, GITHUB], linkable: [] });
+    mockApiPost.mockRejectedValueOnce(new FakeApiError(500));
+
+    render(<LinkedAccounts />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^leaveButton$/ }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^leaveButton$/ }),
+    );
+
+    expect(await screen.findByText("leaveError")).toBeTruthy();
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(mockToast).not.toHaveBeenCalled();
+  });
+
+  it("on 404 says so and re-reads the list and the auth user", async () => {
+    mockApiGet
+      .mockResolvedValueOnce({ linked: [ADMIN, GITHUB], linkable: [] })
+      .mockResolvedValueOnce({ linked: [], linkable: [] });
+    mockApiPost.mockRejectedValueOnce(new FakeApiError(404));
+
+    render(<LinkedAccounts />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /^leaveButton$/ }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^leaveButton$/ }),
+    );
+
+    expect(await screen.findByText("leaveNotLinkedError")).toBeTruthy();
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledTimes(2);
+    });
+    expect(mockRefetchUser).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -536,6 +630,14 @@ describe("LinkedAccounts — i18n key coverage", () => {
     "unlinkError",
     "unlinkNotLinkedError",
     "loadError",
+    "leaveHint",
+    "leaveButton",
+    "leaving",
+    "leaveTitle",
+    "leaveDescription",
+    "leaveSuccess",
+    "leaveError",
+    "leaveNotLinkedError",
   ];
 
   it.each([
