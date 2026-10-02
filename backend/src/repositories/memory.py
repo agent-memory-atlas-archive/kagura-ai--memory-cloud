@@ -326,9 +326,32 @@ class MemoryRepository(BaseRepository[Memory]):
         logger.info("memory_promoted_to_persistent", memory_id=str(memory_id))
 
     async def get_by_resource_id(
-        self, resource_id: str, context_id: UUID, user_id: str
+        self,
+        resource_id: str,
+        context_id: UUID,
+        user_id: str,
+        *,
+        include_linked: bool = False,
     ) -> Memory | None:
-        """Find active memory by external resource_id within a context.
+        """Find the newest active memory by external resource_id in a context.
+
+        See ``list_by_resource_id``; this is its first row.
+        """
+        rows = await self.list_by_resource_id(
+            resource_id, context_id, user_id, include_linked=include_linked, limit=1
+        )
+        return rows[0] if rows else None
+
+    async def list_by_resource_id(
+        self,
+        resource_id: str,
+        context_id: UUID,
+        user_id: str,
+        *,
+        include_linked: bool = False,
+        limit: int | None = None,
+    ) -> list[Memory]:
+        """Active memories with an external resource_id in a context, newest first.
 
         Uses the computed resource_id column (details->>'resource_id').
 
@@ -336,22 +359,30 @@ class MemoryRepository(BaseRepository[Memory]):
             resource_id: External resource identifier
             context_id: Context UUID
             user_id: User ID (ownership check)
-
-        Returns:
-            Memory or None
+            include_linked: Also match a memory written by an account linked
+                to ``user_id`` (#1803). Only for a context the caller reads as
+                a linked owner — a private one; the caller decides. Accounts
+                linked before #1803 may each hold a row for the same id, so an
+                upsert replaces all of them, not only the newest.
+            limit: At most this many rows.
         """
-        result = await self.db.execute(
+        from services.identity_link_service import owned_by
+
+        author = owned_by(Memory.user_id, user_id) if include_linked else Memory.user_id == user_id
+        query = (
             select(Memory)
             .where(
                 Memory.resource_id == resource_id,
                 Memory.context_id == context_id,
-                Memory.user_id == user_id,
+                author,
                 Memory.deleted_at.is_(None),
             )
             .order_by(desc(Memory.created_at))
-            .limit(1)
         )
-        return result.scalars().first()
+        if limit is not None:
+            query = query.limit(limit)
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
 
     # Issue #886: the always-load read returns L1 (summary) + L2
     # (context_summary) + a few metadata fields only — never L3 (content /
