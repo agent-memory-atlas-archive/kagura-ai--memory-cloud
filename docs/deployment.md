@@ -470,7 +470,7 @@ CLI actions (`reset_password`, `create_admin`) send no notice. A send failure is
 change. Under `EMAIL_PROVIDER=logging` each notice is one
 `security_notification_email` log line (event and a keyed recipient hash only).
 
-## One person, two accounts — moving context ownership (Issue #1783)
+## One person, two accounts — linking them (Issue #1784)
 
 Identities are keyed by `user_id` and are never linked by email: a CLI admin
 (`local:<login>`, created by `create_admin`) and an OAuth sign-in (the IdP
@@ -479,8 +479,84 @@ through the CLI admin's API key (MCP clients) then read as another creator in
 the browser — the **Created by me** filter is empty and the private ones are
 hidden — because `created_by` is compared with the session's `user_id`.
 
-To hand those contexts to the identity that should own them, run the one-shot
-command where the API runs (same env: `DATABASE_URL` and the vector store):
+When the person keeps using both accounts, link them:
+
+1. Sign in to the web UI with the password account (the CLI admin). A
+   password sign-in always starts a new browser session, so it comes first.
+2. From the account switcher, choose **Add another account** and sign in with
+   the OAuth account. The browser session now holds both.
+3. Open **Profile Settings**, find **Linked accounts**, and link the other account.
+
+That browser session is the proof: each account entered it through its own
+sign-in. An account that is not signed in on the session cannot be linked,
+and nothing is ever linked by an email match.
+
+What a link does:
+
+- A private context is open to every account linked to its creator, and the
+  memories any of them wrote in it are visible to all of them — in the
+  context list, that context's memory list, recall, stats, tags and export.
+- The web UI shows those contexts as the viewer's own (`GET /api/v1/auth/me`
+  returns `linked_user_ids`).
+
+What it does not do:
+
+- **Roles and membership stay per account.** A link never makes an account a
+  system admin, and never lets it reach a workspace it is not a member of.
+  The caller is checked as itself: a workspace viewer reads the linked
+  account's private context and cannot write to it or change its memories, a
+  member needs the context in its `allowed_context_ids`, and a
+  workspace-scoped API key cannot open a context outside its workspace. The
+  memory list and stats with no context stay the caller's own.
+- **Rows keep their author.** `created_by` and `memories.user_id` are not
+  rewritten. After an unlink, a memory one account wrote in the other's
+  private context is hidden from the context's creator again.
+- **Per-account history stays separate**: the graph view and its edges, Sleep
+  maintenance (each account's memories are maintained on their own, with no
+  de-duplication across the two), memory health, access patterns, the workspace dashboard's counts and
+  retrieval feedback.
+- **Writes that name another memory stay per account**: an `external_id`
+  upsert replaces only the caller's own earlier memory, and `supersedes` /
+  linked memory ids must point at the caller's own memories. Two accounts
+  that upsert the same `external_id` into one private context keep two rows.
+- A share key recalls as the account that issued it, so it also returns what
+  a linked account wrote in that account's private context.
+
+Either account can unlink from **Profile Settings**; the other one does not
+have to be signed in. At most 4 accounts can be linked together. Every link
+and unlink writes an `audit_logs` row (`identity_linked`,
+`identity_unlinked`) on both accounts and emails both a security notice. An
+unlink takes effect at once; tag suggestions can keep the other account's tag
+names for up to two minutes.
+
+A link outlives the browser session it was made in. Anyone who can use a
+browser where both accounts are signed in can make one, so treat a shared
+browser as you would for any signed-in session, and unlink from **Profile
+Settings** if a notice arrives that you did not expect.
+
+Erasing an account, or deleting a user from the admin API, takes it out of
+its link set. A private context it created passes to a linked account that
+wrote memories there and could own it as a linked account (a workspace owner
+or admin, or a member whose `allowed_context_ids` names it), so what that
+account wrote stays readable. The leaving account's own memories in that
+context are deleted. A context no linked account wrote in is handled as for
+any erased or deleted account. The `delete_admin` command only removes the
+user row and its link.
+
+The endpoints, for a deployment that scripts it: `GET`/`POST
+/api/v1/me/account/identity-links` and `POST
+/api/v1/me/account/identity-links/unlink`, browser session only.
+
+### Moving ownership instead (Issue #1783)
+
+When one of the two accounts is being retired, move its contexts to the other
+with the one-shot command below rather than linking. Do not use it for a
+person who keeps both accounts: the account that gave its contexts away loses
+them, along with every client that signs in as it.
+
+
+Run the one-shot command where the API runs (same env: `DATABASE_URL` and the
+vector store):
 
 ```bash
 # inside the API container / venv, from backend/
@@ -523,7 +599,7 @@ The command does not move API keys: mint a new key for `--to` if MCP clients
 should keep seeing the private contexts afterwards. It also leaves other
 `created_by` columns (resources, agents, files, secrets), per-user retrieval
 history (neural edges, feedback, sleep reports — boosting starts over) and the
-two user rows untouched — linking the accounts is a separate feature (#1784).
+two user rows untouched.
 
 ## Hosted-mode UI gates (Issue #1571)
 
