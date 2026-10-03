@@ -25,7 +25,7 @@ from models.memory import (
     EDGE_TYPE_RELATED_TO,
     EDGE_TYPE_SUPERSEDES,
 )
-from repositories.neural_edge import NeuralEdgeRepository
+from repositories.neural_edge import NeuralEdgeRepository, owner_condition
 from utils.datetime import to_utc_iso
 from utils.logger import get_logger
 
@@ -111,6 +111,7 @@ class GraphService:
         db: AsyncSession,
         workspace_id: str | None = None,
         context_id: str | None = None,
+        owner_ids: frozenset[str] | None = None,
     ):
         """Initialize graph service with SQL backend and 3-level isolation.
 
@@ -121,11 +122,20 @@ class GraphService:
             db: SQLAlchemy async session
             workspace_id: Workspace ID (for 3-level isolation)
             context_id: Context ID (for 3-level isolation)
+            owner_ids: #1834 — the identity-link set whose edges READS see
+                (has_node, get_edge, stats, the activation spread). Pass it
+                inside a private context; None (the default) reads the
+                caller's own edges. Writes always use ``user_id``.
 
         Note:
             **Breaking change**: Requires AsyncSession parameter (v0.8.0+)
         """
         self.user_id = user_id
+        # #1834: whose edges a READ sees. Inside a private context the callers
+        # pass the identity-link set (the accounts that own the context
+        # together); everywhere else it is the caller alone. Writes keep
+        # using ``user_id``.
+        self.read_owner: str | frozenset[str] = owner_ids or user_id
         self.db = db
         self.edge_repo = NeuralEdgeRepository(db)
         self.workspace_id = workspace_id  # Single Collection Migration
@@ -172,7 +182,7 @@ class GraphService:
             True if node has any edges
         """
         node_uuid = UUID(node_id) if isinstance(node_id, str) else node_id
-        in_deg, out_deg = await self.edge_repo.get_node_degree(self.user_id, node_uuid)
+        in_deg, out_deg = await self.edge_repo.get_node_degree(self.read_owner, node_uuid)
         return (in_deg + out_deg) > 0
 
     async def remove_node(self, node_id: str | UUID) -> None:
@@ -312,7 +322,7 @@ class GraphService:
         src_uuid = UUID(src_id) if isinstance(src_id, str) else src_id
         dst_uuid = UUID(dst_id) if isinstance(dst_id, str) else dst_id
 
-        edge = await self.edge_repo.get_edge(self.user_id, src_uuid, dst_uuid)
+        edge = await self.edge_repo.get_edge(self.read_owner, src_uuid, dst_uuid)
 
         if not edge:
             return None
@@ -341,7 +351,7 @@ class GraphService:
         src_uuid = UUID(src_id) if isinstance(src_id, str) else src_id
         dst_uuid = UUID(dst_id) if isinstance(dst_id, str) else dst_id
 
-        edge = await self.edge_repo.get_edge(self.user_id, src_uuid, dst_uuid)
+        edge = await self.edge_repo.get_edge(self.read_owner, src_uuid, dst_uuid)
         return edge is not None
 
     async def remove_edge(self, src_id: str | UUID, dst_id: str | UUID) -> None:
@@ -365,6 +375,9 @@ class GraphService:
     # Graph Traversal
     # ========================================================================
 
+    # NOTE(#1834): get_neighbors and get_node_metrics read with ``self.user_id``
+    # on purpose — Sleep and consolidation work per account. The link-set
+    # reads (has_node, stats, the activation spread) go through ``read_owner``.
     async def get_neighbors(self, node_id: str | UUID, max_hops: int = 1) -> list[str]:
         """Get all neighbors via BFS traversal.
 
@@ -399,14 +412,18 @@ class GraphService:
 
         Issue #383: visibility-aware. ``owner_filter`` controls creator scoping:
 
-        - **Omitted** (default, backward-compatible): filter by ``self.user_id``
-          — the pre-#383 "per-user metrics" semantics that sleep/consolidation,
-          neural_tasks, and internal callers rely on. Does NOT aggregate across
-          the whole workspace, which would distort consolidation heuristics.
+        - **Omitted** (default, backward-compatible): filter by ``read_owner``
+          — ``self.user_id`` unless the service was built with ``owner_ids``
+          (#1834), i.e. the pre-#383 "per-user metrics" semantics that
+          sleep/consolidation, neural_tasks, and internal callers rely on.
+          Does NOT aggregate across the whole workspace, which would distort
+          consolidation heuristics.
         - ``None`` (explicit): no creator filter — aggregate across all creators
           in workspace+context (shared-context HTTP reads). Only pass this when
           the caller's workspace membership has been verified upstream.
         - ``str`` (creator user_id): restrict to edges created by that user.
+        - ``frozenset[str]`` (#1834): the identity-link set of a private
+          context — edges created by any account that owns it.
           Private-context reads or admin paths pass this explicitly.
 
         Args:
@@ -416,8 +433,8 @@ class GraphService:
         Returns:
             Stats dict with edge counts and weights
         """
-        effective_filter: str | None = (
-            self.user_id if owner_filter is self._STATS_OWNER_DEFAULT else owner_filter
+        effective_filter: str | frozenset[str] | None = (
+            self.read_owner if owner_filter is self._STATS_OWNER_DEFAULT else owner_filter
         )
         edge_stats = await self.edge_repo.get_stats(
             effective_filter,
@@ -432,7 +449,7 @@ class GraphService:
 
         conditions: list = []
         if effective_filter is not None:
-            conditions.append(NeuralMemoryEdge.user_id == effective_filter)
+            conditions.append(owner_condition(effective_filter))
         if self.workspace_id:
             conditions.append(NeuralMemoryEdge.workspace_id == UUID(self.workspace_id))
         if self.context_id:
