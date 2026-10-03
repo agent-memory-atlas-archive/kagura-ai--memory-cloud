@@ -139,6 +139,32 @@ class TestResourceIndexerNamedVectorUpsert:
         assert "deleted_at IS NULL" in lookup_sql
 
     @pytest.mark.asyncio
+    async def test_apply_upsert_point_carries_the_existing_rows_memory_id(self, indexer, mock_db):
+        """#1829: on a re-index the payload memory_id is the row's id, not a
+        fresh uuid4() written before the row was looked up (#1808)."""
+        existing = MagicMock()
+        existing.id = uuid4()
+        existing.details = {}
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = existing
+        old_versions = MagicMock()
+        old_versions.scalars.return_value.all.return_value = []
+        mock_db.execute.side_effect = [lookup, old_versions]
+
+        await indexer._apply_upsert(
+            _make_event(),
+            _make_schema(),
+            _make_context(),
+            "kagura_memories",
+            indexer.embedding_service,
+        )
+
+        point = indexer.qdrant_client.upsert.await_args.kwargs["points"][0]
+        assert point.payload["memory_id"] == str(existing.id)
+        # The row was resolved before the point was built: one lookup, no second.
+        assert mock_db.add.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_apply_upsert_attaches_bm25_sparse_vector(self, indexer):
         """Issue #335: PointStruct.vector must include `bm25` SparseVector
         derived from the same fulltext_content as the dense embedding, so

@@ -13,15 +13,20 @@ This sweep removes those points. A point is an orphan when:
   the grace period; or
 * it is a resource point (its id is derived from the document, not from a
   memory row) whose context is gone, or was soft-deleted longer ago than the
-  grace period.
+  grace period; or
+* it is a resource point whose row — found by ``summary_embedding_id``, the
+  column that holds the point id — was soft-deleted longer ago than the grace
+  period, or is gone, was written longer ago than the grace period, and no live
+  row carries the document's natural key ``(context, resource_id, doc_id,
+  version)`` either (#1829: ``forget`` on a resource-ingested memory used to
+  leave its point behind for good). The age check covers the indexer, which
+  writes the point before the transaction that owns the row commits.
 
 A point whose memory row is live is never an orphan, whatever else is true.
-A resource point in a live context is always kept, even when its document's
-memory was forgotten: the point id cannot be matched to a row. Its payload's
-``memory_id`` is no way around that (#1808): ``ResourceIndexer._apply_upsert``
-writes a fresh ``uuid4()`` there before it looks the row up, so a re-index of
-a document that already has a row stores an id no row carries, and judging by
-it would delete live points.
+A resource point whose row cannot be decided (no natural key in the payload,
+no context) is kept. Its payload's ``memory_id`` is still not used as a key:
+before #1829 ``ResourceIndexer._apply_upsert`` wrote a fresh ``uuid4()`` there
+on every re-index, so points written by older releases carry ids no row has.
 
 It runs daily from ``tasks/neural_tasks.py`` and on demand from
 ``cli/sweep_orphan_vectors.py``.
@@ -33,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.point_writer_lock import wait_for_point_writers
@@ -66,6 +71,10 @@ SCHEDULED_MAX_ORPHAN_RATIO = 0.5
 REASON_NO_ROW = "no_row"
 REASON_TOMBSTONED = "tombstoned"
 REASON_CONTEXT_DELETED = "context_deleted"
+# A resource point whose row is tombstoned past the grace period, or gone with
+# no live row for the document either (#1829).
+REASON_RESOURCE_TOMBSTONED = "resource_tombstoned"
+REASON_RESOURCE_NO_ROW = "resource_no_row"
 
 _DELETE_BATCH = 1000
 
@@ -79,6 +88,9 @@ class CollectionSweep:
     no_row: int = 0
     tombstoned: int = 0
     context_deleted: int = 0
+    # Resource points judged by their own row (#1829).
+    resource_tombstoned: int = 0
+    resource_no_row: int = 0
     deleted: int = 0
     # Why the collection could not be read (dropped mid-run, say); its counts
     # are then partial and nothing is deleted from it.
@@ -86,7 +98,13 @@ class CollectionSweep:
 
     @property
     def orphans(self) -> int:
-        return self.no_row + self.tombstoned + self.context_deleted
+        return (
+            self.no_row
+            + self.tombstoned
+            + self.context_deleted
+            + self.resource_tombstoned
+            + self.resource_no_row
+        )
 
 
 @dataclass
@@ -179,6 +197,109 @@ async def _classify(db: AsyncSession, refs: list[PointRef], cutoff: datetime) ->
             if context_id in dead:
                 orphans[point_id] = REASON_CONTEXT_DELETED
 
+        # #1829: a resource point in a live context follows its own row. The
+        # point id is the row's ``summary_embedding_id``.
+        live_resource = [
+            ref
+            for ref in refs
+            if ref.is_resource and ref.point_id in resource_contexts and ref.point_id not in orphans
+        ]
+        orphans.update(await _classify_resource_rows(db, live_resource, cutoff))
+
+    return orphans
+
+
+async def _classify_resource_rows(
+    db: AsyncSession, refs: list[PointRef], cutoff: datetime
+) -> dict[str, str]:
+    """Judge resource points whose context is live by their memory rows (#1829).
+
+    A row found by ``summary_embedding_id``: live → kept; soft-deleted before
+    ``cutoff`` → orphan. No row: the point must be older than ``cutoff`` (the
+    indexer writes a point before its row commits), and a live row that names
+    the same document under another point id — an older row, or one whose
+    point was re-pointed — keeps it; otherwise it is an orphan. Points that
+    cannot be decided (no natural key or no timestamp in the payload) are kept.
+    """
+    point_ids: dict[UUID, PointRef] = {}
+    for ref in refs:
+        point_uuid = _as_uuid(ref.point_id)
+        if point_uuid is not None:
+            point_ids[point_uuid] = ref
+    if not point_ids:
+        return {}
+
+    # Scoped by the (indexed) context ids as well: summary_embedding_id alone
+    # has no index.
+    context_ids = {c for c in (_as_uuid(ref.context_id) for ref in point_ids.values()) if c}
+    rows = await db.execute(
+        select(Memory.summary_embedding_id, Memory.deleted_at).where(
+            Memory.context_id.in_(list(context_ids)),
+            Memory.summary_embedding_id.in_(list(point_ids)),
+        )
+    )
+    # Several rows can name one point: a forgotten document that was synced
+    # again gets a NEW row under the SAME uuid5 id while the tombstone keeps
+    # its summary_embedding_id. Any live row keeps the point; only when every
+    # row is a tombstone does the newest one decide.
+    live_points: set[UUID] = set()
+    newest_tombstone: dict[UUID, datetime] = {}
+    for row in rows:
+        if row.deleted_at is None:
+            live_points.add(row.summary_embedding_id)
+        else:
+            previous = newest_tombstone.get(row.summary_embedding_id)
+            if previous is None or row.deleted_at > previous:
+                newest_tombstone[row.summary_embedding_id] = row.deleted_at
+
+    orphans: dict[str, str] = {}
+    unmatched: list[PointRef] = []
+    for point_uuid, ref in point_ids.items():
+        if point_uuid in live_points:
+            continue
+        if point_uuid in newest_tombstone:
+            if newest_tombstone[point_uuid] < cutoff:
+                orphans[ref.point_id] = REASON_RESOURCE_TOMBSTONED
+        elif (
+            ref.resource_key is not None
+            and ref.updated_at is not None
+            and ref.updated_at < cutoff
+            and _as_uuid(ref.context_id) is not None
+        ):
+            unmatched.append(ref)
+
+    if unmatched:
+        # One query for every unmatched document: live rows for exactly these
+        # natural keys (not every row of the resource).
+        keyed: dict[tuple[UUID, str, str, int], PointRef] = {}
+        for ref in unmatched:
+            context_uuid = _as_uuid(ref.context_id)
+            if context_uuid is not None and ref.resource_key is not None:
+                keyed[(context_uuid, *ref.resource_key)] = ref
+        rows = await db.execute(
+            select(
+                Memory.context_id,
+                Memory.resource_id,
+                Memory.resource_doc_id,
+                Memory.resource_version,
+            ).where(
+                tuple_(
+                    Memory.context_id,
+                    Memory.resource_id,
+                    Memory.resource_doc_id,
+                    Memory.resource_version,
+                ).in_(list(keyed)),
+                Memory.deleted_at.is_(None),
+            )
+        )
+        live_keys = {
+            (row.context_id, row.resource_id, row.resource_doc_id, row.resource_version)
+            for row in rows
+        }
+        for key, ref in keyed.items():
+            if key not in live_keys:
+                orphans[ref.point_id] = REASON_RESOURCE_NO_ROW
+
     return orphans
 
 
@@ -243,6 +364,10 @@ async def sweep_orphan_points(
                         stats.no_row += 1
                     elif reason == REASON_TOMBSTONED:
                         stats.tombstoned += 1
+                    elif reason == REASON_RESOURCE_TOMBSTONED:
+                        stats.resource_tombstoned += 1
+                    elif reason == REASON_RESOURCE_NO_ROW:
+                        stats.resource_no_row += 1
                     else:
                         stats.context_deleted += 1
         except QdrantError as e:
@@ -253,6 +378,7 @@ async def sweep_orphan_points(
             # A partial count would be asked about, weighed against the ratio
             # guard and never deleted.
             stats.no_row = stats.tombstoned = stats.context_deleted = 0
+            stats.resource_tombstoned = stats.resource_no_row = 0
             logger.warning("orphan_vector_sweep_collection_skipped", collection=name, error=str(e))
         candidates[name] = found
 
