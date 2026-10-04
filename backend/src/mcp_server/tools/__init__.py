@@ -10,6 +10,7 @@ Handler re-exports (used by test_mcp_server_e2e.py):
 - handle_remember, handle_recall, handle_forget, handle_reference, handle_explore
 """
 
+import json
 import logging
 import time
 from typing import Any
@@ -22,6 +23,8 @@ from mcp_server.tools._arg_coercion import coerce_mcp_arguments, find_unknown_ar
 from mcp_server.tools._definitions import get_tool_definitions  # noqa: F401
 from mcp_server.tools._errors import _tool_exception_response
 from mcp_server.tools._helpers import (
+    ToolErrorContent,
+    _dumps,
     _error_response,
     _format_validation_error,
     _resolve_context_id,
@@ -38,6 +41,7 @@ _TOOLS_WITHOUT_CONTEXT_ID = frozenset(
         # context_id pre-dispatch.
         "list_my_bindings",
         "describe_binding",
+        "guide",  # #1850: static manual text, no context
         "list_contexts",
         "create_context",
         "update_context",
@@ -110,6 +114,8 @@ _RATE_LIMIT_EXEMPT_TOOLS = frozenset(
         # Tool guardrails: the session-start hook read — plain SQL, no
         # embedding, no Hebbian write; a rate-limited hook would fail open.
         "load_guardrails",
+        # #1850: the tool manual is static text — no database, no embedding.
+        "guide",
         # Issue #1128: secret-store tools carry NO embedding/LLM cost (the memory
         # quota's cost driver) and must stay callable on EVERY plan — an agent has
         # to be able to fetch its deploy key even after heavy recall use. Available
@@ -133,6 +139,37 @@ _RATE_LIMIT_EXEMPT_TOOLS = frozenset(
         "get_agent_bootstrap",
     }
 )
+
+# #1850: the manual left the descriptions, so a caller error on a core tool
+# names the topic in ``help`` — once, here, for every handler.
+_CALLER_ERRORS = frozenset(
+    {"validation_error", "missing_fields", "invalid_argument", "context_id_required"}
+)
+
+
+def _manual_help(tool_name: str) -> str | None:
+    """``Manual: guide(["<tool>"])`` for a tool with a guide topic, else None."""
+    from mcp_server.tools.guide import GUIDE_INDEX
+
+    return f'Manual: guide(["{tool_name}"])' if tool_name in GUIDE_INDEX else None
+
+
+def _with_manual_help(tool_name: str, result: list[TextContent]) -> list[TextContent]:
+    """Append the manual pointer to a caller-error envelope that has no ``help`` yet."""
+    manual = _manual_help(tool_name)
+    if manual is None or not isinstance(result, ToolErrorContent) or len(result) != 1:
+        return result
+    try:
+        payload = json.loads(result[0].text)
+    except (ValueError, AttributeError):
+        return result
+    if not isinstance(payload, dict) or payload.get("error") not in _CALLER_ERRORS:
+        return result
+    if "help" in payload:
+        return result
+    payload["help"] = manual
+    return ToolErrorContent([TextContent(type="text", text=_dumps(payload))])
+
 
 # Per-workspace rate limit cache {workspace_id: (allowed, used, limit, expires_at)}
 _RATE_LIMIT_CACHE: dict[UUID, tuple[bool, int, int, float]] = {}
@@ -188,6 +225,7 @@ def _build_registry() -> dict[str, Any]:
         handle_init_file_upload,
         handle_list_files,
     )
+    from mcp_server.tools.guide import handle_guide
     from mcp_server.tools.measurement import handle_recall_series, handle_record_measurement
     from mcp_server.tools.resource import (
         handle_get_resource_impact,
@@ -227,6 +265,7 @@ def _build_registry() -> dict[str, Any]:
         "forget": handle_forget,
         "reference": handle_reference,
         "explore": handle_explore,
+        "guide": handle_guide,  # #1850
         # Issue #889: agent session-state lane (TTL, recall-excluded)
         "set_state": handle_set_state,
         "get_state": handle_get_state,
@@ -440,10 +479,12 @@ async def execute_tool_call(
     if tool_name not in _TOOLS_WITHOUT_CONTEXT_ID:
         has_context_ids = "context_ids" in args and isinstance(args.get("context_ids"), list)
         if "context_id" not in args and not has_context_ids:
+            manual = _manual_help(tool_name)
             return _error_response(
                 "context_id_required",
                 f"{tool_name} requires context_id argument.",
-                help="Use list_contexts() first to discover available context IDs.",
+                help="Use list_contexts() first to discover available context IDs."
+                + (f" {manual}" if manual else ""),
                 example=f'{tool_name}(..., context_id="<uuid-from-list_contexts>")',
             )
         if "context_id" in args:
@@ -453,7 +494,7 @@ async def execute_tool_call(
                 return _error_response("invalid_context_id_format", str(e))
 
     try:
-        return await handler(args, user_id, workspace_id)
+        return _with_manual_help(tool_name, await handler(args, user_id, workspace_id))
     except ValidationError as e:
         # #1323: expected client-input errors — return the structured envelope
         # (no pydantic model names / errors.pydantic.dev URLs) and log at
@@ -470,6 +511,9 @@ async def execute_tool_call(
         if title.endswith("Request"):
             message = _format_validation_error(e)
             logger.warning(f"mcp_tool_{tool_name}_invalid_argument: {message}")
+            manual = _manual_help(tool_name)
+            if manual:
+                return _error_response("invalid_argument", message, help=manual)
             return _error_response("invalid_argument", message)
         # #1684: a server fault — error-level log with the traceback and a
         # correlation_id; the caller gets ``internal_error``, never the dump.

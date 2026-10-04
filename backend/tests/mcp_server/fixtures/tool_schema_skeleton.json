@@ -1537,6 +1537,24 @@
     }
   },
   {
+    "name": "guide",
+    "readOnly": true,
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "topics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "maxItems": 20
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "set_state",
     "inputSchema": {
       "type": "object",
