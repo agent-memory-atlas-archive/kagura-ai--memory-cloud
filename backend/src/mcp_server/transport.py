@@ -1189,11 +1189,12 @@ async def _dispatch_message(scope: Scope, send: Send, session: "MCPSession", bod
 
         from mcp_server.tools._profiles import ToolProfileError, select_tool_definitions
 
-        # #1601: the endpoint URL (``?profile=`` / ``?tools=``) picks what is
-        # listed; without either this is the whole registry, as before. It is
-        # a view, not an authorization boundary — ``tools/call`` below never
+        # #1601 / #1849: the endpoint URL (``?profile=`` / ``?tools=``) picks
+        # what is listed; without either this is the core profile. It is a
+        # view, not an authorization boundary — ``tools/call`` below never
         # reads it, so an unlisted tool stays callable under the usual role
-        # checks.
+        # checks (clients, however, call listed tools only; ``describe_tools``
+        # names the rest).
         try:
             tools = select_tool_definitions(scope.get("query_string"))
         except ToolProfileError as e:
@@ -1508,6 +1509,7 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
         from mcp_server.tools._helpers import (
             set_mcp_guardrails_selection,
             set_mcp_key_workspace_scope,
+            set_mcp_tool_view_query,
         )
 
         set_mcp_key_workspace_scope(api_key_workspace_id)
@@ -1519,6 +1521,9 @@ async def mcp_asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
         from services.guardrail_digest import select_guardrail_context
 
         set_mcp_guardrails_selection(select_guardrail_context(scope.get("query_string", b"")))
+        # #1849: the same URL picks what ``tools/list`` shows; ``describe_tools``
+        # derives the view from these bytes when (and only when) it is called.
+        set_mcp_tool_view_query(scope.get("query_string", b""))
 
         # RFC-0002 P0-4 (#1277): parse W3C traceparent + baggage into the
         # per-request correlation contextvar at the same auth seam (sibling of
