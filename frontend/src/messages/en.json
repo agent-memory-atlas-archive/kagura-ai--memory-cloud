@@ -2365,10 +2365,6 @@
         "title": "Tier Comparison",
         "description": "Live plan tier configuration. Values reflect environment overrides applied on the server.",
         "feature": "Feature",
-        "free": "S",
-        "basic": "M",
-        "pro": "L",
-        "promax": "XL",
         "loadError": "Failed to load plan tier data",
         "emptyTitle": "No plan tiers configured",
         "emptyDescription": "The backend returned no tiers — check the deployment's PLAN_* configuration.",
@@ -2626,12 +2622,6 @@
           "description": "Change plan tier for {workspaceName}",
           "currentPlanLabel": "Current Plan",
           "newPlanLabel": "New Plan",
-          "planOptions": {
-            "free": "Free",
-            "basic": "Basic",
-            "pro": "Pro",
-            "promax": "Pro Max"
-          },
           "warningText": "⚠️ Plan changes take effect immediately and will update quota limits.",
           "confirm": "Change Plan"
         },
