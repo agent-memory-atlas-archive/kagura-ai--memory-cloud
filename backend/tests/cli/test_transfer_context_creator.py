@@ -17,12 +17,23 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.workspace_roles import WorkspaceRole
 from models.auth import AuditLog, Context, User, Workspace, WorkspaceMember
-from models.memory import Memory
+from models.memory import (
+    EDGE_ORIGIN_DECLARED,
+    EDGE_ORIGIN_HEBBIAN,
+    EDGE_ORIGIN_SEMANTIC,
+    EDGE_TYPE_CONTRADICTS,
+    EDGE_TYPE_DEPENDS_ON,
+    EDGE_TYPE_NEURAL_ASSOCIATION,
+    EDGE_TYPE_RELATED_TO,
+    EDGE_TYPE_SUPERSEDES,
+    Memory,
+    NeuralMemoryEdge,
+)
 from utils.datetime import utcnow
 
 _BACKEND_SRC = Path(__file__).resolve().parents[2] / "src"
@@ -64,7 +75,9 @@ def _context(ws: Workspace, owner: str, *, private: bool, deleted: bool = False)
     )
 
 
-def _memory(ctx: Context, author: str, *, deleted: bool = False) -> Memory:
+def _memory(
+    ctx: Context, author: str, *, deleted: bool = False, embedding_status: str = "success"
+) -> Memory:
     return Memory(
         id=uuid4(),
         user_id=author,
@@ -74,7 +87,30 @@ def _memory(ctx: Context, author: str, *, deleted: bool = False) -> Memory:
         content="c",
         type="note",
         client="test",
+        embedding_status=embedding_status,
         deleted_at=utcnow() if deleted else None,
+    )
+
+
+def _edge(
+    src: Memory,
+    dst: Memory,
+    owner: str,
+    *,
+    edge_type: str = EDGE_TYPE_RELATED_TO,
+    origin: str = EDGE_ORIGIN_DECLARED,
+    weight: float = 1.0,
+) -> NeuralMemoryEdge:
+    return NeuralMemoryEdge(
+        user_id=owner,
+        src_id=src.id,
+        dst_id=dst.id,
+        workspace_id=src.workspace_id,
+        context_id=src.context_id,
+        edge_type=edge_type,
+        weight=weight,
+        confidence=1.0,
+        origin=origin,
     )
 
 
@@ -355,7 +391,9 @@ async def test_repair_payloads_converges_after_a_failed_run(
     assert "would move 1 memory row(s) still authored by" in out
     # The swept row is re-pointed too, so the plan says 4 — what the run does.
     assert "would re-point the vector payload of 4 live memor(ies)" in out
-    assert "changed 5 item(s)" in out
+    # The prompt and the report name what moves instead of "5 item(s)" (#1872).
+    assert "changed 1 memory row(s), 4 vector payload repair(s)" in out
+    assert "item(s)" not in out
     sweep = await db_session.scalar(
         select(AuditLog).where(
             AuditLog.action == AUDIT_ACTION,
@@ -441,6 +479,368 @@ async def test_unknown_workspace_and_same_user_are_errors(db_session, scenario):
             to_user_id=s["web_user"].user_id,
             workspace_id=uuid4(),
         )
+
+
+async def _edges(db: AsyncSession, context_id) -> dict[tuple, NeuralMemoryEdge]:
+    rows = (
+        (
+            await db.execute(
+                select(NeuralMemoryEdge)
+                .where(NeuralMemoryEdge.context_id == context_id)
+                # The command writes with Core statements: read the rows, not the identity map.
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {(row.user_id, row.src_id, row.dst_id): row for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_non_hebbian_edges_follow_the_context(db_session, scenario, vector_store):
+    """#1872: ``supersedes`` / declared / sleep-discovered edges are state the
+    new owner has to manage, so they move with the context; Hebbian weights
+    are retrieval history and stay. A pair ``--to`` already holds an edge on
+    cannot collide with ``unique_edge``."""
+    s, m = scenario, scenario["memories"]
+    frm, to = s["cli_admin"].user_id, s["web_user"].user_id
+    a, b, t, o = m["private_a"], m["private_b"], m["private_tombstone"], m["private_by_other"]
+    db_session.add_all(
+        [
+            _edge(a, b, frm, edge_type=EDGE_TYPE_SUPERSEDES),
+            _edge(b, a, frm),  # declared related_to
+            _edge(a, o, frm, origin=EDGE_ORIGIN_SEMANTIC),
+            _edge(a, t, frm, edge_type=EDGE_TYPE_NEURAL_ASSOCIATION, origin=EDGE_ORIGIN_HEBBIAN),
+            # --to declared a related_to on a pair --from superseded: recall
+            # acts on the supersedes, so it is the one that survives.
+            _edge(b, o, frm, edge_type=EDGE_TYPE_SUPERSEDES),
+            _edge(b, o, to, weight=0.5),
+            # Both superseded the pair: --to's row is kept, --from's is dropped.
+            _edge(t, b, frm, edge_type=EDGE_TYPE_SUPERSEDES, weight=0.9),
+            _edge(t, b, to, edge_type=EDGE_TYPE_SUPERSEDES, weight=0.3),
+            # An ordinary declared link does not displace --to's declared one.
+            _edge(t, o, frm),
+            _edge(t, o, to, edge_type=EDGE_TYPE_DEPENDS_ON, weight=0.2),
+            # A third user's edge in the same context is nobody's to move.
+            _edge(b, t, s["other"].user_id, edge_type=EDGE_TYPE_SUPERSEDES),
+            # --to only has a co-activation weight on the pair: the declared
+            # edge replaces it, as a declared write through the API would.
+            _edge(o, a, frm, edge_type=EDGE_TYPE_SUPERSEDES),
+            _edge(o, a, to, edge_type=EDGE_TYPE_NEURAL_ASSOCIATION, origin=EDGE_ORIGIN_HEBBIAN),
+            # Declared beats semantic (#1406): --to's sleep-discovered link on
+            # the pair gives way to the old account's declared supersedes.
+            _edge(o, b, frm, edge_type=EDGE_TYPE_SUPERSEDES),
+            _edge(o, b, to, origin=EDGE_ORIGIN_SEMANTIC),
+            # Semantic does not beat semantic: --to's row is kept.
+            _edge(t, a, frm, origin=EDGE_ORIGIN_SEMANTIC, weight=0.9),
+            _edge(t, a, to, origin=EDGE_ORIGIN_SEMANTIC, weight=0.4),
+            # Outside the transfer: an edge of --from in a context --to owned all along.
+            _edge(m["pre_owned_by_from"], m["pre_owned_by_from"], frm),
+        ]
+    )
+    await db_session.flush()
+
+    plan = await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=True
+    )
+    by_ctx = {line.context_id: line.edges for line in plan.lines}
+    assert (by_ctx[s["private_ctx"].id].moved, by_ctx[s["private_ctx"].id].dropped) == (6, 3)
+    assert by_ctx[s["private_ctx"].id].replaced == 3
+    assert by_ctx[s["shared_ctx"].id].moved == 0
+    assert (plan.edges_moved, plan.edges_dropped) == (6, 3)
+    # The prompt names moved and dropped edges the way the plan lines do.
+    assert plan.summary() == (
+        "2 context(s), 4 memory row(s), 6 edge(s), 3 duplicate edge(s) dropped"
+    )
+    # Dry run wrote nothing.
+    assert (frm, a.id, b.id) in await _edges(db_session, s["private_ctx"].id)
+
+    result = await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=False
+    )
+    assert result.edges_moved == 6
+
+    edges = await _edges(db_session, s["private_ctx"].id)
+    assert set(edges) == {
+        (to, a.id, b.id),
+        (to, b.id, a.id),
+        (to, a.id, o.id),
+        (frm, a.id, t.id),  # Hebbian: left with the old account
+        (to, b.id, o.id),
+        (to, o.id, a.id),
+        (to, o.id, b.id),
+        (to, t.id, a.id),
+        (to, t.id, b.id),
+        (to, t.id, o.id),
+        (s["other"].user_id, b.id, t.id),
+    }
+    assert edges[(to, a.id, b.id)].edge_type == EDGE_TYPE_SUPERSEDES
+    assert edges[(to, b.id, a.id)].edge_type == EDGE_TYPE_RELATED_TO
+    assert edges[(to, a.id, o.id)].origin == EDGE_ORIGIN_SEMANTIC
+    assert edges[(frm, a.id, t.id)].origin == EDGE_ORIGIN_HEBBIAN
+    # The supersedes replaced --to's related_to on the pair.
+    assert edges[(to, b.id, o.id)].edge_type == EDGE_TYPE_SUPERSEDES
+    assert edges[(to, b.id, o.id)].weight == 1.0
+    # Same type on both sides, or an ordinary link: --to's own row survived
+    # untouched and --from's duplicate is gone.
+    assert edges[(to, t.id, b.id)].weight == 0.3
+    assert edges[(to, t.id, o.id)].edge_type == EDGE_TYPE_DEPENDS_ON
+    assert edges[(s["other"].user_id, b.id, t.id)].edge_type == EDGE_TYPE_SUPERSEDES
+    # The declared edge took the place of --to's Hebbian row.
+    assert edges[(to, o.id, a.id)].edge_type == EDGE_TYPE_SUPERSEDES
+    assert edges[(to, o.id, a.id)].origin == EDGE_ORIGIN_DECLARED
+    assert edges[(to, o.id, b.id)].edge_type == EDGE_TYPE_SUPERSEDES
+    assert edges[(to, o.id, b.id)].origin == EDGE_ORIGIN_DECLARED
+    assert edges[(to, t.id, a.id)].weight == 0.4
+    # A context --to owned all along is out of scope.
+    pre = m["pre_owned_by_from"]
+    assert set(await _edges(db_session, s["pre_owned_ctx"].id)) == {(frm, pre.id, pre.id)}
+
+    audit = await db_session.scalar(
+        select(AuditLog).where(AuditLog.resource == f"context:{s['private_ctx'].id}")
+    )
+    assert audit.user_metadata["edges"] == 6
+    assert audit.user_metadata["edges_dropped"] == 3
+    assert audit.user_metadata["edges_replaced"] == 3
+
+    # A second run, with and without the sweep, changes nothing.
+    for repair in (False, True):
+        again = await transfer_context_creator(
+            db_session,
+            from_user_id=frm,
+            to_user_id=to,
+            workspace_id=s["ws"].id,
+            dry_run=False,
+            repair_payloads=repair,
+        )
+        assert (again.transferred, again.edges_moved, again.repair_edges.total) == (0, 0, 0)
+    assert set(await _edges(db_session, s["private_ctx"].id)) == set(edges)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("from_type", "to_type", "to_origin", "survivor"),
+    [
+        # Recall acts on supersedes / contradicts: never given up for another type.
+        (EDGE_TYPE_SUPERSEDES, EDGE_TYPE_RELATED_TO, EDGE_ORIGIN_DECLARED, "from"),
+        (EDGE_TYPE_CONTRADICTS, EDGE_TYPE_RELATED_TO, EDGE_ORIGIN_DECLARED, "from"),
+        (EDGE_TYPE_SUPERSEDES, EDGE_TYPE_CONTRADICTS, EDGE_ORIGIN_DECLARED, "from"),
+        # Same type on both sides: the new owner's row is the one that stays.
+        (EDGE_TYPE_SUPERSEDES, EDGE_TYPE_SUPERSEDES, EDGE_ORIGIN_DECLARED, "to"),
+        (EDGE_TYPE_CONTRADICTS, EDGE_TYPE_CONTRADICTS, EDGE_ORIGIN_SEMANTIC, "from"),
+        # An ordinary link does not displace --to's supersedes.
+        (EDGE_TYPE_RELATED_TO, EDGE_TYPE_SUPERSEDES, EDGE_ORIGIN_DECLARED, "to"),
+    ],
+)
+async def test_edge_type_decides_a_collision_recall_depends_on(
+    db_session, scenario, vector_store, from_type, to_type, to_origin, survivor
+):
+    """``--from`` holds a declared edge on a pair ``--to`` also holds one on.
+    Shadowing and contradiction annotations follow ``edge_type``, so the
+    transfer must not trade a ``supersedes`` / ``contradicts`` for another
+    type; with the same type on both sides nothing is lost either way."""
+    s, m = scenario, scenario["memories"]
+    frm, to = s["cli_admin"].user_id, s["web_user"].user_id
+    a, b = m["private_a"], m["private_b"]
+    db_session.add_all(
+        [
+            _edge(a, b, frm, edge_type=from_type, weight=0.9),
+            _edge(a, b, to, edge_type=to_type, origin=to_origin, weight=0.3),
+        ]
+    )
+    await db_session.flush()
+
+    result = await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=False
+    )
+
+    edges = await _edges(db_session, s["private_ctx"].id)
+    assert set(edges) == {(to, a.id, b.id)}
+    row = edges[(to, a.id, b.id)]
+    if survivor == "from":
+        assert (row.edge_type, row.origin, row.weight) == (from_type, EDGE_ORIGIN_DECLARED, 0.9)
+        assert (result.edges_moved, result.edges_dropped) == (1, 0)
+    else:
+        assert (row.edge_type, row.origin, row.weight) == (to_type, to_origin, 0.3)
+        assert (result.edges_moved, result.edges_dropped) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_an_automated_supersedes_does_not_delete_a_declared_edge(
+    db_session, scenario, vector_store
+):
+    """``--from``'s sleep-discovered ``supersedes`` meets a link ``--to``
+    declared by hand on the same pair: the declared row stays."""
+    s, m = scenario, scenario["memories"]
+    frm, to = s["cli_admin"].user_id, s["web_user"].user_id
+    a, b = m["private_a"], m["private_b"]
+    db_session.add_all(
+        [
+            _edge(a, b, frm, edge_type=EDGE_TYPE_SUPERSEDES, origin=EDGE_ORIGIN_SEMANTIC),
+            _edge(a, b, to, edge_type=EDGE_TYPE_CONTRADICTS, weight=0.3),
+        ]
+    )
+    await db_session.flush()
+
+    result = await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=False
+    )
+
+    edges = await _edges(db_session, s["private_ctx"].id)
+    assert set(edges) == {(to, a.id, b.id)}
+    row = edges[(to, a.id, b.id)]
+    assert (row.edge_type, row.origin, row.weight) == (
+        EDGE_TYPE_CONTRADICTS,
+        EDGE_ORIGIN_DECLARED,
+        0.3,
+    )
+    assert (result.edges_moved, result.edges_dropped) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_repair_sweeps_edges_left_on_the_old_account(
+    db_session, scenario, vector_store, cli_db, capsys
+):
+    """A transfer made before #1872, or an edge declared by ``--from`` after
+    the flip, leaves non-Hebbian edges behind: the sweep moves them, counts
+    them as planned work and records them on its audit row."""
+    s, m = scenario, scenario["memories"]
+    frm, to = s["cli_admin"].user_id, s["web_user"].user_id
+    await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=False
+    )
+    db_session.add_all(
+        [
+            _edge(m["private_a"], m["private_b"], frm, edge_type=EDGE_TYPE_SUPERSEDES),
+            _edge(
+                m["private_b"],
+                m["private_a"],
+                frm,
+                edge_type=EDGE_TYPE_NEURAL_ASSOCIATION,
+                origin=EDGE_ORIGIN_HEBBIAN,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    argv = ["--from", frm, "--to", to, "--workspace", str(s["ws"].id), "--repair-payloads"]
+    assert await _main(_parse(argv)) == 0
+    out = capsys.readouterr().out
+    assert "would move 1 edge(s) still held by" in out
+    assert "dry run" in out
+    assert (frm, m["private_a"].id, m["private_b"].id) in await _edges(
+        db_session, s["private_ctx"].id
+    )
+
+    assert await _main(_parse([*argv, "--apply", "--yes"])) == 0
+    out = capsys.readouterr().out
+    assert "changed 1 edge(s), 3 vector payload repair(s)" in out
+    assert set(await _edges(db_session, s["private_ctx"].id)) == {
+        (to, m["private_a"].id, m["private_b"].id),
+        (frm, m["private_b"].id, m["private_a"].id),
+    }
+    sweep = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.action == AUDIT_ACTION, AuditLog.resource == f"workspace:{s['ws'].id}"
+        )
+    )
+    assert sweep.user_metadata["edges"] == 1 and sweep.user_metadata["memories"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_runs_after_the_from_user_row_is_gone(
+    db_session, scenario, vector_store, cli_db
+):
+    """The sweep needs the audit rows and the ``user_id`` string, not the
+    ``users`` row: it still converges once the retired account was removed.
+    ``--to`` is always required."""
+    s = scenario
+    retired = _user("retired")
+    db_session.add(retired)
+    await db_session.flush()
+    ctx = _context(s["ws"], retired.user_id, private=True)
+    db_session.add(ctx)
+    await db_session.flush()
+    first_memory = _memory(ctx, retired.user_id)
+    db_session.add(first_memory)
+    await db_session.flush()
+    frm, to = retired.user_id, s["web_user"].user_id
+
+    first = await transfer_context_creator(
+        db_session, from_user_id=frm, to_user_id=to, workspace_id=s["ws"].id, dry_run=False
+    )
+    assert first.transferred_ids == [ctx.id]
+
+    await db_session.execute(delete(User).where(User.user_id == frm))
+    late = _memory(ctx, frm)
+    db_session.add(late)
+    await db_session.flush()
+    # ...and an edge it declared after the flip: swept with the memory.
+    db_session.add(_edge(late, first_memory, frm, edge_type=EDGE_TYPE_SUPERSEDES))
+    await db_session.flush()
+
+    argv = ["--from", frm, "--to", to, "--workspace", str(s["ws"].id), "--apply", "--yes"]
+    # Without the sweep the --from row is still required: a typo must not
+    # read as "nothing to transfer".
+    assert await _main(_parse(argv)) == 1
+    assert await _main(_parse([*argv, "--repair-payloads"])) == 0
+    assert await _author(db_session, late.id) == to
+    assert set(await _edges(db_session, ctx.id)) == {(to, late.id, first_memory.id)}
+
+    with pytest.raises(ValueError, match="nobody_here"):
+        await transfer_context_creator(
+            db_session,
+            from_user_id=frm,
+            to_user_id="nobody_here",
+            workspace_id=s["ws"].id,
+            repair_payloads=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_missing_point_of_an_unembedded_memory_is_not_a_failure(
+    db_session, scenario, vector_store, cli_db, capsys
+):
+    """A memory whose embedding is pending or failed has no vector point, so
+    the payload update raises on a store that rejects unknown ids. That is
+    not a failure — the later embed writes the payload from the row — and it
+    must not keep the command from exiting 0. A ``success`` memory's failure
+    still does."""
+    s, m = scenario, scenario["memories"]
+    frm, to = s["cli_admin"].user_id, s["web_user"].user_id
+    unembedded = _memory(s["private_ctx"], frm, embedding_status="failed")
+    db_session.add(unembedded)
+    await db_session.flush()
+    raising = {unembedded.id}
+
+    async def missing_point(*, memory_id, **_):
+        if memory_id in raising:
+            raise RuntimeError("no point with that id")
+
+    vector_store.side_effect = missing_point
+    argv = ["--from", frm, "--to", to, "--workspace", str(s["ws"].id), "--apply", "--yes"]
+    assert await _main(_parse(argv)) == 0
+    captured = capsys.readouterr()
+    assert "NOT updated" not in captured.err
+    assert "skipped 1 memor(ies) not embedded yet" in captured.out
+    assert str(unembedded.id) in captured.out
+
+    # The same raise for an embedded memory is a real failure: reported, exit 1.
+    raising.add(m["private_a"].id)
+    assert await _main(_parse([*argv, "--repair-payloads"])) == 1
+    captured = capsys.readouterr()
+    assert "vector payload NOT updated for 1 memor(ies)" in captured.err
+    assert str(m["private_a"].id) in captured.err
+    assert str(unembedded.id) not in captured.err
+
+
+def test_help_covers_plan_mode_for_repair_payloads(capsys):
+    with pytest.raises(SystemExit):
+        _parse(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "planned without --apply, written with it" in out
+    assert "with --apply:" not in out
 
 
 def test_parse_requires_both_users_and_a_workspace():
