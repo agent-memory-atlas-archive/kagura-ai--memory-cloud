@@ -4,6 +4,48 @@ Issue #51: Password + MFA login for initial admin.
 
 Usage:
     cd backend && python -m src.cli.reset_password
+
+A password reset is the account's compromise-recovery path, so resetting the
+password here (choices 1 and 3) does what the emailed-link reset does
+(``PasswordAccountService.complete_reset``), in one transaction (#1866):
+
+- the owner's ``users`` row is locked and every OAuth2 / MCP token, pending
+  authorization code and device code of the account is revoked with the
+  shared statements of ``services/oauth_grant_revocation.py``, in their lock
+  order ``users -> oauth_authorization_codes -> oauth_device_codes ->
+  oauth_tokens``;
+- emailed reset / set-up links are invalidated (#1678) and the known devices
+  are forgotten (#1769), so the next sign-in from each browser is reported;
+- every browser session of the account is deleted from the session store
+  (Redis, ``REDIS_URL``) with ``strict=True`` before the commit.
+
+The session store must be reachable. It is probed before the password prompt
+and the reset is refused when it cannot be reached; a delete that fails
+later rolls the transaction back. Either way the password, MFA and grants
+are left as they were and the CLI exits non-zero: a reset that reported
+success while the old sessions survived would not contain the incident. If
+the commit itself fails after the sessions were deleted, the CLI rolls back
+and says so: the password is unchanged, the sessions are already signed out
+and the reset has to be run again. Messages name only the store's host and
+port and an exception's type, never the URL's credentials or a statement's
+parameters. There is no "continue anyway" prompt — while the
+session store is down nobody can sign in either, so the operator loses
+nothing by bringing it back first. Run the CLI where ``REDIS_URL`` points at
+the Redis the API uses (the default ``redis://localhost:6379`` is the port
+Docker Compose publishes on the host).
+
+API keys and OAuth client secrets are not revoked; the CLI says so. No audit
+row and no notification email are written (operator CLI actions run outside
+the API).
+
+Decision — "Disable MFA only" (choice 2) revokes nothing. It is the recovery
+for a lost authenticator, not for a leaked credential: the password, and
+with it everything a session or grant was obtained with, stays the same, so
+ending the sessions would contain nothing and would only sign the owner out
+of every browser and MCP client. It also keeps the lost-authenticator
+recovery usable while the session store is down. After a suspected
+compromise the operator resets the password (choice 1 or 3), and the CLI
+prints that hint.
 """
 
 import getpass
@@ -11,6 +53,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -23,11 +66,18 @@ from auth.password_policy import (  # noqa: E402
     PasswordPolicyError,
     validate_password_policy,
 )
+from auth.session import SessionManager  # noqa: E402
 from cli.db import get_sync_database_url  # noqa: E402
+from config.database import get_redis_url  # noqa: E402
 from models.auth import User  # noqa: E402
 from services.email_action_token_service import (  # noqa: E402
     PASSWORD_LINK_PURPOSES,
     invalidation_statement,
+)
+from services.known_device_service import known_devices_delete  # noqa: E402
+from services.oauth_grant_revocation import (  # noqa: E402
+    RevokedGrants,
+    revoke_oauth_grants_sync,
 )
 
 _project_root = Path(__file__).parent.parent.parent.parent
@@ -47,6 +97,67 @@ def _get_env_from_docker(key: str) -> str | None:
         return value if result.returncode == 0 and value else None
     except Exception:
         return None  # Docker not running or not accessible
+
+
+def _redis_location(redis_url: str) -> str:
+    """``host:port`` of the store, for operator messages.
+
+    Built from the parsed host and port only: a URL can carry a password in
+    its userinfo (``redis://:pw@host``) or its query (``?password=pw``), and
+    neither may reach the terminal.
+    """
+    try:
+        parts = urlsplit(redis_url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "the configured REDIS_URL"
+    if not host:
+        return "the configured REDIS_URL"
+    return f"{host}:{port}" if port else host
+
+
+def _refusal(*lines: str) -> SystemExit:
+    """Print why the reset cannot start; return the exit for the caller to raise.
+
+    Returned, not raised here, so each caller's ``raise`` shows on its own
+    line that the path ends (nothing was written at that point).
+    """
+    print(f"\n✗ {lines[0]}")
+    for line in lines[1:]:
+        print(f"  {line}")
+    print("  A password reset must sign out every browser session of the account.")
+    print("  Nothing was changed.")
+    return SystemExit(1)
+
+
+def _session_store_or_exit() -> SessionManager:
+    """Connect to the browser-session store, or refuse the reset (#1866).
+
+    A password reset that cannot sign the old sessions out must not happen:
+    exit before anything is prompted for or written. Fail closed — every
+    failure to get a working store ends here, each with its own message, and
+    only the exception's type is printed (its text may quote the URL).
+    """
+    redis_url = get_redis_url()
+    try:
+        return SessionManager(redis_url=redis_url)
+    except ImportError as exc:
+        raise _refusal(
+            "The 'redis' package is not installed in this Python environment.",
+            "Run this command from the backend environment (or the API container).",
+        ) from exc
+    except OSError as exc:
+        # ``SessionManager`` reports a refused, timed-out or unresolvable
+        # store — whatever the redis client raised — as the builtin
+        # ``ConnectionError`` (an ``OSError``).
+        raise _refusal(
+            f"Cannot reach the session store at {_redis_location(redis_url)}"
+            f" ({type(exc).__name__}).",
+            "Start Redis, or set REDIS_URL to the Redis the API runs on, and run",
+            "this command again.",
+        ) from exc
+    except Exception as exc:
+        raise _refusal(f"Could not open the session store ({type(exc).__name__}).") from exc
 
 
 def reset_password():
@@ -81,8 +192,12 @@ def reset_password():
             print("✗ Invalid choice.")
             sys.exit(1)
 
-        # Reset password
-        if choice in ("1", "3"):
+        # Reset password. The session store is probed before the prompt: without it there is
+        # no password reset (#1866). Choice 2 does not need it.
+        session_store = _session_store_or_exit() if choice in ("1", "3") else None
+        grants: RevokedGrants | None = None
+        sessions_deleted = 0
+        if session_store is not None:
             while True:
                 print("\nPassword requirements:")
                 for line in PASSWORD_REQUIREMENT_LINES:
@@ -104,21 +219,73 @@ def reset_password():
 
                 break
 
-            user.password_hash = hash_password(password)
+            password_hash = hash_password(password)
+            # First the owner lock and the OAuth2 / MCP grants, in the shared
+            # lock order (#1738, #1770): every grant writer waits on the user
+            # row from here until the commit.
+            grants = revoke_oauth_grants_sync(db, user.user_id)
+            user.password_hash = password_hash
             # Kill emailed reset / set-up links in the same commit (#1678): one
             # issued before this reset must not overwrite the new password.
             db.execute(
                 invalidation_statement(user_id=user.user_id, purposes=PASSWORD_LINK_PURPOSES)
             )
-            print("  ✓ Password updated.")
+            # #1769: forget every known browser, so the next sign-in from each
+            # is a new device.
+            db.execute(known_devices_delete(user.user_id))
 
         # Disable MFA
         if choice in ("2", "3"):
             user.totp_enabled = False
             user.totp_secret = None
-            print("  ✓ MFA disabled.")
 
-        db.commit()
+        if session_store is not None:
+            # Send every write before the sessions go, so a database error
+            # surfaces while nothing has been signed out yet.
+            db.flush()
+            try:
+                sessions_deleted = session_store.delete_user_sessions(user.user_id, strict=True)
+            except Exception as exc:
+                # The old sessions may have survived: the new password and the
+                # revocations must not be committed without them (#1866).
+                db.rollback()
+                print(f"\n✗ Could not delete the browser sessions ({type(exc).__name__}).")
+                print("  The reset was rolled back: the password, MFA and OAuth grants are as")
+                print("  before. Sessions the store already dropped stay signed out.")
+                print("  Check the session store (REDIS_URL) and run this command again.")
+                sys.exit(1)
+
+        try:
+            db.commit()
+        except Exception as exc:
+            # Never the exception text: a driver error quotes the statement
+            # and its parameters, the new password hash among them.
+            db.rollback()
+            print(f"\n✗ The database commit failed ({type(exc).__name__}).")
+            if session_store is not None:
+                print("  The password was NOT changed; MFA and the OAuth grants are as before.")
+                print("  The browser sessions of the account were already signed out.")
+                print("  Run this command again to complete the reset.")
+            else:
+                print("  Nothing was changed. Run this command again.")
+            sys.exit(1)
+
+        if grants is not None:
+            pending_codes = grants.authorization_codes + grants.device_codes
+            print("  ✓ Password updated.")
+            print(
+                f"  ✓ Revoked: {sessions_deleted} browser session(s),"
+                f" {grants.tokens} OAuth / MCP token(s),"
+                f" {pending_codes} pending authorization / device code(s)."
+            )
+            print("  ✓ Known devices forgotten.")
+            print("  ⚠ API keys and OAuth client secrets are NOT revoked. After a suspected")
+            print("    compromise, review them in Settings.")
+        if choice in ("2", "3"):
+            print("  ✓ MFA disabled.")
+        if choice == "2":
+            print("  ⚠ Browser sessions and OAuth / MCP grants were NOT revoked. After a")
+            print("    suspected compromise, reset the password (choice 1 or 3).")
 
         # Offer to re-enable MFA
         if choice in ("2", "3"):

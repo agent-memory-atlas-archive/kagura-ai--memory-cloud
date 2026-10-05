@@ -26,12 +26,29 @@ We aim to acknowledge reports within 48 hours and provide a fix within 7 days fo
 - **API Keys** for programmatic access (SHA-256 hashed, Fernet encrypted at rest)
 - **JWT** for session tokens (configurable expiry, HS256)
 - **HttpOnly cookies** for session storage
-- **Email + password** for existing accounts. A password reset signs out every
-  browser session and revokes every OAuth / MCP token and pending grant of the
-  account; a consent or device approval racing the reset is refused rather
-  than left behind as a grant the reset could not see. API keys and OAuth
-  client secrets are not revoked automatically — review them in Settings
-  after a suspected compromise.
+- **Email + password** for existing accounts. A password reset — by emailed
+  link, or by an operator with the `reset_password` CLI (choices 1 and 3) —
+  signs out every browser session and revokes every OAuth / MCP token and
+  pending grant (authorization code, device code) of the account. The grant
+  revocations are in the database transaction of the new password; the
+  sessions live in Redis and are deleted just before that transaction
+  commits, so the password is never committed while old sessions survive (a
+  commit that then fails leaves the old password with the sessions already
+  signed out; the CLI says so and the reset is run again). A consent or
+  device approval racing the reset is refused rather than left behind as a
+  grant the reset could not see. API keys and OAuth client secrets are not
+  revoked automatically — review them in Settings after a suspected
+  compromise. The two paths differ in three ways:
+  - the CLI reset writes no audit row and sends no notice (see below);
+  - the CLI must reach the session store (Redis, `REDIS_URL`): it refuses to
+    reset the password when the store is unreachable, and rolls the reset
+    back and exits non-zero when deleting the sessions or the commit fails,
+    so it never reports success while old sessions survive. Its messages
+    name the store's host and port and the error type only, never the URL's
+    credentials or a statement's parameters;
+  - the CLI's "Disable MFA only" (choice 2) changes no credential and revokes
+    nothing — sessions, tokens and known devices are kept. After a suspected
+    compromise, reset the password (choice 1 or 3).
 - **Security-change notification emails** — the account owner is emailed
   (mandatory, no opt-out) when:
   - a password is set, changed or reset with an emailed link;
@@ -59,8 +76,8 @@ We aim to acknowledge reports within 48 hours and provide a fix within 7 days fo
     match — it is spoofable. An account's first browser
     sign-in ever registers the device silently (so the device the account
     was created from sends nothing); from then on the account stays armed. A
-    password reset forgets every known device but not that the account is
-    armed, so the next sign-in from each browser — the attacker's included,
+    password reset (emailed link or CLI) forgets every known device but not
+    that the account is armed, so the next sign-in from each browser — the attacker's included,
     even when it comes first — is reported. Devices not seen for
     `KNOWN_DEVICE_RETENTION_DAYS` (default 180, at most 365) are forgotten by
     a daily job and reported again on their next sign-in, at most
@@ -80,8 +97,9 @@ We aim to acknowledge reports within 48 hours and provide a fix within 7 days fo
   ones are sent as one follow-up digest. A notice whose send fails is retried
   twice. Emails go only to a verified address — one proven through an emailed
   password link, or one an OAuth provider attested as verified at sign-in (a
-  linked provider alone is not enough) — never to `@local` accounts. Operator CLI actions (`reset_password`, `create_admin`, ...) run
-  outside the API and send no notice. Share keys (read-only, bound to one
+  linked provider alone is not enough) — never to `@local` accounts. Operator
+  CLI actions (`reset_password`, `create_admin`, ...) run outside the API and
+  send no notice. Share keys (read-only, bound to one
   context) and connector resource tokens do not send notices either.
 
 ### Authorization (RBAC)
