@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -20,7 +21,7 @@ from auth.dependencies import WorkspaceOwner
 from auth.resource_tokens import ResourceTokenManager
 from db.base import get_db
 from models.api_base import TZAwareBaseModel
-from models.resource import ResourceToken, WorkspaceConnector
+from models.resource import Resource, ResourceToken, WorkspaceConnector
 from services.resource_lookup import resolve_resource_pk
 from utils.exceptions import (
     FeatureNotAvailableError,
@@ -168,6 +169,29 @@ def _format_token_response(token: ResourceToken) -> ResourceTokenResponse:
 # ============================================================================
 
 
+async def _token_in_workspace(db: AsyncSession, token: ResourceToken, workspace_id: UUID) -> bool:
+    """Does ``token`` belong to ``workspace_id``? (#268, #1863)
+
+    The boundary is the ``resources`` row the token's ``resource_pk`` points
+    at — not a live ``contexts`` row. Resolving through contexts (the pre-#1863
+    check) made a token unreachable the moment its last context was
+    soft-deleted: the token kept authenticating ingest (``verify_token`` joins
+    ``Resource`` by ``resource_pk`` and never looks at contexts) while the
+    owner's revoke got 403. A legacy token with ``resource_pk IS NULL`` (it
+    cannot authenticate — ``verify_token`` rejects it — but may still be
+    listed) falls back to the token's own ``workspace_id`` so the owner can
+    still revoke or relabel it.
+    """
+    if token.resource_pk is None:
+        return token.workspace_id is not None and token.workspace_id == workspace_id
+    result = await db.execute(
+        select(Resource.id).where(
+            and_(Resource.id == token.resource_pk, Resource.workspace_id == workspace_id)
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
 @router.get("", response_model=PaginatedResourceTokensResponse)
 async def list_resource_tokens(
     owner: WorkspaceOwner,
@@ -204,40 +228,36 @@ async def list_resource_tokens(
         )
 
         # SECURITY: Workspace boundary check when filtering by resource_id
-        # Issue #268/#270: Verify resource belongs to owner's workspace
+        # Issue #268/#270: Verify resource belongs to owner's workspace.
+        # #1863: resolved through the ``resources`` row, not a live context,
+        # so the tokens of a resource whose contexts were deleted stay listed.
+        resource_pk: UUID | None = None
         if resource_id is not None:
-            from models.auth import Context
+            resource_pk = await resolve_resource_pk(db, current_workspace_id, resource_id)
 
-            # SECURITY: Verify resource_id belongs to current workspace
-            # Issue #268: Prevent accessing tokens for resources in other workspaces
-            context_result = await db.execute(
-                select(Context.id).where(
-                    and_(
-                        Context.resource_id == resource_id,
-                        Context.workspace_id == current_workspace_id,
-                        Context.deleted_at.is_(None),
-                    )
-                )
-            )
-            context_exists = context_result.scalar_one_or_none()
-
-            if not context_exists:
+            if resource_pk is None:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Resource ID '{resource_id}' not found in your workspace or you don't have access to it.",
                 )
 
-        # Performance: DB-level filtering and pagination (not in-memory)
+        # Performance: DB-level filtering and pagination (not in-memory).
+        # #1863: the list is the workspace's — every token in it, whoever
+        # minted it (the owner must be able to see and revoke all of them) —
+        # and the slug filter is pinned to the resolved ``resource_pk`` so a
+        # same-slug resource in another workspace never shows up here.
         total = await manager.count_tokens(
-            resource_id=resource_id, created_by=user_id, include_revoked=True
+            include_revoked=True,
+            workspace_id=current_workspace_id,
+            resource_pk=resource_pk,
         )
 
         tokens = await manager.list_tokens(
-            resource_id=resource_id,
-            created_by=user_id,
             include_revoked=True,
             limit=limit,
             offset=offset,
+            workspace_id=current_workspace_id,
+            resource_pk=resource_pk,
         )
 
         return PaginatedResourceTokensResponse(
@@ -304,8 +324,18 @@ async def create_resource_token(
         )
         from models.auth import Context, Workspace
 
-        # SECURITY: Verify resource_id belongs to current workspace
-        # Issue #268: Workspace boundary violation prevention
+        # SECURITY: Verify the resource belongs to current workspace
+        # Issue #268: Workspace boundary violation prevention. #1863: judged by
+        # the ``resources`` row like list/update/revoke; minting additionally
+        # needs a live context — a retired resource gets no new credentials —
+        # and the message says which of the two is missing (the resource may
+        # well be listed, its existing tokens being reachable while active).
+        resource_pk = await resolve_resource_pk(db, workspace_id, data.resource_id)
+        if resource_pk is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Resource ID '{data.resource_id}' not found in your workspace or you don't have access to it.",
+            )
         context_result = await db.execute(
             select(Context.id).where(
                 and_(
@@ -315,12 +345,14 @@ async def create_resource_token(
                 )
             )
         )
-        context_exists = context_result.scalar_one_or_none()
-
-        if not context_exists:
+        if context_result.scalar_one_or_none() is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Resource ID '{data.resource_id}' not found in your workspace or you don't have access to it.",
+                detail=(
+                    f"Resource ID '{data.resource_id}' has no live context in your "
+                    "workspace; restore or create a context bound to it before creating "
+                    "tokens."
+                ),
             )
 
         # ``WorkspaceOwner`` guarantees a workspace id; a missing plan row is a
@@ -394,28 +426,9 @@ async def create_resource_token(
                 ),
             )
 
-        # Issue #390 Phase 2: resolve authoritative ``resource_pk`` + pass
-        # ``workspace_id`` so the ResourceToken insert satisfies the
-        # before_insert event listener invariant (models/resource.py).
-        # The context-existence check above already confirmed the Resource
-        # is bound to this workspace; if resolve_resource_pk still returns
-        # None it indicates either a delete race between the two queries or
-        # a data-integrity gap (Context exists without a backing Resource
-        # row), NOT an authorization failure. Surface 409 CONFLICT with an
-        # actionable hint so operators can distinguish "not authorized" from
-        # "resource binding is inconsistent" in logs and error reports.
-        resource_pk = await resolve_resource_pk(db, workspace_id, data.resource_id)
-        if resource_pk is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Resource ID '{data.resource_id}' exists as a Context but has no "
-                    "backing Resource entity row. This is either a delete race or a "
-                    "data-integrity gap. Retry in a moment, or run setup_resource() "
-                    "to rebind."
-                ),
-            )
-
+        # Issue #390 Phase 2: ``resource_pk`` (resolved above) + ``workspace_id``
+        # make the ResourceToken insert satisfy the before_insert event
+        # listener invariant (models/resource.py).
         # Create token (returns plaintext + token object)
         plaintext_token, new_token = await manager.create_token(
             resource_id=data.resource_id,
@@ -486,15 +499,14 @@ async def update_resource_token(
     try:
         user_id, current_workspace_id = owner
 
-        # SECURITY: Get token and verify ownership
-        from models.auth import Context
-
-        # Verify ownership
+        # SECURITY: the token must belong to the caller's workspace (#1863:
+        # any owner of the workspace may relabel any of its tokens; a token of
+        # another workspace is a uniform 404 so its existence is not disclosed)
         result = await db.execute(
             select(ResourceToken).where(
                 and_(
                     ResourceToken.public_id == token_id,
-                    ResourceToken.created_by == user_id,
+                    ResourceToken.workspace_id == current_workspace_id,
                 )
             )
         )
@@ -503,23 +515,13 @@ async def update_resource_token(
         if not token:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Resource token not found or not owned by you",
+                detail="Resource token not found",
             )
 
-        # SECURITY: Verify resource_id belongs to current workspace
+        # SECURITY: Verify the token's resource belongs to current workspace
         # Issue #268: Prevent updating tokens for resources in other workspaces
-        context_result = await db.execute(
-            select(Context.id).where(
-                and_(
-                    Context.resource_id == token.resource_id,
-                    Context.workspace_id == current_workspace_id,
-                    Context.deleted_at.is_(None),
-                )
-            )
-        )
-        context_exists = context_result.scalar_one_or_none()
-
-        if not context_exists:
+        # #1863: judged by the ``resources`` row, not a live context
+        if not await _token_in_workspace(db, token, current_workspace_id):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Resource token belongs to a different workspace.",
@@ -619,15 +621,15 @@ async def revoke_resource_token(
         user_id, current_workspace_id = owner
         logger.info("revoke_resource_token_request", user_id=user_id, public_id=token_id)
 
-        # SECURITY: Verify token exists and ownership
-        from models.auth import Context
-
-        # Verify token exists and ownership (security)
+        # SECURITY: the token must belong to the caller's workspace (#1863:
+        # any owner of the workspace may revoke any of its tokens, including
+        # ones minted by a departed member or a connector; a token of another
+        # workspace is a uniform 404 so its existence is not disclosed)
         result = await db.execute(
             select(ResourceToken).where(
                 and_(
                     ResourceToken.public_id == token_id,
-                    ResourceToken.created_by == user_id,  # Security: verify ownership
+                    ResourceToken.workspace_id == current_workspace_id,
                 )
             )
         )
@@ -639,20 +641,11 @@ async def revoke_resource_token(
                 detail="Resource token not found",
             )
 
-        # SECURITY: Verify resource_id belongs to current workspace
+        # SECURITY: Verify the token's resource belongs to current workspace
         # Issue #268: Prevent revoking tokens for resources in other workspaces
-        context_result = await db.execute(
-            select(Context.id).where(
-                and_(
-                    Context.resource_id == target_token.resource_id,
-                    Context.workspace_id == current_workspace_id,
-                    Context.deleted_at.is_(None),
-                )
-            )
-        )
-        context_exists = context_result.scalar_one_or_none()
-
-        if not context_exists:
+        # #1863: judged by the ``resources`` row so a token whose contexts were
+        # deleted can still be revoked (it still authenticates ingest).
+        if not await _token_in_workspace(db, target_token, current_workspace_id):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Resource token belongs to a different workspace.",
