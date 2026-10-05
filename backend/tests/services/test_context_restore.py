@@ -492,7 +492,12 @@ async def test_restored_resource_rows_get_the_indexers_point_back(db_session, se
         assert rebuilt.id == str(point_ids[doc_id]) == original.id
         assert rebuilt.id != str(memory_id)
         assert rebuilt.vector == original.vector
-        assert rebuilt.payload == original.payload
+        # ``indexed_at`` is each point's own write time (#1869): the rebuilt
+        # point is written later than the original, everything else is equal.
+        assert rebuilt.payload["indexed_at"] >= original.payload["indexed_at"]
+        assert {k: v for k, v in rebuilt.payload.items() if k != "indexed_at"} == {
+            k: v for k, v in original.payload.items() if k != "indexed_at"
+        }
         assert rebuilt.payload["content"] == f"Title: {_DOCS[doc_id]['title']}"
         assert rebuilt.payload["facets"] == {"category": _DOCS[doc_id]["category"]}
         assert rebuilt.payload["sortable"] == {"price": _DOCS[doc_id]["price"]}

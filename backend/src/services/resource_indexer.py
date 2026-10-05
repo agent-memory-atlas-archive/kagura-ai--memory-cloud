@@ -379,7 +379,12 @@ def build_resource_point(
             "facets": projected["facets"],
             "sortable": projected["sortable"],
             "metadata": projected["metadata"],
+            # The event time: the updated_after / updated_before recall
+            # filters read it. Not when the point was written.
             "updated_at": to_utc_iso(updated_at),
+            # When the point was written (#1869): the orphan sweep's grace
+            # period is measured from here, see the upsert in _apply_upsert.
+            "indexed_at": to_utc_iso(utcnow()),
             "memory_id": str(memory_id),
             "point_id_source": resource_point_source(resource_id, doc_id, version),
         },
@@ -836,9 +841,11 @@ class ResourceIndexer:
         # 4. Upsert to Qdrant (per-context collection, see #334). The point is
         # written before the row that owns it commits (once per batch); the
         # orphan sweep, which judges resource points by their rows (#1829),
-        # never takes a point younger than its grace period for an orphan, so
-        # this window is safe without the #1798 writer lock — which would pin
-        # the sweep out for the whole batch.
+        # never takes a point for an orphan until its payload ``indexed_at`` —
+        # the write time, not ``updated_at``, which is the event time and can
+        # be far in the past on a backlog (#1869) — is older than the grace
+        # period, so this window is safe without the #1798 writer lock — which
+        # would pin the sweep out for the whole batch.
         try:
             await self.qdrant_client.upsert(
                 collection_name=collection_name,
@@ -871,16 +878,13 @@ class ResourceIndexer:
         # This is acceptable because:
         # 1. Qdrant upsert is idempotent (same point_id)
         # 2. Next indexer run will retry Memory creation
-        # 3. A point left without a row is swept once it is older than the
-        #    sweep's grace period: the sweep judges resource points by their
-        #    row (#1829).
+        # 3. A point left without a row is swept once its ``indexed_at`` is
+        #    older than the sweep's grace period: the sweep judges resource
+        #    points by their row (#1829).
 
         try:
-            # The row was resolved above, before the point was built; the point
-            # already carries its id.
             if existing_memory:
                 # Update existing memory (re-indexing case)
-
                 # P1-5: Truncate summary to 500 chars (database limit)
                 summary = f"[{event.resource_id}] {event.doc_id} v{event.version}"
                 existing_memory.summary = summary[:500]
