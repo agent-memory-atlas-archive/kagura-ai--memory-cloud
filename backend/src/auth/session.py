@@ -15,6 +15,7 @@ from typing import Any
 
 from config.database import INVALID_REDIS_URL_MESSAGE
 from utils.datetime import utcnow
+from utils.redis_lock import execute_watched_sync, watch_token_sync
 from utils.url_redact import redis_location
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,45 @@ _LEGACY_SCAN_MARGIN_SECONDS = 24 * 3600
 
 def _user_index_key(user_id: str) -> str:
     return f"{_USER_INDEX_PREFIX}{user_id}"
+
+
+class SweepLeaseLostError(RuntimeError):
+    """A fenced sweep found its fence key gone or another holder's (#1918).
+
+    Nothing was deleted: a newer holder of the caller's lock has been
+    through since the sweep read its candidates, and may have written — and
+    answered for — a session among them.
+    """
+
+    def __init__(self, fence_key: str) -> None:
+        super().__init__(f"sweep lease lost: {fence_key}")
+        self.fence_key = fence_key
+
+
+def _arm_sweep_fence(pipe: Any, fence_key: str, token: str) -> None:
+    """WATCH ``fence_key`` and open the transaction only if it holds ``token``.
+
+    Raises:
+        SweepLeaseLostError: The key is gone or holds another token.
+        Exception: A Redis connection or timeout failure, as it is.
+    """
+    if not watch_token_sync(pipe, fence_key, token):
+        raise SweepLeaseLostError(fence_key)
+
+
+def _execute_fenced(pipe: Any, fence_key: str) -> list[Any]:
+    """EXEC a transaction armed by :func:`_arm_sweep_fence`.
+
+    Raises:
+        SweepLeaseLostError: The key changed after the fence read it; Redis
+            aborted the transaction.
+        Exception: A Redis connection or timeout failure, as it is: whether
+            the transaction ran is unknown.
+    """
+    results = execute_watched_sync(pipe)
+    if results is None:
+        raise SweepLeaseLostError(fence_key)
+    return results
 
 
 def browser_cookie_attrs() -> dict[str, Any]:
@@ -1021,6 +1061,7 @@ class SessionManager:
         exclude_session_id: str | None = None,
         *,
         strict: bool = False,
+        fence: tuple[str, str] | None = None,
     ) -> int:
         """Delete all sessions for a specific user.
 
@@ -1039,11 +1080,22 @@ class SessionManager:
             strict: Re-raise a Redis failure instead of reporting 0 deleted.
                 The password flows (#1678) must not report success — or
                 commit the new password — when the old sessions survived.
+            fence: ``(key, token)`` (#1918). The deletes then run as one
+                WATCH/MULTI transaction on ``key`` and land only if it
+                still holds ``token`` at EXEC. The password sign-in writes
+                the token of the latest holder of its sweep lock there, so
+                a sweep that outlived its lease cannot delete a session a
+                newer holder created and already answered for. Otherwise
+                nothing is deleted and ``SweepLeaseLostError`` is raised,
+                ``strict`` or not. A sweep with nothing to delete has
+                nothing to fence and returns 0 without reading the key.
 
         Returns:
             Number of sessions deleted
 
         Raises:
+            SweepLeaseLostError: With ``fence``: the key is gone or holds
+                another token. Nothing was deleted.
             Exception: Only with ``strict=True``: whatever Redis raised.
 
         Example:
@@ -1103,14 +1155,25 @@ class SessionManager:
             deleted_count = 0
             if keys_to_delete or stale_ids:
                 pipe = self._redis.pipeline()
-                for key in keys_to_delete:
-                    pipe.delete(key)
-                for sid in stale_ids + [k.removeprefix("session:") for k in keys_to_delete]:
-                    pipe.srem(index_key, sid)
-                for key, index_ids in other_sets.items():
-                    for index_id in index_ids:
-                        pipe.srem(_user_index_key(index_id), key.removeprefix("session:"))
-                results = pipe.execute()
+                try:
+                    if fence is not None:
+                        _arm_sweep_fence(pipe, *fence)
+                    for key in keys_to_delete:
+                        pipe.delete(key)
+                    for sid in stale_ids + [k.removeprefix("session:") for k in keys_to_delete]:
+                        pipe.srem(index_key, sid)
+                    for key, index_ids in other_sets.items():
+                        for index_id in index_ids:
+                            pipe.srem(_user_index_key(index_id), key.removeprefix("session:"))
+                    if fence is not None:
+                        results = _execute_fenced(pipe, fence[0])
+                    else:
+                        results = pipe.execute()
+                finally:
+                    if fence is not None:
+                        # A watching pipeline holds a connection from the
+                        # fence on; give it back on every exit (EXEC did).
+                        pipe.reset()
                 deleted_count = sum(1 for r in results[: len(keys_to_delete)] if r)
 
             if deleted_count:
@@ -1118,6 +1181,8 @@ class SessionManager:
 
             return deleted_count
 
+        except SweepLeaseLostError:
+            raise  # The caller's lock is the story; it logs.
         except Exception as e:
             logger.error(f"Failed to delete user sessions: {e}")
             if strict:
