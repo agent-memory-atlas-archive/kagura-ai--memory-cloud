@@ -467,7 +467,10 @@ remember_batch(context_id=..., atomic=true, items=[
   {"summary": "MCP smoke test atomic item — must not be written", "content": "Valid item of a refused atomic batch.", "type": "note"},
   {"summary": "MCP smoke test atomic item — invalid (no content, no type)"}
 ])
--> Verify: status="error", error="batch_refused"; count=2, succeeded=0, failed=2
+-> Verify: status="error", error="batch_refused"; count=2, succeeded=0, failed=1, skipped=1 — the
+   counters follow the per-item status, so the valid item the refusal never attempted counts as
+   skipped, not as failed (the batch is refused before any write — this is not the post-write
+   atomic rollback, whose items say "batch rolled back")
 -> Verify: results[0].status="skipped" and results[1] is status="error", error="missing_fields";
    no result carries a memory_id — atomic=true wrote nothing (the list call below confirms it)
 
@@ -507,7 +510,9 @@ forget(memory_id=<batch_id_3>, context_id=...)
 
 changes_since(context_id=..., since="2020-01-01T00:00:00Z")
 -> Verify: status=success; `changes` is ordered oldest first (`at` ascending); each change is
-   {memory_id, kind, at, summary}; has_more=false, next_cursor=null, until=null
+   {memory_id, kind, at, summary}, except that every event of the forgotten batch_id_3 — its
+   earlier "created" one included — carries no `summary` (forget retracts the text from this
+   lane too, #1876); has_more=false, next_cursor=null, until=null
 -> Verify: there is a kind="created" change for <memory_id>, batch_id_1, batch_id_2 and batch_id_3
    (a forgotten memory keeps its earlier events), a kind="updated" change for <memory_id> (the
    step 5 edit) and a kind="forgotten" change for batch_id_3
