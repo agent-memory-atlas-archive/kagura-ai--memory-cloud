@@ -468,7 +468,16 @@ async def handle_get_resource_schema(
 async def handle_list_resource_tokens(
     args: dict[str, Any], user_id: str, workspace_id: UUID | None
 ) -> list[TextContent]:
-    """List resource tokens for a workspace."""
+    """List resource tokens for a workspace.
+
+    Lists the tokens that can authenticate ingest — those with a ``resources``
+    row (inner join on ``resource_pk``). A legacy row without ``resource_pk``
+    is deliberately NOT listed here (#1919): it cannot authenticate
+    (``verify_token`` joins through ``resource_pk``), so it is not a live
+    credential for this audit view. The REST list
+    (``GET /api/v1/resource-tokens``) does include such rows so an owner can
+    still revoke or relabel them; documented in ``docs/api-reference.md``.
+    """
     if not workspace_id:
         return _error_response("workspace_required", "No active workspace.")
 
@@ -979,7 +988,7 @@ async def handle_setup_resource(
             actual_embedding_model = preflight.embedding_model
             actual_dimensions = preflight.embedding_dimensions
 
-            from sqlalchemy import func, select
+            from sqlalchemy import func
 
             from models.auth import Context
 
@@ -1036,17 +1045,19 @@ async def handle_setup_resource(
             # 9. Qdrant collection is created lazily on first remember() call
             # via MemoryService — no need to create it here.
 
-            # 10. Check active token count against plan limit (workspace-scoped)
+            # 10. Check active token count against plan limit — the same
+            # population as the REST cap and the quota ceiling (#1919): the
+            # workspace's active non-connector tokens, attributed by the
+            # resources row. The old live-context slug join counted a token
+            # once per live context, counted connector tokens, and skipped a
+            # token whose resource has no live context (which still counts
+            # toward the ceiling), so this mint path could still push the
+            # workspace past max_resource_tokens * 10000.
+            from auth.resource_tokens import workspace_regular_active_tokens
             from models.resource import ResourceToken
 
             active_count_result = await db.execute(
-                select(func.count(ResourceToken.id))
-                .join(Context, Context.resource_id == ResourceToken.resource_id)
-                .where(
-                    Context.workspace_id == workspace_id,
-                    Context.deleted_at.is_(None),
-                    ResourceToken.is_active == True,  # noqa: E712
-                )
+                workspace_regular_active_tokens(workspace_id, func.count(ResourceToken.id))
             )
             active_count = active_count_result.scalar() or 0
             if active_count >= plan.max_resource_tokens:
