@@ -52,9 +52,12 @@ your-domain.example.com {
 - Caddy automatically provisions TLS certificates via Let's Encrypt
 - Caddy writes **no access log** unless the site has a `log` directive. If you add
   one, bound the container's log file ([Container log rotation](#container-log-rotation))
-  and keep invite tokens out of it (see
-  [Closed-beta invite links](#closed-beta-invite-links-issue-1581)) — the
-  single-server template's `Caddyfile.tpl` does both
+  and keep credentials out of it — invite tokens (see
+  [Closed-beta invite links](#closed-beta-invite-links-issue-1581) and
+  [Workspace invitation links](#workspace-invitation-links)) and the
+  `X-Resource-API-Key` header (see
+  [Credential headers in the proxy log](#credential-headers-in-the-proxy-log)) —
+  the single-server template's `Caddyfile.tpl` does all of this
 
 ### Docker Compose Integration
 
@@ -162,6 +165,80 @@ the compose option, it only applies to containers created afterwards):
   "log-opts": { "max-size": "50m", "max-file": "3" }
 }
 ```
+
+### Credential headers in the proxy log
+
+Caddy's JSON access log writes **every request header** by value, and Caddy
+redacts only `Cookie`, `Set-Cookie`, `Authorization` and `Proxy-Authorization`
+on its own. Any other header that carries a credential has to be removed by the
+site's log configuration — and removed a second time in the global `log default`
+block, because a request whose upstream failed (a `502` while the API is being
+restarted or deployed) is written again as an `http.log.error` line through
+Caddy's default logger, request headers included.
+
+The single-server `Caddyfile.tpl` drops these request headers in both blocks:
+
+| Header | Why |
+|---|---|
+| `Cookie` | session material |
+| `Referer`, `Next-Router-State-Tree`, `Next-Url` | may repeat an invite URL ([Closed-beta invite links](#closed-beta-invite-links-issue-1581)) |
+| `X-Resource-Api-Key` | the **resource token** an ingester authenticates `POST /api/v1/resources/{resource_id}/events` with ([Resource Tokens Guide](resource-tokens-guide.md)). Resource tokens do not expire, so a logged value stays usable until the token is revoked. |
+
+Two details matter if you run a different proxy or edit the template:
+
+- **Header-name spelling.** Caddy logs header names in Go's canonical form and the
+  `filter` encoder looks the field up case-sensitively. The delete line has to
+  read `request>headers>X-Resource-Api-Key delete`; a line spelled the way the
+  API documents the header (`X-Resource-API-Key`) validates and matches nothing.
+  `terraform/single-server/scripts/tests/caddy_log_scrub_live.bats` proves the
+  exact line against the real image.
+- **Both loggers.** Turning the access log off is not enough: the error line
+  still carries the headers. The `log default` block must carry the same deletes.
+
+**Applying a template change** needs no container recreate: re-render and
+restart Caddy, or run a normal `deploy.sh`:
+
+```bash
+cd /opt/kagura-memory/src/terraform/single-server
+./scripts/deploy.sh --generate-caddyfile \
+  && docker compose -f docker-compose.prod.yml --env-file .env.prod restart caddy
+```
+
+**If the proxy logged the header before the delete was in place**, treat every
+resource token that ingested through that proxy while those log lines were kept
+as exposed:
+
+1. Create a replacement token for each affected resource — creating a new token
+   does **not** invalidate the old one — and switch the ingester to it:
+
+   ```bash
+   curl -X POST https://<your-domain>/api/v1/resource-tokens \
+     -H "Authorization: Bearer kagura_{your_api_key}" \
+     -H "Content-Type: application/json" \
+     -d '{"resource_id": "<resource_id>", "context_id": "<context-uuid>", "description": "rotated"}'
+   ```
+
+2. Revoke the old token once the ingester uses the new one:
+
+   ```bash
+   curl -X DELETE https://<your-domain>/api/v1/resource-tokens/<rtok_old_id> \
+     -H "Authorization: Bearer kagura_{your_api_key}"
+   ```
+
+   Both steps are also available in the Web UI under **Integrations → Resource
+   Tokens**.
+
+3. Discard the Caddy container's existing log file by recreating the container
+   (`:80`/`:443` drop for a few seconds; add `--no-build` on a registry-mode
+   host), and delete any copies that were exported or shipped elsewhere:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml --env-file .env.prod \
+     up -d --no-deps --force-recreate caddy
+   ```
+
+Until then, restrict who can read the container logs (root and the `docker`
+group on the host).
 
 ## Frontend Environment Variables
 
@@ -295,6 +372,74 @@ split-origin deployment `/login` already drops the API-origin `return_to`, with
 or without an invite. The device flow is not affected: its `return_to` is a
 frontend path.
 
+## Workspace invitation links
+
+A workspace invitation (the `/workspace/members` page, or
+`POST /api/v1/workspaces/{workspace_id}/invitations`) is a one-time link,
+`{FRONTEND_URL}/invite/{token}`, bound to the invited e-mail address and valid
+for 7, 30, 90 or 365 days, or until used. Like a closed-beta link, its token
+travels in URLs: the landing page `/invite/{token}`, the unauthenticated preview
+`GET /api/v1/invitations/{token}` the page calls, and — when the invitee has to
+sign in first — the landing URL percent-encoded in the OAuth login's
+`return_to` (`…/login?return_to=https%3A%2F%2F<host>%2Finvite%2F{token}`), which
+the callback then repeats in its `Location` header.
+
+The same scrub as for closed-beta links covers these three shapes: structured
+logs, the uvicorn access log and the `usage_stats.endpoint` column record the
+literal `{token}`, and the single-server `Caddyfile.tpl` writes `REDACTED` into
+the token slot of the request URI (both loggers) and of the `Location` /
+`Refresh` response headers. `/api/v1/invitations/accept`, `/api/v1/invitations/pending`
+and `/api/v1/workspaces/{id}/invitations/{invitation_id}` carry no token and are
+recorded as they are. **A different reverse proxy has to scrub these shapes
+too** — the list of copies to cover is the one given for closed-beta links
+above.
+
+Upgrading from a release that did not scrub these shapes:
+
+1. **Purge or redact the existing log files.** Lines already written are not
+   rewritten. On the single-server template, empty the current log file of the
+   proxy and of both API colours without a restart (Docker's `json-file` driver
+   appends, so the containers keep logging):
+
+   ```bash
+   for c in kagura-caddy kagura-api-blue kagura-api-green; do
+     sudo truncate -s 0 "$(docker inspect --format '{{.LogPath}}' "$c")"
+   done
+   ```
+
+   Rotated files next to it (`<LogPath>.1`, `.2`) hold older lines — remove
+   them the same way, or recreate the containers (`docker compose
+   -f docker-compose.prod.yml --env-file .env.prod up -d --no-deps
+   --force-recreate caddy`; the next `deploy.sh` run recreates the API colours).
+   If the logs are shipped elsewhere, redact the token slot in the aggregator
+   as well: anything after `/invite/`, `/api/v1/invitations/` (other than
+   `accept` and `pending`) or `%2Finvite%2F`.
+
+2. **Redact the `usage_stats` rows** written for the preview call of a
+   signed-in visitor. Rewriting the endpoint to the shape the scrub now writes
+   keeps the usage counts; the two token-free routes are left alone:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml --env-file .env.prod exec postgres \
+     psql -U kagura -d kagura -c "
+       UPDATE usage_stats
+          SET endpoint = '/api/v1/invitations/{token}'
+        WHERE endpoint LIKE '/api/v1/invitations/%'
+          AND endpoint NOT IN ('/api/v1/invitations/accept',
+                               '/api/v1/invitations/pending',
+                               '/api/v1/invitations/{token}');"
+   ```
+
+   The statement is idempotent — run it once per database.
+
+3. **Optionally, revoke and re-issue the pending invitations** whose links were
+   in those logs: the `/workspace/members` page, or
+   `DELETE /api/v1/workspaces/{workspace_id}/invitations/{invitation_id}` for
+   each entry of `GET /api/v1/workspaces/{workspace_id}/invitations`, then
+   invite again. A token on its own does not join the workspace — accepting
+   needs a session signed in as the invited address — so this is a precaution,
+   most relevant for invitations with a long or no expiry.
+
 ## Terms-of-service acceptance (Issue #1665)
 
 `/login`, `/join/{token}` and the workspace invitation page ask for
@@ -387,6 +532,16 @@ resets it; an identifier that names no account is counted on its own
 (normalized). There is no per-client-address lockout: behind a reverse proxy
 that does not forward the client address it would lock everyone out.
 
+With MFA on, the second factor draws on the same budget: a wrong TOTP code at
+`POST /api/v1/auth/mfa/verify` counts like a wrong password, a correct password
+does not reset the counter, and the budget spent both endpoints answer `429` —
+only the completed sign-in clears it. A code that signed the account in is not
+accepted again, and the wrong code that spends the budget emails the account
+owner (a wrong password does not: anyone who knows a login ID can send one).
+Deployments that also rate-limit `/api/v1/auth/login` and
+`/api/v1/auth/mfa/verify` per client address at the reverse proxy may keep
+doing so; the API's counter is per account and ignores the client address.
+
 **Links and endpoints.**
 
 | Endpoint | Auth | What it does |
@@ -444,8 +599,9 @@ OAuth / MCP client is authorized (by consent when it grants something new — a
 first authorization, a broader scope, or a client changed since the last grant
 — and by device-flow approval every time), an API key is created or regenerated
 (connector write keys included), an OAuth client is registered or its secret
-regenerated, or a provider sign-in changes the account's email address (the
-previous address is told), the account owner is
+regenerated, a provider sign-in changes the account's email address (the
+previous address is told), or a password sign-in with MFA fails the second
+factor until the account's sign-in budget is spent, the account owner is
 emailed a notice (UTC time, IP address, user agent, key or client name; for an
 admin action the acting admin, without the admin's IP address and user agent —
 never a secret, token or link other than the plain `FRONTEND_URL/profile`
@@ -470,6 +626,94 @@ that recent; a window older than that is dropped with a
 CLI actions (`reset_password`, `create_admin`) send no notice. A send failure is logged and never affects the
 change. Under `EMAIL_PROVIDER=logging` each notice is one
 `security_notification_email` log line (event and a keyed recipient hash only).
+
+**Removed sign-in providers.** A Google / GitHub identity signs in to an
+account only through its `user_oauth_providers` row. Once the owner removes
+that provider from **Settings** (`POST /api/v1/me/account/unlink-provider`),
+the identity has no row and owns nothing — including the account it created,
+whose `users.user_id` still equals the provider's subject. A sign-in through
+it is refused: the callback redirects to `/login?error=provider_unlinked`,
+opens no session, and the backend logs
+`oauth_unlinked_identity_sign_in_refused` (or `session_owner_not_found`).
+Earlier releases let such an identity back in by the `users` row alone. After
+upgrading, list the accounts in that state and review their recent activity —
+`users.last_login_at`, the browsers in `user_known_devices`, and their
+`audit_logs` rows (`oauth_provider_unlinked`, `password_set`, and anything
+that follows the unlink: `oauth_provider_linked`, `api_key_created`,
+`password_changed`, role changes):
+
+```sql
+-- OAuth-created accounts whose original identity has no provider row
+SELECT u.user_id, u.email, u.auth_provider, u.last_login_at
+FROM users u
+WHERE u.auth_method = 'oauth'
+  AND NOT EXISTS (
+    SELECT 1 FROM user_oauth_providers p WHERE p.oauth_sub = u.user_id
+  )
+ORDER BY u.last_login_at DESC NULLS LAST;
+
+-- One account's recent sign-in devices and audit trail
+SELECT first_seen, last_seen FROM user_known_devices WHERE user_id = '<user_id>' ORDER BY last_seen DESC;
+SELECT created_at, action, resource, ip_address FROM audit_logs WHERE user_id = '<user_id>' ORDER BY created_at DESC LIMIT 50;
+```
+
+A sign-in dated after the `oauth_provider_unlinked` row that was not the
+owner's is a reason to reset the account's password (which signs it out
+everywhere and revokes its OAuth / MCP grants, see above) and to review its
+API keys and OAuth clients in Settings.
+
+## Which sign-in provider syncs the account's email (Issues #1811, #1875)
+
+`users.auth_provider` names the account's **primary** sign-in provider. Only
+a sign-in through it syncs the account's email and name from the identity
+provider; a sign-in through any other provider on the **Connected accounts**
+card updates nothing but that provider's last-used time.
+
+An OAuth account can have no primary provider (`auth_provider` NULL): a row
+from before the pointer existed, or an account that set a password and then
+unlinked its last provider. Such an account gets the pointer back on a
+sign-in through **the identity it was created with** — the Google / GitHub
+identity whose `sub` is the account's `user_id` — once that identity's link
+is older than 10 minutes or was written together with the account. A
+provider attached later through **Connected accounts** never becomes primary,
+however long ago it was attached: attaching needs only a live session, so a
+session alone can never choose whose email and name the account takes. Such
+a sign-in logs `oauth_primary_provider_not_adopted_attached_identity` and
+goes through as a linked sign-in. Unlinking the primary provider follows the
+same rule: the pointer moves to the identity the account was created with
+when that one is still attached, and is cleared otherwise — never to a
+provider attached later. (A password account's pointer still moves to any
+surviving provider, as before.)
+
+**After upgrading**, review the accounts whose primary provider is a later
+attached identity. From this version on the pointer gets there only by hand;
+before it, it could land there when the original provider was unlinked, which
+owners did legitimately, so this is a list to check with the owners, not a
+list of mistakes. On the database host:
+
+```bash
+docker exec kagura-postgres psql -U kagura -d kagura -c "
+  SELECT u.user_id, u.auth_provider, p.linked_at
+  FROM users u
+  JOIN user_oauth_providers p
+    ON p.user_id = u.user_id AND p.provider = u.auth_provider
+  WHERE u.auth_method = 'oauth' AND p.oauth_sub <> u.user_id
+  ORDER BY p.linked_at DESC;"
+```
+
+To point an account at a provider the owner confirms, or to clear the pointer
+so that no provider syncs the profile until the original identity signs in:
+
+```bash
+docker exec kagura-postgres psql -U kagura -d kagura -c \
+  "UPDATE users SET auth_provider = 'google' WHERE user_id = '<user_id>';"
+docker exec kagura-postgres psql -U kagura -d kagura -c \
+  "UPDATE users SET auth_provider = NULL WHERE user_id = '<user_id>';"
+```
+
+Setting the pointer by hand is also the way to make a later attached
+provider primary for an owner who asks for it; neither a sign-in nor an
+unlink does.
 
 ## One person, two accounts — identity links (Issue #1784)
 

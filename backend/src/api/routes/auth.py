@@ -20,12 +20,13 @@ Security features:
 
 import asyncio
 import functools
+import hashlib
 import os
 import re
 import secrets
 import time
 from datetime import datetime, timedelta
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, NoReturn
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
@@ -72,13 +73,19 @@ from services.security_notification_service import (
     PROVIDER_SIGN_IN_LABELS,
     SecurityEvent,
     schedule_security_notification,
+    spawn_security_notification,
 )
 from services.signup_gate_service import check_signup_access
 from services.terms_service import TermsService, current_terms_version
 from services.workspace_service import WorkspaceService
 from utils.datetime import utcnow
 from utils.encryption import get_encryptor
-from utils.exceptions import AuthenticationError, ConflictError, InvalidCredentialsError
+from utils.exceptions import (
+    AuthenticationError,
+    ConflictError,
+    InvalidCredentialsError,
+    UnlinkedProviderSignInError,
+)
 from utils.hashing import SHA256_HEX_PATTERN, sha256_hex
 from utils.logger import get_logger
 from utils.redis_lock import acquire_lock_sync, release_lock_sync
@@ -349,6 +356,7 @@ async def _maybe_refresh_redirect(
 async def _maybe_link_redirect(
     *,
     state: str,
+    request: Request,
     provider: str,
     idp_sub: str,
     idp_email: str,
@@ -369,12 +377,23 @@ async def _maybe_link_redirect(
     The user stays logged in as themselves; only a ``user_oauth_providers``
     row is added.
 
+    The state alone is not authority. ``POST /me/account/link-provider`` pins
+    the initiating browser session under ``oauth2_state_session:{state}``, and
+    the link is honoured only when ``request`` carries that very session
+    cookie and the session still holds the pinned account — as the add-account
+    flow requires of its callback. Otherwise whoever was handed the
+    authorization URL and completed the provider consent would have THEIR
+    identity attached to the initiator's account, and would sign in to it
+    from then on.
+
     Redirect outcomes (all on the ``/profile`` surface so the page can flash
     the result inline):
 
     - success → ``oauth2_return_to`` value (default ``/profile?linked=1``).
-    - ``error=link_failed``: the initiating session's user_id record expired
-      (TTL) before the IdP round-trip returned — we cannot attribute the link.
+    - ``error=link_failed``: the initiating session's user_id or session
+      record expired (TTL) before the IdP round-trip returned, the callback
+      did not come from the browser session that started the link, or that
+      session no longer holds the account — we cannot attribute the link.
     - ``error=provider_already_linked``: the returned identity is already
       bound to a different account (``AccountLinkingService.link`` raised
       ``ConflictError`` after writing the failed-attempt audit row), or a
@@ -395,6 +414,9 @@ async def _maybe_link_redirect(
     user_id = redis.get(f"oauth2_state_user:{state}")
     if user_id:
         redis.delete(f"oauth2_state_user:{state}")
+    expected_session = redis.get(f"oauth2_state_session:{state}")
+    if expected_session:
+        redis.delete(f"oauth2_state_session:{state}")
     return_to_url = redis.get(f"oauth2_return_to:{state}")
     if return_to_url:
         redis.delete(f"oauth2_return_to:{state}")
@@ -405,6 +427,36 @@ async def _maybe_link_redirect(
         # The initiating session's user_id record expired (TTL ran out between
         # POST /me/account/link-provider and the IdP round-trip). Without it we
         # cannot attribute the new identity to a user — refuse rather than guess.
+        return RedirectResponse(
+            _safe_redirect_url(f"{frontend_url}/profile?error=link_failed"),
+            status_code=303,
+        )
+
+    # The callback must arrive from the browser that started the link: its
+    # session cookie must be the pinned session (constant-time compare), and
+    # that session must still hold the pinned account. A missing pin — expired,
+    # or a state minted before the pin existed — fails closed.
+    cookie_session = request.cookies.get(SESSION_COOKIE_NAME)
+    if (
+        not expected_session
+        or not cookie_session
+        or not secrets.compare_digest(cookie_session.encode(), expected_session.encode())
+    ):
+        logger.warning(
+            "oauth_provider_link_rejected_session_mismatch",
+            user_id=user_id,
+            provider=provider,
+            pinned=bool(expected_session),
+            cookie=bool(cookie_session),
+        )
+        return RedirectResponse(
+            _safe_redirect_url(f"{frontend_url}/profile?error=link_failed"),
+            status_code=303,
+        )
+    if not _session_manager.session_holds_user(expected_session, user_id):
+        logger.warning(
+            "oauth_provider_link_rejected_session_lost_user", user_id=user_id, provider=provider
+        )
         return RedirectResponse(
             _safe_redirect_url(f"{frontend_url}/profile?error=link_failed"),
             status_code=303,
@@ -645,7 +697,9 @@ def _state_hash(state: str | None) -> str | None:
 
 # Internal reason tokens for the non-cancel failure redirect (#1381). These are
 # literals chosen by call sites — IdP-supplied text never reaches the URL.
-_OAUTH_ERROR_REASONS = frozenset({"oauth_failed", "oauth_expired"})
+# ``provider_unlinked``: the identity has no link row any more (its account
+# removed this sign-in method), so no session is opened for it.
+_OAUTH_ERROR_REASONS = frozenset({"oauth_failed", "oauth_expired", "provider_unlinked"})
 
 
 def _oauth_error_redirect(provider: str, reason: str) -> RedirectResponse:
@@ -654,8 +708,8 @@ def _oauth_error_redirect(provider: str, reason: str) -> RedirectResponse:
     Counterpart to ``_oauth_cancel_redirect`` for real failures: missing
     params, expired/replayed state, exchange failure, DB trouble. The login
     page maps the well-known ``error`` tokens (``oauth_failed`` /
-    ``oauth_expired``) to i18n'd banners — the same channel already used by
-    ``registration_disabled`` / ``email_in_use``.
+    ``oauth_expired`` / ``provider_unlinked``) to i18n'd banners — the same
+    channel already used by ``registration_disabled`` / ``email_in_use``.
 
     ``reason`` is an internal literal (never IdP-derived); an unknown value
     collapses to ``oauth_failed`` so the URL vocabulary cannot widen by
@@ -820,6 +874,7 @@ async def google_callback(
         # session must stay untouched (link ≠ login, same as refresh).
         link_redirect = await _maybe_link_redirect(
             state=state,
+            request=request,
             provider="google",
             idp_sub=user_info["sub"],
             idp_email=user_info["email"],
@@ -1082,6 +1137,10 @@ async def google_callback(
 
         return redirect
 
+    except UnlinkedProviderSignInError:
+        # The identity has no link row (its account removed this sign-in
+        # method): no session, a banner that says so.
+        return _oauth_error_redirect("google", "provider_unlinked")
     except ConflictError:
         return _email_in_use_redirect()
     except SQLAlchemyError:
@@ -1502,8 +1561,11 @@ async def _identity_exists(provider: str, idp_sub: str, email: str) -> bool:
     insert:
 
     - the ``(provider, oauth_sub)`` link row — a returning user;
-    - a ``users`` row whose ``user_id`` is the sub — the identity that somehow
-      lacks a link row (ensure_user's IntegrityError retry lands on it);
+    - a ``users`` row whose ``user_id`` is the sub — an identity with no link
+      row, whose account removed this sign-in method: ensure_user's
+      IntegrityError retry refuses it (``/login?error=provider_unlinked``)
+      rather than creating anything, and that answer must not be masked by
+      ``terms_required`` either;
     - a ``users`` row holding ``email`` — ensure_user's insert trips the
       ``users.email`` UNIQUE constraint and raises ``ConflictError``
       (``/login?error=email_in_use``). Plain equality, like that constraint,
@@ -1623,8 +1685,14 @@ async def _terms_refusal(
             _LINK_PROOF_KEY.format(state=state),
             f"oauth2_state_intent:{state}",
             f"oauth2_state_user:{state}",
+            f"oauth2_state_session:{state}",
         )
     return _terms_required_redirect(provider, return_to)
+
+
+# The providers whose identities live in ``user_oauth_providers`` (#517): for
+# them a link row is the only thing that binds an identity to an account.
+_LINK_ROW_PROVIDERS = frozenset({"google", "github"})
 
 
 class SessionOwner(NamedTuple):
@@ -1633,9 +1701,9 @@ class SessionOwner(NamedTuple):
     ``name`` and ``picture`` are the account's own (``users`` columns), so a
     session opened through a linked provider shows the account, not whichever
     provider was used (#1875). ``provider_linked_at`` is when the identity was
-    attached (naive UTC) — None when the owner was found by the ``users`` row
-    keyed by the sub, or not found at all. ``account_created_at`` is when the
-    account itself was created (naive UTC), None when no row was found.
+    attached (naive UTC) — None when no link row was found. ``account_created_at``
+    is when the account itself was created (naive UTC), None when no row was
+    found.
     """
 
     user_id: str
@@ -1651,8 +1719,11 @@ async def _owning_user(db: AsyncSession, provider: str, idp_sub: str) -> Session
 
     Resolved the way ``RoleManager.ensure_user`` resolves it: through the
     ``(provider, oauth_sub)`` link row — a provider linked to another account
-    (#517) belongs to that account's ``user_id``, not to the sub — falling back
-    to a ``users`` row whose ``user_id`` is the sub.
+    (#517) belongs to that account's ``user_id``, not to the sub. For google
+    and github the link row is the only answer: a ``users`` row whose
+    ``user_id`` is the sub but has no link row is the account that removed
+    this sign-in method, and the identity owns nothing (None). Other providers
+    keep the ``users.user_id == sub`` fallback.
     """
     from models.auth import UserOAuthProvider
 
@@ -1673,6 +1744,8 @@ async def _owning_user(db: AsyncSession, provider: str, idp_sub: str) -> Session
     ).first()
     if row is not None:
         return SessionOwner(row[0], row[1], row[2], row[3], row[4], row[5])
+    if provider in _LINK_ROW_PROVIDERS:
+        return None
     row = (
         await db.execute(
             select(User.user_id, User.email, User.name, User.picture, User.created_at)
@@ -1697,9 +1770,12 @@ async def _session_owner(provider: str, idp_sub: str, idp_email: str) -> Session
 
     Unlike those advisory steps this one fails closed: a database error
     propagates, and the callback turns it into ``oauth_failed`` rather than
-    opening a session for an id that may own nothing. Only an identity with
-    no owning row at all (a role manager without Postgres) keeps the IdP
-    ``sub`` and email, which is what every sign-in used before.
+    opening a session for an id that may own nothing. A google or github
+    identity with no owning row raises ``UnlinkedProviderSignInError``
+    (``provider_unlinked``, no session): after ``ensure_user`` such an identity
+    has a link row, so none means it owns nothing. Only another provider with
+    no owning row keeps the IdP ``sub`` and email, which is what every sign-in
+    used before.
     """
     async for db in get_db():
         owner = await _owning_user(db, provider, idp_sub)
@@ -1707,6 +1783,8 @@ async def _session_owner(provider: str, idp_sub: str, idp_email: str) -> Session
             return owner
         break
     logger.warning("session_owner_not_found", provider=provider, idp_sub=idp_sub)
+    if provider in _LINK_ROW_PROVIDERS:
+        raise UnlinkedProviderSignInError()
     return SessionOwner(idp_sub, idp_email)
 
 
@@ -2238,6 +2316,7 @@ async def github_callback(
         # identity as its own user nor disturbs the initiating session.
         link_redirect = await _maybe_link_redirect(
             state=state,
+            request=request,
             provider="github",
             idp_sub=user_info["sub"],
             idp_email=user_info["email"],
@@ -2408,6 +2487,9 @@ async def github_callback(
         logger.info(f"GitHub OAuth2 login successful: {db_email} (role={role})")
         return redirect
 
+    except UnlinkedProviderSignInError:
+        # No link row for this identity (see google_callback): no session.
+        return _oauth_error_redirect("github", "provider_unlinked")
     except ConflictError:
         return _email_in_use_redirect()
     except SQLAlchemyError:
@@ -2676,8 +2758,13 @@ def _login_rate_key(identifier: str, user: User | None) -> str:
     proxy's, and such a counter becomes a global lockout.
     """
     if user is not None:
-        return f"user:{user.user_id}"
+        return _account_rate_key(user.user_id)
     return f"id:{_normalize_login_identifier(identifier)}"
+
+
+def _account_rate_key(user_id: str) -> str:
+    """The failure counter of an account — shared by the password and the TOTP step."""
+    return f"user:{user_id}"
 
 
 def _login_client_ip(request: Request) -> str:
@@ -2707,15 +2794,45 @@ def _check_login_rate_limit(rate_key: str) -> None:
         )
 
 
-def _record_login_failure(rate_key: str) -> None:
-    """Record a failed login attempt against ``rate_key``."""
+def _record_login_failure(rate_key: str) -> int:
+    """Record a failed login attempt against ``rate_key``.
+
+    Returns:
+        The attempts now counted, including this one (0 without Redis).
+    """
     if not _session_manager:
-        return
+        return 0
     key = f"{_LOGIN_ATTEMPT_PREFIX}{rate_key}"
     pipe = _session_manager._redis.pipeline()
     pipe.incr(key)
     pipe.expire(key, _LOGIN_LOCKOUT_SECONDS)
-    pipe.execute()
+    counted = pipe.execute()[0]
+    return int(counted) if isinstance(counted, int | str) else 0
+
+
+def _reserve_login_attempt(rate_key: str) -> int:
+    """Take one attempt from the budget BEFORE a credential is checked.
+
+    One ``INCR``, so the check and the record are a single Redis operation:
+    of several requests arriving at once on different workers, those whose
+    result exceeds ``_MAX_LOGIN_ATTEMPTS`` are refused (429) without a check,
+    while a separate read-then-write would let every one of them guess once.
+    The attempt is spent whether the check then fails or not; a sign-in that
+    completes clears the budget anyway.
+
+    Raises:
+        HTTPException: 429 when the budget was already spent.
+
+    Returns:
+        The attempts counted, this one included.
+    """
+    attempt = _record_login_failure(rate_key)
+    if attempt > _MAX_LOGIN_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Please try again later.",
+        )
+    return attempt
 
 
 def _clear_login_failures(rate_key: str) -> None:
@@ -2799,6 +2916,46 @@ def _take_mfa_accepted_terms(mfa_token: str) -> str | None:
 # The fingerprint of the password hash a pending MFA step verified (#1809),
 # beside ``mfa_pending:{token}`` and with the same lifetime.
 _MFA_PENDING_CRED_KEY = "mfa_pending_cred:{token}"
+
+# A TOTP code the second factor accepted, so it is not accepted again. The
+# marker is keyed by a digest of the code (never the code itself) and lives
+# past the code's validity: ``verify_totp`` accepts a code for its own 30 s
+# step and one on either side, so a code is good for at most 90 s.
+_MFA_USED_CODE_KEY = "mfa_totp_used:{user_id}:{digest}"
+_MFA_USED_CODE_TTL_SECONDS = 120
+
+
+def _claim_totp_code(user_id: str, code: str) -> bool:
+    """Mark an accepted TOTP code as used; False when it already was.
+
+    One ``SET NX``, so of two sign-ins presenting the same code at once only
+    one completes.
+    """
+    if not _session_manager:
+        return True
+    digest = hashlib.sha256(f"{user_id}:{code}".encode()).hexdigest()
+    key = _MFA_USED_CODE_KEY.format(user_id=user_id, digest=digest)
+    return bool(_session_manager._redis.set(key, "1", nx=True, ex=_MFA_USED_CODE_TTL_SECONDS))
+
+
+def _refuse_totp_code(user: User, mfa_token: str, request: Request, attempt: int) -> NoReturn:
+    """Answer a wrong (or already used) second-factor code.
+
+    The pending step is consumed. The attempt was taken from the account's
+    sign-in budget — the one wrong passwords draw on — before the code was
+    checked (``_reserve_login_attempt``), so nothing is counted here. The
+    attempt that spends the budget tells the owner, and only that one (its
+    ``INCR`` result is the limit itself): unlike a wrong password, which
+    anyone can send, a wrong code was sent by someone who had the password.
+    """
+    if _session_manager:
+        _session_manager._redis.delete(f"mfa_pending:{mfa_token}")
+    if attempt == _MAX_LOGIN_ATTEMPTS:
+        logger.warning("mfa_second_factor_locked", user_id=user.user_id)
+        spawn_security_notification(
+            user_id=user.user_id, event=SecurityEvent.SECOND_FACTOR_LOCKED, request=request
+        )
+    raise AuthenticationError("Invalid TOTP code. Please login again.")
 
 
 async def _password_still_current(user_id: str, fingerprint: str | None) -> bool:
@@ -2934,10 +3091,11 @@ async def password_login(
         _record_login_failure(rate_key)
         raise InvalidCredentialsError()
 
-    _clear_login_failures(rate_key)
     verified = credential_fingerprint(user.password_hash)
 
-    # MFA check
+    # MFA check. The budget is NOT cleared here: the second factor draws on it
+    # (see ``_refuse_totp_code``), and a correct password must not refill it —
+    # someone who has the password would otherwise get unlimited code guesses.
     if user.totp_enabled and user.totp_secret:
         mfa_token = secrets.token_urlsafe(32)
         _session_manager._redis.setex(f"mfa_pending:{mfa_token}", 300, user.user_id)
@@ -2949,8 +3107,10 @@ async def password_login(
 
         return PasswordLoginResponse(success=True, mfa_required=True, mfa_session_token=mfa_token)
 
-    # No MFA — create session
+    # No MFA — create session. The budget is cleared only once the sign-in
+    # stands (a superseded password is refused above as a wrong one).
     session_id = await _open_password_session(user, verified)
+    _clear_login_failures(rate_key)
     await _record_terms_acceptance(
         user_id=user.user_id,
         email=user.email,
@@ -3001,6 +3161,13 @@ async def mfa_verify(
     if not user or not user.totp_secret:
         raise AuthenticationError("MFA not configured")
 
+    # The second factor draws on the account's sign-in budget, the one wrong
+    # passwords count against. The attempt is taken (one INCR) before the code
+    # is checked, so concurrent requests on several workers cannot each guess
+    # once past the limit. Spent, the step answers 429 before anything is
+    # consumed: a pending token issued before the lockout expires with it.
+    attempt = _reserve_login_attempt(_account_rate_key(user.user_id))
+
     try:
         totp_secret = get_encryptor().decrypt(user.totp_secret)
     except Exception as e:
@@ -3022,15 +3189,19 @@ async def mfa_verify(
     # the success and the failure path alike.
     accepted_terms = _take_mfa_accepted_terms(body.mfa_session_token)
 
+    # A wrong code, or a code this account already signed in with, consumes
+    # the pending step and is answered 401 (the attempt is already counted).
+    # The fingerprint key is already gone: the single-use guard above took it.
     if not verify_totp(totp_secret, body.totp_code):
-        # Delete MFA token on failed attempt (prevent brute-force replay). The
-        # fingerprint key is already gone: the single-use guard above took it.
-        _session_manager._redis.delete(f"mfa_pending:{body.mfa_session_token}")
-        raise AuthenticationError("Invalid TOTP code. Please login again.")
+        _refuse_totp_code(user, body.mfa_session_token, request, attempt)
+    if not _claim_totp_code(user.user_id, body.totp_code):
+        _refuse_totp_code(user, body.mfa_session_token, request, attempt)
 
     _session_manager._redis.delete(f"mfa_pending:{body.mfa_session_token}")
 
     session_id = await _open_password_session(user, verified)
+    # The whole sign-in stands: only now is the budget cleared.
+    _clear_login_failures(_account_rate_key(user.user_id))
     await _record_terms_acceptance(
         user_id=user.user_id,
         email=user.email,

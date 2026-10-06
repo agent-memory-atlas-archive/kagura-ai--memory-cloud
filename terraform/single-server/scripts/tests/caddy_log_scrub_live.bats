@@ -40,9 +40,17 @@ PROJECT_DIR="$BATS_TEST_DIRNAME/../.."
 # Token-shaped (URL-safe base64, 43 chars) and unique to this suite, so a
 # plain grep over everything the container printed is a complete leak check.
 TOKEN="k1591ScrubLiveTokenAbCdEfGhIjKlMnOpQrStUv_-9"
+# A resource token (resource-ingest credential, sent in the X-Resource-API-Key
+# request header). Distinct from TOKEN so a leak names the header it came from.
+RESOURCE_TOKEN="rtokScrubLiveResourceTokenZyXwVuTsRqPoNmLkJiHg"
 
-EXPECTED_CASES=15   # access-log lines: one per fire() below
-EXPECTED_ERRORS=4   # error-log lines: one per *-down case
+EXPECTED_CASES=28   # access-log lines: one per fire() below
+EXPECTED_ERRORS=7   # error-log lines: one per *-down case
+
+# A workspace invitation id as the API's management routes carry it: it must
+# NOT be mistaken for a token.
+INVITATION_ID="7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f"
+WORKSPACE_ID="0b9f6c1e-5d0a-4a3e-9d57-2f4f3f6f8a11"
 
 setup_file() {
     export SCRUB_SKIP=""
@@ -138,7 +146,10 @@ CADDYEOF
     export PORT="$port"
 
     # Every request carries the token in the four request headers a browser on
-    # the /join/<token> page sends it in, so each line doubles as a header test.
+    # the /join/<token> page sends it in, plus a resource token in the header
+    # an ingester authenticates with (spelled as the API documents it; Go
+    # canonicalises it to X-Resource-Api-Key on the way in), so each line
+    # doubles as a header test.
     fire() {   # $1 case id, $2 path + query, $3... extra curl arguments
         curl -s -o /dev/null --max-time 5 "${@:3}" \
             -A "scrub-case-$1" \
@@ -146,6 +157,7 @@ CADDYEOF
             -H "Cookie: session=$TOKEN" \
             -H "Next-Url: /join/$TOKEN" \
             -H "Next-Router-State-Tree: %5B%22join%22%2C%5B%22token%22%2C%22$TOKEN%22%2C%22d%22%5D%5D" \
+            -H "X-Resource-API-Key: $RESOURCE_TOKEN" \
             "http://127.0.0.1:$PORT$2" || true
     }
     fire join          "/join/$TOKEN"
@@ -159,13 +171,34 @@ CADDYEOF
     fire plain-mcp     "/mcp"
     fire plain-root    "/"
     fire plain-invites "/api/v1/beta-invites/me"
-    # The three invite shapes again, and an ordinary request, against a
-    # failing upstream (the first one reaches `web`, the others the API).
+    # The request shape an ingester sends: the resource token rides ONLY in the
+    # header, so this line is the one a resource token leaks through.
+    fire ingest        "/api/v1/resources/products/events" -X POST -H "Content-Type: application/json" -d '{"op":"upsert","id":"x","version":1,"payload":{}}'
+    # Workspace invitation links: the landing page (plain, with the Next.js
+    # data query, with a trailing slash), the preview API call, and the
+    # landing URL percent-encoded in the OAuth login's return_to as the
+    # invite page builds it (encodeURIComponent: upper-case hex; a hand-built
+    # client may send lower-case).
+    fire invite        "/invite/$TOKEN"
+    fire invite-rsc    "/invite/$TOKEN?_rsc=1a2b3"
+    fire invite-slash  "/invite/$TOKEN/"
+    fire invitation    "/api/v1/invitations/$TOKEN"
+    fire login-return  "/api/v1/auth/google/login?return_to=https%3A%2F%2Fmemory.example.test%2Finvite%2F$TOKEN&accepted_terms=2026-01"
+    fire login-return-lc "/api/v1/auth/github/login?return_to=https%3a%2f%2fmemory.example.test%2finvite%2f$TOKEN"
+    # Token-free routes of the same family keep their concrete path.
+    fire plain-accept  "/api/v1/invitations/accept"
+    fire plain-pending "/api/v1/invitations/pending"
+    fire plain-ws-inv  "/api/v1/workspaces/$WORKSPACE_ID/invitations/$INVITATION_ID"
+    # The invite shapes again, an ordinary request and the ingest shape,
+    # against a failing upstream (join/invite reach `web`, the others the API).
     local down=(-H "X-Stub-Down: 1")
     fire join-down     "/join/$TOKEN"                                        "${down[@]}"
     fire preview-down  "/api/v1/beta-invites/$TOKEN/preview"                 "${down[@]}"
     fire login-down    "/api/v1/auth/google/login?return_to=x&invite=$TOKEN" "${down[@]}"
+    fire invite-down   "/invite/$TOKEN"                                      "${down[@]}"
+    fire invitation-down "/api/v1/invitations/$TOKEN"                        "${down[@]}"
     fire plain-down    "/api/v1/memories?limit=5&q=join"                     "${down[@]}"
+    fire ingest-down   "/api/v1/resources/products/events"                   "${down[@]}" -X POST -H "Content-Type: application/json" -d '{"op":"upsert","id":"x","version":1,"payload":{}}'
 
     # The access-log line is written after the response completes; give the
     # last one a moment to land. stdout = access log (`output stdout`),
@@ -291,8 +324,8 @@ PYEOF
     # Both encoders: the default logger (error lines) and the site's access
     # logger (log0).
     # shellcheck disable=SC2016  # literal ${N}: the regexp's capture references
-    expect "$output" 'default regexp ${1}${2}${4}REDACTED${3}
-log0 regexp ${1}${2}${4}REDACTED${3}'
+    expect "$output" 'default regexp ${1}${2}${4}${5}${6}${7}REDACTED${3}
+log0 regexp ${1}${2}${4}${5}${6}${7}REDACTED${3}'
 }
 
 @test "live: customising the default logger does not copy the access log onto stderr" {
@@ -376,15 +409,80 @@ log0 writes to: stdout'
     expect "$output" "0;url=/join/REDACTED"
 }
 
-@test "live: no Referer / Cookie / Next-Router-State-Tree / Next-Url key in any line" {
+@test "live: GET /invite/<token> logs the token slot as REDACTED" {
+    require_live
+    run logged invite uri
+    expect "$output" "/invite/REDACTED"
+    run logged invite-rsc uri
+    expect "$output" "/invite/REDACTED?_rsc=1a2b3"
+}
+
+@test "live: GET /api/v1/invitations/<token> keeps the route, drops the token" {
+    require_live
+    run logged invitation uri
+    expect "$output" "/api/v1/invitations/REDACTED"
+}
+
+@test "live: the percent-encoded /invite/<token> in return_to is redacted, either hex case" {
+    require_live
+    run logged login-return uri
+    expect "$output" "/api/v1/auth/google/login?return_to=https%3A%2F%2Fmemory.example.test%2Finvite%2FREDACTED&accepted_terms=2026-01"
+    run logged login-return-lc uri
+    expect "$output" "/api/v1/auth/github/login?return_to=https%3a%2f%2fmemory.example.test%2finvite%2fREDACTED"
+}
+
+@test "live: the invite page's trailing-slash 308 does not leak the token through Location / Refresh" {
+    require_live
+    run logged invite-slash status
+    expect "$output" "308"
+    run logged invite-slash uri
+    expect "$output" "/invite/REDACTED/"
+    run logged invite-slash resp:Location
+    expect "$output" "/invite/REDACTED"
+    run logged invite-slash resp:Refresh
+    expect "$output" "0;url=/invite/REDACTED"
+}
+
+@test "live: token-free invitation routes keep their concrete path" {
+    require_live
+    run logged plain-accept uri
+    expect "$output" "/api/v1/invitations/accept"
+    run logged plain-pending uri
+    expect "$output" "/api/v1/invitations/pending"
+    # An invitation id under its workspace is not a token slot.
+    run logged plain-ws-inv uri
+    expect "$output" "/api/v1/workspaces/$WORKSPACE_ID/invitations/$INVITATION_ID"
+}
+
+@test "live: no Referer / Cookie / Next-Router-State-Tree / Next-Url / X-Resource-Api-Key key in any line" {
     require_live
     for c in join join-rsc join-pasted join-slash preview login login-first \
-             plain-api plain-mcp plain-root plain-invites; do
+             plain-api plain-mcp plain-root plain-invites \
+             invite invite-rsc invite-slash invitation login-return login-return-lc \
+             plain-accept plain-pending plain-ws-inv; do
         run logged "$c" req_headers
         [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-        # What is left is exactly what curl sent besides the four.
+        # What is left is exactly what curl sent besides the five.
         [ "$output" = "Accept User-Agent" ] || { echo "$c: $output"; return 1; }
     done
+    # The POST adds the two body headers and nothing else.
+    run logged ingest req_headers
+    expect "$output" "Accept Content-Length Content-Type User-Agent"
+}
+
+@test "live: the resource token (X-Resource-API-Key) appears in neither the access log nor the runtime log" {
+    require_live
+    # The ingest request went through (so the header was really sent and the
+    # line under test is the production path)...
+    run logged ingest status
+    expect "$output" "200"
+    # ...and the deleted key is gone under its canonical name — a delete spelled
+    # the way the API documents the header would leave it here.
+    run logged ingest req_headers
+    [[ "$output" != *"X-Resource"* ]] || { echo "ingest: $output"; return 1; }
+    run grep -c "$RESOURCE_TOKEN" "$WORK/access.log" "$WORK/runtime.log"
+    [[ "$output" == *"access.log:0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"runtime.log:0"* ]] || { echo "$output"; return 1; }
 }
 
 # ---------------------------------------------------------------------------
@@ -393,7 +491,7 @@ log0 writes to: stdout'
 
 @test "live: a failing upstream is a 502 plus an http.log.error line on stderr (guard not vacuous)" {
     require_live
-    for c in join-down preview-down login-down plain-down; do
+    for c in join-down preview-down login-down invite-down invitation-down plain-down ingest-down; do
         run logged "$c" status
         expect "$output" "502"
         # The second line exists, is about this request, and names the 502.
@@ -418,10 +516,16 @@ log0 writes to: stdout'
     expect "$output" "/api/v1/beta-invites/REDACTED/preview"
     run logged login-down uri
     expect "$output" "/api/v1/auth/google/login?return_to=x&invite=REDACTED"
-    for c in join-down preview-down login-down plain-down; do
+    run logged invite-down uri
+    expect "$output" "/invite/REDACTED"
+    run logged invitation-down uri
+    expect "$output" "/api/v1/invitations/REDACTED"
+    for c in join-down preview-down login-down invite-down invitation-down plain-down; do
         run logged "$c" req_headers
         expect "$output" "Accept User-Agent X-Stub-Down"
     done
+    run logged ingest-down req_headers
+    expect "$output" "Accept Content-Length Content-Type User-Agent X-Stub-Down"
 }
 
 @test "live: the ERROR-log line of a 502 is redacted too (default logger, global options)" {
@@ -432,18 +536,31 @@ log0 writes to: stdout'
     expect "$output" "/api/v1/beta-invites/REDACTED/preview"
     run err_logged login-down uri
     expect "$output" "/api/v1/auth/google/login?return_to=x&invite=REDACTED"
-    for c in join-down preview-down login-down plain-down; do
+    run err_logged invite-down uri
+    expect "$output" "/invite/REDACTED"
+    run err_logged invitation-down uri
+    expect "$output" "/api/v1/invitations/REDACTED"
+    for c in join-down preview-down login-down invite-down invitation-down plain-down; do
         run err_logged "$c" req_headers
         expect "$output" "Accept User-Agent X-Stub-Down"
     done
+    # The ingest shape against a restarting API — the error line that carries
+    # the resource token when only the access log is filtered.
+    run err_logged ingest-down req_headers
+    expect "$output" "Accept Content-Length Content-Type User-Agent X-Stub-Down"
     # An ordinary failure keeps the URI an operator needs to debug it.
     run err_logged plain-down uri
     expect "$output" "/api/v1/memories?limit=5&q=join"
+    run err_logged ingest-down uri
+    expect "$output" "/api/v1/resources/products/events"
 }
 
-@test "live: the token appears NOWHERE in what the container printed (stdout + stderr)" {
+@test "live: neither token appears ANYWHERE in what the container printed (stdout + stderr)" {
     require_live
     run grep -c "$TOKEN" "$WORK/access.log" "$WORK/runtime.log"
+    [[ "$output" == *"access.log:0"* ]]
+    [[ "$output" == *"runtime.log:0"* ]]
+    run grep -c "$RESOURCE_TOKEN" "$WORK/access.log" "$WORK/runtime.log"
     [[ "$output" == *"access.log:0"* ]]
     [[ "$output" == *"runtime.log:0"* ]]
 }
@@ -459,4 +576,7 @@ log0 writes to: stdout'
     # Same route family as the preview, but no token slot: left alone.
     run logged plain-invites uri
     expect "$output" "/api/v1/beta-invites/me"
+    # The resource token travels in a header, never in the URI: nothing to redact.
+    run logged ingest uri
+    expect "$output" "/api/v1/resources/products/events"
 }

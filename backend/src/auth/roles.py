@@ -25,7 +25,7 @@ from sqlalchemy import func
 from auth.provider_link import provider_link_established
 from config.settings import get_settings
 from utils.datetime import to_utc_iso, utcnow
-from utils.exceptions import ConflictError
+from utils.exceptions import ConflictError, UnlinkedProviderSignInError
 from utils.hashing import hmac_sha256_hex
 from utils.logger import get_logger
 
@@ -104,7 +104,8 @@ def _adopt_primary_provider(
     user: _UserModel, auth_provider: str | None, link: _UserOAuthProviderModel
 ) -> None:
     """Make the signing-in provider the primary one of an OAuth account that
-    has none (#1875) — when its link to the account is established.
+    has none (#1875) — when it is the identity the account was created with
+    and its link to the account is established.
 
     ``users.auth_provider`` decides whether a sign-in may sync email and name
     (#1811). It is NULL on a legacy row, and after ``AccountLinkingService``
@@ -112,11 +113,17 @@ def _adopt_primary_provider(
     an account never synced again whichever provider it signed in with.
 
     ``link`` is this identity's own ``user_oauth_providers`` row for ``user``.
-    A provider becomes primary only through a link older than the
-    identity-link window, or the identity the account was created with
-    (:func:`auth.provider_link.provider_link_established`, the rule an
-    identity-link proof follows). A younger link signs in as any linked
-    provider does: no adoption, no profile sync.
+    Only the account's original identity — the one whose sub is the account's
+    ``user_id`` (``ensure_user`` creates the account under the first sub, and
+    the #517 backfill linked that sub) — can become primary, and only through
+    an established link: a row older than the identity-link window, or
+    written with the account (:func:`auth.provider_link.provider_link_established`,
+    the rule an identity-link proof follows). Any other identity was attached
+    later through ``link-provider``, which needs only a live session: it
+    signs in as a linked provider does, however old its link, so a session
+    alone can never make a provider the one whose email and name are synced
+    onto the account. A younger link of the original identity signs in the
+    same way: no adoption, no profile sync.
     Staged only: ``_sync_existing_user`` commits it.
 
     A password account (``auth_method == "password"``) that links a provider
@@ -128,8 +135,15 @@ def _adopt_primary_provider(
         or user.auth_method != "oauth"
     ):
         return
+    if link.oauth_sub != user.user_id:
+        logger.info(
+            "oauth_primary_provider_not_adopted_attached_identity",
+            auth_provider=auth_provider,
+            user_id=user.user_id,
+        )
+        return
     if not provider_link_established(
-        sub_is_user_id=link.oauth_sub == user.user_id,
+        sub_is_user_id=True,
         linked_at=link.linked_at,
         account_created_at=user.created_at,
     ):
@@ -289,6 +303,10 @@ class RoleManager:
                 ``users.email`` UNIQUE constraint (different account already
                 holds the new address). The caller's transaction is rolled
                 back; the row's prior state is preserved.
+            UnlinkedProviderSignInError: When a google / github identity has
+                no ``user_oauth_providers`` row but a ``users`` row carries
+                its sub as ``user_id`` — the account removed this sign-in
+                method. No role is returned and nothing is written.
 
         Example:
             >>> role = await role_manager.ensure_user(
@@ -357,9 +375,10 @@ class RoleManager:
             # pointer that account-linking writes. It no longer resolves the
             # owner, but #1811 reads it again to decide whether this sign-in
             # may sync email/name — see ``_sync_existing_user``.) A known
-            # provider that somehow still lacks a row falls through to the
-            # new-user path below, whose IntegrityError(user_id) retry
-            # re-resolves the existing user without creating a duplicate.
+            # provider with no row falls through to the new-user path below,
+            # whose IntegrityError(user_id) retry creates no duplicate and
+            # signs in only when the row has appeared meanwhile (a concurrent
+            # first sign-in); an identity whose row was removed is refused.
             if known_provider:
                 link = (
                     await db.execute(
@@ -426,28 +445,31 @@ class RoleManager:
                 await db.commit()
                 return role
             except IntegrityError as exc:
-                # Two collision shapes share this except:
+                # Three collision shapes share this except:
                 #  (a) user_id race: another request just inserted the same
-                #      oauth_sub. Re-lookup by user_id and route the existing
-                #      row through _sync_existing_user so concurrent
-                #      first-logins still get last_login_at updated and any
-                #      email/name drift synced (Copilot review #516).
+                #      oauth_sub — user and link row in one commit. Re-lookup
+                #      by user_id and route the existing row through
+                #      _sync_existing_user so concurrent first-logins still
+                #      get last_login_at updated and any email/name drift
+                #      synced (Copilot review #516).
                 #  (b) email collision: oauth_sub is novel but email belongs
                 #      to a different account (different provider, same
                 #      address). The user_id re-lookup misses; raise 409.
+                #  (c) an identity with no link row whose sub is still the
+                #      ``user_id`` of the account it created: its owner
+                #      removed this sign-in method (AccountLinkingService.
+                #      unlink keeps the id). Only the link row tells (a) from
+                #      (c), so a known provider is re-checked for its own
+                #      row after the rollback and refused without one.
                 await db.rollback()
                 retry = await db.execute(select(User).filter_by(user_id=user_id))
                 existing = retry.scalar_one_or_none()
                 if existing is not None:
-                    # ``existing`` was found by ``user_id`` alone. Adopt only
-                    # when this identity is one of its own (race (a): the
-                    # other request wrote the link row) — a row that merely
-                    # shares the id must not start syncing from this provider.
-                    if (
-                        known_provider
-                        and existing.auth_provider is None
-                        and existing.auth_method == "oauth"
-                    ):
+                    if known_provider:
+                        # ``existing`` was found by ``user_id`` alone. Sign in
+                        # through it only when this identity's link row exists
+                        # and points at it (race (a)); a row that merely
+                        # shares the id is not this identity's account.
                         own_link = (
                             await db.execute(
                                 select(UserOAuthProvider).filter_by(
@@ -455,8 +477,16 @@ class RoleManager:
                                 )
                             )
                         ).scalar_one_or_none()
-                        if own_link is not None and own_link.user_id == existing.user_id:
-                            _adopt_primary_provider(existing, auth_provider, own_link)
+                        if own_link is None or own_link.user_id != existing.user_id:
+                            logger.warning(
+                                "oauth_unlinked_identity_sign_in_refused",
+                                auth_provider=auth_provider,
+                                user_id=user_id,
+                                link_row_present=own_link is not None,
+                            )
+                            raise UnlinkedProviderSignInError() from exc
+                        own_link.last_used_at = utcnow()
+                        _adopt_primary_provider(existing, auth_provider, own_link)
                     return await self._sync_existing_user(
                         db=db,
                         user=existing,
