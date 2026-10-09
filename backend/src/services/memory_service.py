@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, and_, exists, or_, select
+from sqlalchemy import ColumnElement, and_, exists, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.retention import should_promote_to_persistent
@@ -39,6 +39,7 @@ from models.memory import (
     SOURCE_TYPE_CONNECTOR,
     SOURCE_TYPE_MANUAL,
     Memory,
+    tool_triggered_predicate,
 )
 from models.schemas import (
     ExploreHint,
@@ -104,6 +105,13 @@ if TYPE_CHECKING:
 # ``LoadPinnedRequest.cap`` le=1000. The MCP path sends the raw arg with no
 # Pydantic validation, so the service clamps defensively (see _clamp_pinned_cap).
 _PINNED_LOAD_CAP_MAX = 1000
+
+# #1941: rows deleted and committed per batch by ``forget_bulk`` — bounds the
+# transaction (and the lock window on the rows) for a context of any size.
+FORGET_BULK_CHUNK = 500
+# Rows one forget-bulk request deletes at most; the client repeats the request
+# while the response says ``remaining`` (bounds request time and lock windows).
+FORGET_BULK_MAX_PER_REQUEST = 2000
 
 # Issue #1052: recall-confidence thresholds for absence detection.
 #
@@ -615,6 +623,31 @@ class MemoryService:
                 "payload store)"
             )
 
+    async def _ensure_capacity(
+        self,
+        user_id: str,
+        *,
+        workspace_id: UUID | str | None = None,
+        context_ids: list[UUID] | tuple[UUID | None, ...] = (),
+    ) -> None:
+        """Refuse when the target workspace is over its Free capacity (#1941).
+
+        The second line behind the MCP dispatcher: every REST and MCP read or
+        write that reaches this service is checked against the workspace that
+        OWNS the data (the context's, not the caller's session workspace).
+        ``forget``, listing, stats and export never call it.
+        """
+        from services.capacity_lock import (
+            ensure_contexts_not_capacity_locked,
+            ensure_not_capacity_locked,
+        )
+
+        if workspace_id is not None:
+            await ensure_not_capacity_locked(self.db, workspace_id, user_id=user_id)
+        if any(c is not None for c in context_ids):
+            # One query for every context, deduplicated per workspace (#1941).
+            await ensure_contexts_not_capacity_locked(self.db, context_ids, user_id=user_id)
+
     async def remember(
         self,
         request: RememberRequest,
@@ -727,6 +760,7 @@ class MemoryService:
         # shared context the caller is also a member of, a different workspace
         # (the wrong counter). A workspace-scoped key or a binding denial is
         # still refused here, before any counter is touched.
+        capacity_checked = isolation is not None  # remember_many checked the batch
         if isolation is None:
             isolation = await self._get_context_isolation_params(
                 user_id,
@@ -740,6 +774,11 @@ class MemoryService:
         # Validate required parameters
         if not workspace_id_str or not context_id_str:
             raise ValueError("remember() requires current_context_id")
+
+        # #1941: after the write gate, so a context the caller cannot write
+        # answers its uniform not-found, never the lock.
+        if not capacity_checked:
+            await self._ensure_capacity(user_id, workspace_id=workspace_id_str)
 
         # #1853: dedupe="check" asks BEFORE the quota is charged and the row
         # exists — a candidate above the suggestion threshold comes back to
@@ -1025,6 +1064,7 @@ class MemoryService:
         _context, workspace_id_str, context_id_str = isolation
         if not workspace_id_str or not context_id_str:
             raise ValueError("remember_batch() requires current_context_id")
+        await self._ensure_capacity(user_id, workspace_id=workspace_id_str)
         tag_canonical = (
             await self.tag_canonical_map(
                 workspace_id=UUID(workspace_id_str),
@@ -1419,6 +1459,8 @@ class MemoryService:
         Returns:
             UpdateMemoryResponse
         """
+        # #1941: the capacity check runs after authorization — in
+        # _update_in_place, and in the inner remember() of an upsert.
         if request.external_id:
             return await self._upsert_by_external_id(
                 request, user_id, client, current_context_id, current_workspace_id
@@ -1439,6 +1481,8 @@ class MemoryService:
         from utils.text import normalize_for_search
 
         memory = await self._update_load_authorized(request.memory_id, user_id)
+        # #1941: after the access check, so the lock is no existence oracle.
+        await self._ensure_capacity(user_id, workspace_id=memory.workspace_id)
 
         # Tool guardrails: any edit of a guardrail row, or a details write that
         # adds / changes / removes tool_trigger, needs context EDITOR or above
@@ -2175,6 +2219,8 @@ class MemoryService:
         from utils.text import normalize_for_search
 
         memory = await self._patch_load_authorized(memory_id, user_id)
+        # #1941: after the access check, so the lock is no existence oracle.
+        await self._ensure_capacity(user_id, workspace_id=memory.workspace_id)
 
         # `model_fields_set` is the set of field names the client EXPLICITLY
         # sent (including those set to None), so `{"details": null}` puts
@@ -2417,6 +2463,9 @@ class MemoryService:
 
         if not can_access:
             raise NotFoundException("Memory", str(memory_id))
+
+        # #1941: after the access check, so the lock is no existence oracle.
+        await self._ensure_capacity(user_id, workspace_id=memory.workspace_id)
 
         # Snapshot ``updated_at`` before bumping access stats. #1317 removed
         # the column's ``onupdate=func.now()``, so ``update_access_stats`` no
@@ -4719,6 +4768,8 @@ class MemoryService:
         | None = None,  # Issue #708: source workspace for shared-context Option A
         context_ids: list[UUID] | None = None,  # Issue #81: cross-context recall
         selection_config: RecallSelectionConfig | None = None,
+        *,
+        capacity_gate: bool = True,
     ) -> RecallResponse:
         """Search memories with Hybrid Search + Neural Memory.
 
@@ -4795,6 +4846,13 @@ class MemoryService:
             context_ids=context_ids,
         )
         request = plan.request
+        # #1941: after the binding gate and scope resolution. ``forget(query=...)``
+        # finds its candidates through recall and must keep working on a locked
+        # workspace — it passes False.
+        if capacity_gate:
+            await self._ensure_capacity(
+                user_id, context_ids=(current_context_id, *(context_ids or ()))
+            )
         effective_workspace_id = plan.effective_workspace_id
         is_shared_context_read = plan.is_shared_context_read
         neural_enabled = plan.neural_enabled
@@ -5069,6 +5127,7 @@ class MemoryService:
         )
         if not workspace_id_str or not context_id_str:
             raise ValueError("load_pinned() requires current_context_id")
+        await self._ensure_capacity(user_id, workspace_id=workspace_id_str)
 
         effective_cap = self._clamp_pinned_cap(cap, get_settings().pinned_load_cap)
 
@@ -5232,6 +5291,8 @@ class MemoryService:
         )
         if not workspace_id_str or not context_id_str:
             raise ValueError("load_guardrails() requires current_context_id")
+        # #1941: no capacity check — guardrails stay available on a locked
+        # workspace (see mcp_server/tools/_capacity_gate.py).
 
         settings = get_settings()
         pinned_cap = self._clamp_pinned_cap(None, settings.pinned_load_cap)
@@ -5326,6 +5387,14 @@ class MemoryService:
         no other live row names it. Memories the API wrote have their own
         point (``point_id == id``) and skip the check.
         """
+        point_id = await self._point_to_delete(memory)
+        if point_id is None:
+            return
+        del_collection = await resolve_collection_name(self.db, memory.context_id)
+        await delete_memory_from_qdrant(user_id, point_id, collection_name=del_collection)
+
+    async def _point_to_delete(self, memory: Memory) -> UUID | None:
+        """``memory``'s vector point id, or ``None`` when another live row owns it too."""
         point_id = memory.point_id
         if point_id != memory.id:
             # Not scoped by context_id on purpose: the row to find is one in
@@ -5346,9 +5415,326 @@ class MemoryService:
                     memory_id=str(memory.id),
                     point_id=str(point_id),
                 )
-                return
-        del_collection = await resolve_collection_name(self.db, memory.context_id)
-        await delete_memory_from_qdrant(user_id, point_id, collection_name=del_collection)
+                return None
+        return point_id
+
+    async def _soft_delete_memory(
+        self,
+        user_id: str,
+        memory: Memory,
+        workspace_id: str,
+        context_id: str,
+        *,
+        delete_point: bool = True,
+    ) -> UUID | None:
+        """Delete one memory the caller may delete: ``forget``'s by-id side effects.
+
+        Soft-deletes the row, removes its search point and its neural edges
+        (3-level isolation). Shared by ``forget(memory_id=...)`` and
+        ``forget_bulk`` so the two can never drift. The caller commits.
+
+        With ``delete_point=False`` the point is not deleted here: its id is
+        returned (``None`` when another live row still owns it) so a batch
+        caller can remove a whole chunk's points in one request.
+        """
+        # Soft delete in PostgreSQL (set deleted_at, deleted_by)
+        memory.deleted_at = utcnow()
+        memory.deleted_by = user_id
+        # touch=False: the delete is dated by deleted_at, not
+        # updated_at — else changes_since lists an "updated" event
+        # after the "forgotten" one (#1924).
+        await self.memory_repo.update(memory.id, memory, touch=False)
+
+        # Hard delete from Qdrant (remove from search index) — by the
+        # row's point id, not its row id (#1829).
+        point_to_delete: UUID | None = None
+        if delete_point:
+            await self._delete_memory_point(user_id, memory)
+        else:
+            point_to_delete = await self._point_to_delete(memory)
+
+        # Clean up neural memory edges with 3-level isolation
+        from repositories.neural_edge import NeuralEdgeRepository
+
+        edge_repo = NeuralEdgeRepository(self.db)
+        edges_deleted = await edge_repo.delete_node_edges(
+            user_id=user_id,
+            node_id=memory.id,
+            workspace_id=workspace_id,
+            context_id=context_id,
+        )
+        if edges_deleted > 0:
+            logger.info(
+                "neural_edges_cleaned",
+                memory_id=str(memory.id),
+                edges_deleted=edges_deleted,
+                user_id=user_id,
+            )
+        return point_to_delete
+
+    async def _soft_delete_chunk(
+        self, user_id: str, ids: list[UUID], workspace_id: str, context_id: str
+    ) -> tuple[list[UUID], list[str]]:
+        """``_soft_delete_memory`` for a chunk, in a fixed number of statements.
+
+        One UPDATE stamps ``deleted_at`` / ``deleted_by`` (and nothing else:
+        ``updated_at`` stays, #1924) on the chunk's still-live rows of the
+        context; one SELECT keeps every shared point another live row still
+        owns (#1829); one DELETE drops the deleted nodes' neural edges with
+        forget's (user, workspace, context) isolation. Returns the deleted ids
+        and the point ids to remove from the index. The caller deletes the
+        points and commits.
+        """
+        from sqlalchemy import update
+
+        from repositories.neural_edge import NeuralEdgeRepository
+
+        if not ids:
+            return [], []
+        rows = (
+            await self.db.execute(
+                update(Memory)
+                .where(
+                    Memory.id.in_(ids),
+                    Memory.context_id == UUID(context_id),
+                    Memory.deleted_at.is_(None),
+                )
+                .values(deleted_at=utcnow(), deleted_by=user_id)
+                .returning(Memory.id, Memory.summary_embedding_id)
+                .execution_options(synchronize_session=False)
+            )
+        ).all()
+        deleted = [row.id for row in rows]
+        points = {row.id: (row.summary_embedding_id or row.id) for row in rows}
+        shared = {p for mid, p in points.items() if p != mid}
+        kept: set[UUID | None] = set()
+        if shared:
+            kept = set(
+                (
+                    await self.db.execute(
+                        select(Memory.summary_embedding_id).where(
+                            Memory.summary_embedding_id.in_(shared),
+                            Memory.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars()
+            )
+        await NeuralEdgeRepository(self.db).delete_nodes_edges(
+            user_id=user_id, node_ids=deleted, workspace_id=workspace_id, context_id=context_id
+        )
+        return deleted, [str(p) for p in dict.fromkeys(points.values()) if p not in kept]
+
+    async def forget_bulk(
+        self,
+        user_id: str,
+        *,
+        context_id: UUID,
+        created_before: datetime | None = None,
+        created_after: datetime | None = None,
+        memory_type: str | None = None,
+        tags: list[str] | None = None,
+        dry_run: bool = True,
+        key_workspace_id: UUID | None = None,
+        chunk_size: int = FORGET_BULK_CHUNK,
+        max_rows: int = FORGET_BULK_MAX_PER_REQUEST,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> tuple[int, bool, tuple[datetime, UUID] | None]:
+        """Delete every live memory in one context that matches the filters (#1941).
+
+        The permission model is ``forget``'s, applied to each candidate: the
+        context gate (``_get_context_isolation_params`` with ``access="write"``,
+        uniform 404), then ``can_access_memory(access="write")`` — evaluated
+        once per distinct (author, type, source) group, since the answer
+        depends on nothing else — and the guardrail author gate. A row the
+        caller may not delete is skipped, exactly as forget skips it, and is
+        not counted.
+
+        Not gated by the capacity lock: deleting is how a locked workspace
+        gets back under its cap.
+
+        Args:
+            user_id: Caller.
+            context_id: The context to delete from.
+            created_before / created_after: ``created_at`` bounds (exclusive /
+                inclusive), naive UTC.
+            memory_type: Exact ``type``.
+            tags: Rows carrying ANY of these tags.
+            dry_run: Count only.
+            key_workspace_id: Pure key scope (#963), as for forget.
+            chunk_size: Rows deleted and committed per batch.
+            max_rows: Rows one request deletes at most; the caller repeats
+                the request while ``remaining`` is true.
+            after: Resume point from the previous request's ``next_after``
+                (``(created_at, id)`` of the last row it deleted), so rows
+                this caller may not delete are not rescanned every request.
+                Ignored on a dry run.
+
+        Returns:
+            ``(count, remaining, next_after)``: on a dry run the FULL matched
+            count, ``False`` and ``None``; otherwise the number deleted by
+            this request, whether matching rows are left, and where the next
+            request resumes (``None`` when nothing remains).
+
+        Each chunk is committed, its search points removed in one request
+        (collection resolved once), and audited on its own — an interrupted
+        request leaves an audit row for every chunk it did delete.
+        """
+        from services.permission_service import CallerId, MemoryAuthorId, PermissionService
+
+        _context, workspace_id_str, context_id_str = await self._get_context_isolation_params(
+            user_id,
+            context_id,
+            access="write",
+            key_workspace_id=key_workspace_id,
+            operation="forget",
+        )
+        if not workspace_id_str or not context_id_str:
+            raise NotFoundException("Context", str(context_id))
+
+        conditions = [Memory.context_id == context_id, Memory.deleted_at.is_(None)]
+        if created_before is not None:
+            conditions.append(Memory.created_at < created_before)
+        if created_after is not None:
+            conditions.append(Memory.created_at >= created_after)
+        if memory_type is not None:
+            conditions.append(Memory.type == memory_type)
+        if tags:
+            conditions.append(Memory.tags.overlap(tags))
+        perm = PermissionService(self.db)
+        allowed_groups: dict[tuple[str, str, str | None], bool] = {}
+        guardrail_ok: bool | None = None
+
+        async def permitted(author: str, mtype: str, source: str | None, guard: bool) -> bool:
+            """forget's per-memory decision, which depends only on these four."""
+            nonlocal guardrail_ok
+            group = (author, mtype, source)
+            if group not in allowed_groups:
+                allowed_groups[group] = await perm.can_access_memory(
+                    user_id=CallerId(user_id),
+                    memory_user_id=MemoryAuthorId(author),
+                    workspace_id=UUID(workspace_id_str),
+                    context_id=context_id,
+                    access="write",
+                    operation="forget",
+                    memory_type=mtype,
+                    memory_source_type=source,
+                )
+            if not allowed_groups[group]:
+                return False
+            if guard:
+                if guardrail_ok is None:
+                    from utils.exceptions import AuthorizationError
+
+                    try:
+                        await self._require_guardrail_author(user_id, context_id)
+                        guardrail_ok = True
+                    except (AuthorizationError, ValueError):
+                        guardrail_ok = False
+                return guardrail_ok
+            return True
+
+        is_guardrail = tool_triggered_predicate().label("is_guardrail")
+        if dry_run:
+            # Counted per permission group in SQL: no row is materialised.
+            groups = (
+                await self.db.execute(
+                    select(
+                        Memory.user_id,
+                        Memory.type,
+                        Memory.source_type,
+                        is_guardrail,
+                        func.count().label("n"),
+                    )
+                    .where(*conditions)
+                    .group_by(Memory.user_id, Memory.type, Memory.source_type, is_guardrail)
+                )
+            ).all()
+            matched = 0
+            for g in groups:
+                if await permitted(g.user_id, g.type, g.source_type, bool(g.is_guardrail)):
+                    matched += int(g.n)
+            return matched, False, None
+
+        # A real delete reads at most max_rows + 1 permitted candidates, a page
+        # at a time (keyset on created_at, id) so rows the permission check
+        # drops do not shrink the batch.
+        victims: list[tuple[UUID, datetime]] = []
+        page = max_rows + 1
+        # ``after`` starts at the caller's resume point, then follows each page.
+        while len(victims) <= max_rows:
+            stmt = (
+                select(
+                    Memory.id,
+                    Memory.created_at,
+                    Memory.user_id,
+                    Memory.type,
+                    Memory.source_type,
+                    is_guardrail,
+                )
+                .where(*conditions)
+                .order_by(Memory.created_at, Memory.id)
+                .limit(page)
+            )
+            if after is not None:
+                stmt = stmt.where(tuple_(Memory.created_at, Memory.id) > tuple_(*after))
+            rows = (await self.db.execute(stmt)).all()
+            for row in rows:
+                if await permitted(row.user_id, row.type, row.source_type, bool(row.is_guardrail)):
+                    victims.append((row.id, row.created_at))
+            if len(rows) < page:
+                break
+            after = (rows[-1].created_at, rows[-1].id)
+
+        from db.qdrant import delete_points_from_qdrant
+        from services.memory_access_event_writer import (
+            MAX_METADATA_MEMORY_IDS,
+            emit_memory_access_event,
+        )
+
+        remaining = len(victims) > max_rows
+        victims = victims[:max_rows]
+        next_after = (victims[-1][1], victims[-1][0]) if remaining and victims else None
+        collection = await resolve_collection_name(self.db, context_id)
+        deleted_total = 0
+        for start in range(0, len(victims), chunk_size):
+            chunk = [vid for vid, _ in victims[start : start + chunk_size]]
+            deleted, points = await self._soft_delete_chunk(
+                user_id, chunk, workspace_id_str, context_id_str
+            )
+            # Points first, then the commit — single forget's order: a failed
+            # point delete raises before this chunk's rows are committed, so
+            # no committed row is left with a live search point. Earlier
+            # chunks stay committed and audited.
+            try:
+                await delete_points_from_qdrant(points, collection)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+            deleted_total += len(deleted)
+            await emit_memory_access_event(
+                operation="forget",
+                outcome="success",
+                workspace_id=UUID(workspace_id_str),
+                user_id=user_id,
+                context_id=context_id,
+                memory_id=deleted[0] if len(deleted) == 1 else None,
+                result_count=len(deleted),
+                extra_metadata=(
+                    {"memory_ids": [str(mid) for mid in deleted[:MAX_METADATA_MEMORY_IDS]]}
+                    if len(deleted) > 1
+                    else None
+                ),
+            )
+
+        logger.info(
+            "memories_soft_deleted_in_bulk",
+            context_id=context_id_str,
+            count=deleted_total,
+            remaining=remaining,
+            user_id=user_id,
+        )
+        return deleted_total, remaining, next_after
 
     async def forget(
         self,
@@ -5357,6 +5743,7 @@ class MemoryService:
         current_context_id: UUID | None = None,
         key_workspace_id: UUID | None = None,  # Issue #963/#1281: pure key scope
         *,
+        current_workspace_id: UUID | None = None,
         _skip_binding_row_filter: bool = False,
     ) -> ForgetResponse:
         """Delete memory (single or multiple via query).
@@ -5453,36 +5840,9 @@ class MemoryService:
                 deleted_workspace_ids.add(memory.workspace_id)
                 deleted_context_ids.add(memory.context_id)
 
-                # Soft delete in PostgreSQL (set deleted_at, deleted_by)
-
-                memory.deleted_at = utcnow()
-                memory.deleted_by = user_id
-                # touch=False: the delete is dated by deleted_at, not
-                # updated_at — else changes_since lists an "updated" event
-                # after the "forgotten" one (#1924).
-                await self.memory_repo.update(memory.id, memory, touch=False)
-
-                # Hard delete from Qdrant (remove from search index) — by the
-                # row's point id, not its row id (#1829).
-                await self._delete_memory_point(user_id, memory)
-
-                # Clean up neural memory edges with 3-level isolation
-                from repositories.neural_edge import NeuralEdgeRepository
-
-                edge_repo = NeuralEdgeRepository(self.db)
-                edges_deleted = await edge_repo.delete_node_edges(
-                    user_id=user_id,
-                    node_id=request.memory_id,
-                    workspace_id=memory_workspace_id,
-                    context_id=memory_context_id,
+                await self._soft_delete_memory(
+                    user_id, memory, memory_workspace_id, memory_context_id
                 )
-                if edges_deleted > 0:
-                    logger.info(
-                        "neural_edges_cleaned",
-                        memory_id=str(request.memory_id),
-                        edges_deleted=edges_deleted,
-                        user_id=user_id,
-                    )
 
                 deleted_ids.append(request.memory_id)
 
@@ -5509,7 +5869,19 @@ class MemoryService:
             )
 
             # Issue #82: Pass project ID to recall
-            search_response = await self.recall(recall_request, user_id, current_context_id)
+            # recall() requires the workspace as well as the context: the
+            # caller's session workspace (what every other recall caller
+            # passes — recall routes a shared read from it), else the
+            # context's own when the caller has none.
+            search_response = await self.recall(
+                recall_request,
+                user_id,
+                current_context_id,
+                current_workspace_id=(
+                    current_workspace_id or (UUID(workspace_id_str) if workspace_id_str else None)
+                ),
+                capacity_gate=False,
+            )
 
             # #1515: the pin above says the router must never choose the
             # candidate set of a destructive operation — and degradation would
@@ -5528,42 +5900,37 @@ class MemoryService:
                     "are healthy.",
                 )
 
-            # Soft delete each found memory
+            # Resolve and validate every match BEFORE any side effect, so a
+            # request either deletes all of its matches or touches nothing: a
+            # legacy row with NULL workspace/context (the by-id path refuses
+            # it too) must not abort the sweep after earlier rows lost their
+            # search points but before the commit.
+            victims: list[Memory] = []
             for memory_response in search_response.results:
                 memory = await self.memory_repo.get(memory_response.memory_id)
-                if memory:
-                    # Tool guardrails: the same author gate as the by-id branch
-                    # — a query sweep must not delete a guardrail a member may
-                    # not delete one by one. Skipped rows are simply not counted.
-                    if not await self._may_delete_guardrail(user_id, memory):
-                        continue
-                    memory.deleted_at = utcnow()
-                    memory.deleted_by = user_id
-                    await self.memory_repo.update(memory.id, memory, touch=False)  # #1924
-
-                    # Hard delete from Qdrant — by the row's point id (#1829)
-                    await self._delete_memory_point(user_id, memory)
-
-                    # Clean up neural memory edges
-                    from repositories.neural_edge import NeuralEdgeRepository
-
-                    edge_repo = NeuralEdgeRepository(self.db)
-                    edges_deleted = await edge_repo.delete_node_edges(
-                        user_id, memory_response.memory_id
+                if not memory:
+                    continue
+                # Tool guardrails: the same author gate as the by-id branch
+                # — a query sweep must not delete a guardrail a member may
+                # not delete one by one. Skipped rows are simply not counted.
+                if not await self._may_delete_guardrail(user_id, memory):
+                    continue
+                if not memory.workspace_id or not memory.context_id:
+                    raise ValueError(
+                        f"Memory {memory.id} has NULL workspace_id/context_id. "
+                        "This indicates data migration issue. Run Migration 063."
                     )
-                    if edges_deleted > 0:
-                        logger.info(
-                            "neural_edges_cleaned",
-                            memory_id=str(memory_response.memory_id),
-                            edges_deleted=edges_deleted,
-                            user_id=user_id,
-                        )
+                victims.append(memory)
 
-                    deleted_ids.append(memory_response.memory_id)
-                    if memory.workspace_id:
-                        deleted_workspace_ids.add(memory.workspace_id)
-                    if memory.context_id:
-                        deleted_context_ids.add(memory.context_id)
+            for memory in victims:
+                # The by-id path's helper: same #1924 stamp, same shared
+                # point rule, same 3-level edge isolation.
+                await self._soft_delete_memory(
+                    user_id, memory, str(memory.workspace_id), str(memory.context_id)
+                )
+                deleted_ids.append(memory.id)
+                deleted_workspace_ids.add(memory.workspace_id)
+                deleted_context_ids.add(memory.context_id)
 
             logger.info(
                 "memories_soft_deleted_by_query",
@@ -5756,6 +6123,9 @@ class MemoryService:
             # above (uniform 404; no existence oracle, and no doubled
             # "not found not found" from the constructor's own suffix).
             raise NotFoundException("Memory", str(request.memory_id))
+
+        # #1941: after the access check, so the lock is no existence oracle.
+        await self._ensure_capacity(user_id, workspace_id=seed_memory.workspace_id)
 
         # Migration 063: Get workspace_id and context_id directly from seed memory
         # CRITICAL: Validate seed memory has workspace_id/context_id (data integrity)

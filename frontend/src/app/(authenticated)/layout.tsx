@@ -19,6 +19,7 @@ import { MemoryContextProvider } from "@/contexts/MemoryContextContext";
 import { Sidebar } from "@/components/dashboard/Sidebar";
 import { WorkspaceSelectionScreen } from "@/components/workspaces/WorkspaceSelectionScreen";
 import { TermsReacceptanceDialog } from "@/components/auth/TermsReacceptanceDialog";
+import { CapacityLockBanner } from "@/components/common/CapacityLockBanner";
 import { WorkspaceSuspensionNotice } from "@/components/plan/WorkspaceSuspensionNotice";
 
 /**
@@ -265,6 +266,8 @@ function DashboardContent({ children }: { children: React.ReactNode }) {
                 </div>
               )}
 
+              {/* #1941: a Free workspace over its capacity */}
+              <CapacityLockBanner />
               {/* #1939: paid-only features paused (back on Free) — owner-only */}
               <WorkspaceSuspensionNotice />
 

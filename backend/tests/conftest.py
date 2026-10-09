@@ -39,6 +39,65 @@ _setup_logger()
 
 
 @pytest.fixture(autouse=True)
+def _capacity_gate_needs_a_session(monkeypatch):
+    """Run ``MemoryService._ensure_capacity`` only against a session (#1941).
+
+    The capacity-lock check reads the workspace and two counts at the entry of
+    every memory read/write. Hundreds of service tests drive those methods
+    with a bare ``MagicMock`` session whose ``execute`` answers a scripted
+    sequence; the extra reads would consume it. The check therefore runs only
+    when ``self.db`` is an ``AsyncSession`` — a real one (integration tests)
+    or a ``MagicMock(spec=AsyncSession)``, which is how
+    ``tests/services/test_memory_service_capacity_lock.py`` exercises it.
+    """
+    from services.memory_service import MemoryService
+
+    real = MemoryService._ensure_capacity
+
+    async def _gated(self, *args, **kwargs):
+        if isinstance(self.db, AsyncSession):
+            await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryService, "_ensure_capacity", _gated)
+
+
+# Route modules that call the capacity lock directly (#1941), and the name each
+# binds. Their tests drive the handlers with a mocked ``db`` / ``perm`` /
+# service whose session is a bare MagicMock; the same rule as above applies.
+_CAPACITY_GATED_ROUTES = (
+    ("api.routes.agent_state", "ensure_context_not_capacity_locked"),
+    ("api.routes.feedback", "ensure_context_not_capacity_locked"),
+    ("api.routes.share_keys", "ensure_context_not_capacity_locked"),
+    ("api.routes.graph", "ensure_not_capacity_locked"),
+    ("api.routes.analyses", "ensure_not_capacity_locked"),
+    ("api.routes.sleep_reports", "ensure_not_capacity_locked"),
+    ("api.routes.agents", "ensure_not_capacity_locked"),
+    ("api.routes.public_search", "ensure_not_capacity_locked"),
+    ("api.routes.context_search_config", "ensure_context_not_capacity_locked"),
+)
+
+
+@pytest.fixture(autouse=True)
+def _capacity_gated_routes_need_a_session(monkeypatch):
+    """Run the routes' capacity-lock check only against a session (#1941).
+
+    ``tests/api/test_capacity_lock_routes.py`` patches each name with a
+    raising mock to pin where the check sits; that patch wins over this one.
+    """
+    import importlib
+
+    for module_name, attr in _CAPACITY_GATED_ROUTES:
+        module = importlib.import_module(module_name)
+        real = getattr(module, attr)
+
+        async def _gated(db, *args, _real=real, **kwargs):
+            if isinstance(db, AsyncSession):
+                await _real(db, *args, **kwargs)
+
+        monkeypatch.setattr(module, attr, _gated)
+
+
+@pytest.fixture(autouse=True)
 def _clear_pricing_cache():
     """Reset the process-local ``llm_pricing`` cache around every test (#713).
 

@@ -1835,6 +1835,84 @@
         },
         "type": "object"
       },
+      "CapacityLockInfo": {
+        "properties": {
+          "cleanup_url": {
+            "type": "string"
+          },
+          "memory_count": {
+            "type": "integer"
+          },
+          "memory_limit": {
+            "type": "integer"
+          },
+          "over_bytes": {
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "over_memories": {
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "storage_limit_bytes": {
+            "type": "integer"
+          },
+          "used_bytes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cleanup_url",
+          "memory_count",
+          "memory_limit",
+          "over_bytes",
+          "over_memories",
+          "storage_limit_bytes",
+          "used_bytes"
+        ],
+        "type": "object"
+      },
+      "CapacityLockNoticeRequest": {
+        "properties": {
+          "period_end": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "period_end"
+        ],
+        "type": "object"
+      },
+      "CapacityLockNoticeResult": {
+        "properties": {
+          "over_bytes": {
+            "type": "integer"
+          },
+          "over_memories": {
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "over_bytes",
+          "over_memories",
+          "sent"
+        ],
+        "type": "object"
+      },
       "ClusterListResponse": {
         "properties": {
           "items": {
@@ -4187,6 +4265,138 @@
         "required": [
           "reason",
           "target_user_id"
+        ],
+        "type": "object"
+      },
+      "ForgetBulkRequest": {
+        "properties": {
+          "all": {
+            "default": false,
+            "type": "boolean"
+          },
+          "context_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_after": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_before": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dry_run": {
+            "default": true,
+            "type": "boolean"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "anyOf": [
+              {
+                "maxLength": 50,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "context_id"
+        ],
+        "type": "object"
+      },
+      "ForgetBulkResponse": {
+        "properties": {
+          "deleted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "matched": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "remaining": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "default": "success",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dry_run"
         ],
         "type": "object"
       },
@@ -9816,6 +10026,16 @@
       },
       "UsageCurrentResponse": {
         "properties": {
+          "capacity_lock": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapacityLockInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "daily_api_usage": {
             "$ref": "#/components/schemas/UsageStatus"
           },
@@ -21294,6 +21514,61 @@
         ]
       }
     },
+    "/api/v1/memory/forget-bulk": {
+      "post": {
+        "operationId": "forget_bulk_api_v1_memory_forget_bulk_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForgetBulkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgetBulkResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "memory"
+        ]
+      }
+    },
     "/api/v1/memory/guardrails": {
       "post": {
         "operationId": "load_guardrails_api_v1_memory_guardrails_post",
@@ -27498,6 +27773,69 @@
         },
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/internal/workspaces/{workspace_id}/capacity-lock-notice": {
+      "post": {
+        "operationId": "send_capacity_lock_notice_internal_workspaces__workspace_id__capacity_lock_notice_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapacityLockNoticeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapacityLockNoticeResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "internal-billing"
         ]
       }
     },

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import UTC, datetime
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,15 @@ def _may_have_been_delivered(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+_SUBJECT_NAME_MAX = 80
+
+
+def _header_safe(value: str, limit: int = _SUBJECT_NAME_MAX) -> str:
+    """``value`` on one line (control characters → spaces), at most ``limit`` chars."""
+    flat = " ".join("".join(" " if ch.isspace() or ord(ch) < 32 else ch for ch in value).split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
 
 class ResendEmailService:
@@ -557,5 +567,62 @@ class ResendEmailService:
             },
             # After a read timeout the notice may already be out; the caller
             # treats TimeoutError as "may have been sent" and never resends.
+            raise_if_uncertain=True,
+        )
+
+    async def send_capacity_lock_notice(
+        self,
+        *,
+        to_email: str,
+        workspace_name: str,
+        period_end: datetime,
+        over_memories: int,
+        over_bytes: int,
+        cleanup_url: str,
+        contexts_url: str,
+    ) -> bool:
+        from utils.exceptions import capacity_overage_text
+
+        if period_end.tzinfo is not None:
+            period_end = period_end.astimezone(UTC)
+        end_day = period_end.strftime("%Y-%m-%d")
+        overage = capacity_overage_text(over_memories, over_bytes)
+        # The name is user-chosen: no CR/LF into a header, and a bounded length.
+        workspace_name = _header_safe(workspace_name)
+        subject = (
+            f"Action needed before {end_day}: {workspace_name} is over the Free plan's capacity"
+        )
+        text = (
+            f'Your workspace "{workspace_name}" goes back to the Free plan on {end_day} (UTC).\n'
+            f"It currently holds more than the Free plan allows: {overage} over.\n"
+            "\n"
+            "If it is still over the limit on that date, the workspace will be locked:\n"
+            "- Paused: search and recall, saving new memories, edits, file uploads and\n"
+            "  creating contexts.\n"
+            "- Still available: listing memories, deleting memories, contexts and files,\n"
+            "  and exporting your data.\n"
+            "\n"
+            "To keep using it without interruption, before that date either:\n"
+            f"- remove {overage} (delete by filter on a context's Memories tab):\n"
+            f"  {contexts_url}\n"
+            "- or keep your subscription:\n"
+            f"  {cleanup_url}\n"
+            "\n"
+            "You can export any context as JSON from its page before deleting it.\n"
+            "Nothing is deleted automatically.\n"
+        )
+        return await self._send(
+            to_email=to_email,
+            subject=subject,
+            text=text,
+            log_event="capacity_lock_notice_email",
+            log_context={
+                "recipient_hash": redact_recipient(to_email),
+                "over_memories": over_memories,
+                "over_bytes": over_bytes,
+                "template": "capacity_lock_notice",
+            },
+            # At most once: a timeout after the provider may have accepted the
+            # email raises, and the caller keeps its idempotency claim.
             raise_if_uncertain=True,
         )

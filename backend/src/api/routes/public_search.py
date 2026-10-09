@@ -20,6 +20,7 @@ from config.plan_tiers import get_plan_tier
 from db.base import get_db
 from db.redis import incrby_counter
 from models.auth import Context, Workspace
+from services.capacity_lock import ensure_not_capacity_locked
 from services.plan_suspension import ensure_public_serving_allowed
 from services.resource_lookup import get_latest_schema
 from services.search_service import SearchService
@@ -486,6 +487,17 @@ async def public_search(
     # has to cover anonymous callers.
     if user is None and bound_key is None:
         ensure_public_serving_allowed(workspace)
+
+    # #1941: a workspace over its Free capacity pauses search, public reads
+    # included. Placed after the rate buckets and on the already-loaded
+    # Workspace, so a 429 flood costs no lock read. Order with the plan-pause
+    # gate (#1939): plan pause (anonymous) first, then this capacity check.
+    # A member session sees the numbers; an anonymous or bound-key reader is
+    # never a member, so it gets the redacted refusal.
+    if user is not None and bound_key is None:
+        await ensure_not_capacity_locked(db, workspace, user_id=user.get("user_id"))
+    else:
+        await ensure_not_capacity_locked(db, workspace, outsider=True)
 
     # 5. Hoist usage-log attribution + caller id once so the success and
     # error paths below share one definition.
