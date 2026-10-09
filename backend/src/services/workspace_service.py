@@ -12,12 +12,14 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.workspace_roles import WorkspaceRole
+from config.plan_tiers import has_feature
 from models.auth import Context, ExternalAPIKey, UsageStats, Workspace, WorkspaceMember
 from models.memory import Memory
 from services.billing_contract import ensure_no_billing_contract
+from services.quota_service import QuotaService
 from services.workspace_locks import lock_workspace_for_update
 from utils.datetime import utcnow
-from utils.exceptions import NotFoundException, ValidationError
+from utils.exceptions import FeatureNotAvailableError, NotFoundException, ValidationError
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -628,14 +630,33 @@ class WorkspaceService:
 
         Raises:
             ValidationError: If member already exists
+            NotFoundException: If the workspace does not exist
+            FeatureNotAvailableError: If the plan has no ``team_invitations``
+            QuotaExceededError: If every seat is taken (members + pending
+                invitations), the same rule as creating an invitation
         """
         # Validate role
         self.validate_role(role)
+
+        # #1939: lock the workspace row first and hold it until the insert
+        # commits, so concurrent direct adds serialize — otherwise two of them
+        # can both read "one seat left" and both take it. Raises
+        # NotFoundException for a missing / soft-deleted workspace.
+        workspace = await lock_workspace_for_update(self.db, workspace_id)
 
         # Check if member already exists
         existing = await self.get_member(workspace_id, user_id, raise_if_not_found=False)
         if existing:
             raise ValidationError(f"User {user_id} is already a member")
+
+        # #1939: the same plan gates as creating an invitation
+        # (api/routes/invitations.py), so a direct add cannot grow a workspace
+        # past what its plan allows. Lives here rather than in the route so
+        # every caller gets it.
+        if not has_feature(workspace.plan_name, "team_invitations"):
+            raise FeatureNotAvailableError.for_feature(workspace.plan_name, "team_invitations")
+
+        await QuotaService(self.db).check_member_quota(workspace_id, raise_on_exceeded=True)
 
         # Create membership
         member = WorkspaceMember(
