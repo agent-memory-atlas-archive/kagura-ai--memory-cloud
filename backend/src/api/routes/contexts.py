@@ -1108,6 +1108,77 @@ async def update_context(
 # Issue #246: PUT /{context_id}/activate endpoint removed (context always explicit)
 
 
+class ContextFilesDeleteResponse(BaseModel):
+    """What ``DELETE /contexts/{id}/files`` removed (#1960)."""
+
+    deleted: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Uploaded files soft-deleted — what the file list showed; cancelled in-flight "
+            "uploads release their bytes but are not counted"
+        ),
+    )
+    released_bytes: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Bytes released from the storage quota: the uploaded files' bytes plus the "
+            "reservations of cancelled in-flight uploads"
+        ),
+    )
+
+
+@router.delete("/{context_id}/files", response_model=ContextFilesDeleteResponse)
+async def delete_context_files(
+    context_id: UUID,
+    user: SessionUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContextFilesDeleteResponse:
+    """Soft-delete every file of the context and release their quota (#1960).
+
+    Owner only. Allowed while the workspace is capacity-locked (#1941): it is
+    cleanup, the way an owner gets back under the storage limit — and the
+    default context cannot be deleted, so this is how its files are cleared in
+    bulk. The files take the same road as a single ``DELETE /files/{id}``: the
+    rows are soft-deleted now, the R2 objects go with the 7-day GC.
+
+    Raises:
+        403: Not the context owner.
+        404: Context not found.
+        409: The context is locked (``is_locked``), as for deleting it.
+    """
+    user_id = user.get("user_id")
+    from services import storage_quota_service
+    from services.file_storage_service import FileStorageService
+    from services.permission_service import PermissionService
+
+    context = await PermissionService(db).check_context_owner(
+        user_id, context_id, capacity=CapacityPolicy.ALLOWED
+    )
+    if context.is_locked:
+        # Issue #85: the lock protects the context's content, its files included.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Context is locked. Unlock it before deleting its files.",
+        )
+    count, released_bytes = await FileStorageService(db).purge_context_files(context.id)
+    await db.commit()
+    if released_bytes:
+        # After the commit: Redis follows the durable rows (R5).
+        await storage_quota_service.release_storage_bytes(
+            workspace_id=context.workspace_id, size_bytes=released_bytes
+        )
+    logger.info(
+        "context_files_deleted_api",
+        user_id=user_id,
+        context_id=str(context_id),
+        files=count,
+        released_bytes=released_bytes,
+    )
+    return ContextFilesDeleteResponse(deleted=count, released_bytes=released_bytes)
+
+
 @router.delete("/{context_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_context(
     context_id: UUID,
@@ -1117,7 +1188,10 @@ async def delete_context(
 ):
     """Delete a context and its collection.
 
-    Only context owner can delete their context.
+    Only context owner can delete their context. The context, its memories and
+    its files are soft-deleted together and the files' bytes leave the storage
+    quota at once (#1960); an admin restore within 6 days brings the files back
+    unless the same content was uploaded again in the meantime.
 
     Args:
         context_id: Context UUID to delete

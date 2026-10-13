@@ -21,6 +21,10 @@ memory carries the context's timestamp the restore takes those up to
 ``DELETION_WINDOW`` before it. A memory forgotten earlier, or tombstoned by
 Sleep, stays deleted.
 
+Files the deletion purged (#1960) come back for 6 days (``FILE_RESTORE_WINDOW``,
+one day short of the GC's 7-day retention); after that they are left deleted
+and the restore reports it.
+
 Not restored: what the deletion hard-deleted or rewrote — the context's
 neural edges, its entries in members' ``allowed_context_ids``, revoked
 resource tokens — and memories the purge already removed.
@@ -42,9 +46,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.auth import AuditLog, Context, Workspace
+from models.file_objects import WorkspaceStorageUsage
 from models.memory import Memory
 from models.resource import Resource, ResourceSchema
+from services import storage_quota_service
+from services.capacity_lock import is_lock_candidate
 from services.context_service import CONTEXT_NAME_PATTERN, DEFAULT_CONTEXT_NAME
+from services.file_storage_service import (
+    FILE_RESTORE_WINDOW,
+    ContextFilesRestore,
+    FileStorageService,
+)
 from services.resource_indexer import resource_point_id
 from utils.datetime import to_utc_iso
 from utils.exceptions import ConflictError, NotFoundException, ValidationError
@@ -73,6 +85,10 @@ class ContextRestoreResult:
     dry_run: bool
     # Memories the deletion tombstoned that are (or would be) live again.
     memories_restored: int = 0
+    # Files the deletion purged (#1960) that the soft-delete GC has not yet
+    # removed: brought back with their bytes.
+    files_restored: int = 0
+    file_bytes_restored: int = 0
     # Tombstoned memories of the context the deletion did not tombstone:
     # forgotten earlier, or archived/merged by Sleep. They stay deleted.
     memories_left_deleted: int = 0
@@ -333,6 +349,15 @@ async def restore_deleted_context(
         )
 
     if dry_run:
+        # #1960: files the deletion purged, inside the restore window and not
+        # re-uploaded — counted without touching a row.
+        await _report_files(
+            db,
+            result,
+            workspace,
+            context,
+            await FileStorageService(db).count_restorable_context_files(context),
+        )
         # Ends the read transaction; the CLI holds the session open while the
         # operator answers its prompt.
         await db.rollback()
@@ -354,6 +379,10 @@ async def restore_deleted_context(
     # removed rows, and those cannot come back.
     result.memories_restored = int(cast(CursorResult[Any], restored).rowcount or 0)
 
+    await _report_files(
+        db, result, workspace, context, await FileStorageService(db).restore_context_files(context)
+    )
+
     context.deleted_at = None
     context.deleted_by = None
     context.name = name
@@ -371,17 +400,27 @@ async def restore_deleted_context(
                 "deleted_by": result.deleted_by,
                 "memories_restored": result.memories_restored,
                 "memories_left_deleted": result.memories_left_deleted,
+                "files_restored": result.files_restored,
+                "file_bytes_restored": result.file_bytes_restored,
             },
         )
     )
     try:
         await db.commit()
     except IntegrityError as e:
-        # A context took the name (or the resource) after the check above.
+        # A context took the name (or the resource) after the check above — or,
+        # since the file check (#1960), the same content was uploaded again.
         await db.rollback()
         raise ConflictError(
-            f"Context {context_id} could not be restored: its name or resource is now taken"
+            f"Context {context_id} could not be restored: its name or resource is now "
+            "taken, or one of its files was uploaded again in the meantime; retry"
         ) from e
+
+    if result.file_bytes_restored:
+        # Redis follows the durable DB state (R5), as the purge did in reverse.
+        await storage_quota_service.bump_committed_storage_bytes(
+            workspace_id=context.workspace_id, size_bytes=result.file_bytes_restored
+        )
 
     logger.info(
         "context_restored",
@@ -394,3 +433,51 @@ async def restore_deleted_context(
         actor_id=actor_id,
     )
     return result
+
+
+async def _report_files(
+    db: AsyncSession,
+    result: ContextRestoreResult,
+    workspace: Workspace,
+    context: Context,
+    files: ContextFilesRestore,
+) -> None:
+    """Put the file outcome (#1960) on the result: the counts, and a warning for
+    every way files stay deleted or the restore crowds the storage limit."""
+    result.files_restored = files.restored
+    result.file_bytes_restored = files.bytes_restored
+    if files.left_past_window:
+        result.warnings.append(
+            f"{files.left_past_window} file(s) are not restored: the context was deleted "
+            f"more than {FILE_RESTORE_WINDOW.days} days ago, past the file restore window "
+            "(the GC removes them after 7 days)."
+        )
+    if files.skipped_duplicates:
+        result.warnings.append(
+            f"{files.skipped_duplicates} file(s) are not restored: the same content was "
+            "uploaded again to this workspace since the deletion, and a workspace holds "
+            "one live copy per content hash."
+        )
+    if files.bytes_restored:
+        used = int(
+            await db.scalar(
+                select(WorkspaceStorageUsage.used_bytes).where(
+                    WorkspaceStorageUsage.workspace_id == context.workspace_id
+                )
+            )
+            or 0
+        )
+        # The dry run reads the counter before the restore, the real run after it.
+        after = used if not result.dry_run else used + files.bytes_restored
+        storage_limit = workspace.effective_storage_limit_bytes
+        if 0 <= storage_limit < after:
+            lock = (
+                " The workspace is a capacity-lock candidate (#1941): the lock applies if the "
+                "bytes it counts are over the limit too."
+                if is_lock_candidate(workspace)
+                else ""
+            )
+            result.warnings.append(
+                f"The restore puts stored files at {after} bytes against the plan's "
+                f"{storage_limit}: uploads are refused until files are deleted.{lock}"
+            )

@@ -40,6 +40,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from config.settings import get_settings
 from models.auth import Context, Workspace
@@ -78,6 +79,37 @@ _SHA256_HEX_RE = re.compile(SHA256_HEX_PATTERN)
 _MIME = mimetypes.MimeTypes()
 
 logger = get_logger(__name__)
+
+#: How long a soft-deleted file row (and its R2 object) is kept before the GC
+#: (``tasks/file_tasks.py::sweep_soft_deleted_files``) hard-deletes it.
+FILE_SOFT_DELETE_RETENTION = timedelta(days=7)
+
+#: How long after a context deletion its files can be restored (#1960): one day
+#: less than the retention. The GC removes the R2 object before the row and
+#: takes no row lock, so a restore racing a sweep on the same rows would bring
+#: a row back without its bytes; a full day between the two windows keeps any
+#: restore transaction clear of the nightly sweep.
+FILE_RESTORE_WINDOW = FILE_SOFT_DELETE_RETENTION - timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class ContextFilesRestore:
+    """What a context restore does (or would do) with the context's files (#1960)."""
+
+    restored: int = 0
+    bytes_restored: int = 0
+    #: Files left deleted because the workspace holds a live file with the same
+    #: content hash again (``uq_file_objects_workspace_sha256_active``).
+    skipped_duplicates: int = 0
+    #: Files left deleted because the deletion is older than
+    #: :data:`FILE_RESTORE_WINDOW` (rows the GC has not swept yet; swept ones
+    #: leave no trace and are not counted).
+    left_past_window: int = 0
+
+
+def context_files_past_restore_window(context: Context) -> bool:
+    """True when the context was deleted :data:`FILE_RESTORE_WINDOW` or longer ago."""
+    return context.deleted_at is not None and context.deleted_at <= utcnow() - FILE_RESTORE_WINDOW
 
 
 @dataclass(frozen=True)
@@ -870,8 +902,15 @@ class FileStorageService:
             size_bytes=size,
         )
 
-    async def purge_files_for_contexts(self, context_ids: Sequence[UUID]) -> dict[UUID, int]:
+    async def purge_files_for_contexts(
+        self, context_ids: Sequence[UUID], *, deleted_at: datetime | None = None
+    ) -> dict[UUID, int]:
         """Soft-delete every live file bound to ``context_ids`` (all statuses).
+
+        ``deleted_at`` lets ``ContextService.delete_context`` (#1960) stamp the
+        files with the context's own timestamp, which is how
+        :meth:`restore_context_files` later tells them from files deleted on
+        their own. Defaults to now.
 
         Admin user-erasure hard-deletes the target's contexts, which would
         fire ``file_objects.context_id``'s ``ON DELETE SET NULL`` and silently
@@ -903,8 +942,29 @@ class FileStorageService:
         for each surviving workspace AFTER its commit succeeds (Redis follows
         the DB, R5).
         """
+        _, _, released = await self._purge_live_files(context_ids, deleted_at)
+        return released
+
+    async def purge_context_files(
+        self, context_id: UUID, *, deleted_at: datetime | None = None
+    ) -> tuple[int, int]:
+        """Soft-delete every live file of one context (``DELETE /contexts/{id}/files``, #1960).
+
+        Same rows and accounting as :meth:`purge_files_for_contexts`, reported for
+        the one context: ``(files soft-deleted, Redis bytes to release)``. The count
+        is the purged set's uploaded rows — the files a list shows; cancelled
+        reservations and lingering ``failed`` rows go too, release their bytes, but
+        are not counted — not a separate read a concurrent upload could make disagree.
+        """
+        _, visible, released = await self._purge_live_files([context_id], deleted_at)
+        return visible, sum(released.values())
+
+    async def _purge_live_files(
+        self, context_ids: Sequence[UUID], deleted_at: datetime | None
+    ) -> tuple[list[FileObject], int, dict[UUID, int]]:
+        """Soft-delete the live rows: ``(rows, visible rows among them, Redis bytes per workspace)``."""
         if not context_ids:
-            return {}
+            return [], 0, {}
         # FOR UPDATE locks the rows we are about to cancel so a concurrent
         # confirm_upload (which now also loads its row FOR UPDATE) cannot slip
         # a reserved→uploaded transition in between this SELECT and the caller's
@@ -919,12 +979,13 @@ class FileStorageService:
             .with_for_update()
         )
         files = list(result.scalars().all())
+        visible = sum(1 for f in files if f.status == "uploaded")
         released: dict[UUID, int] = {}
         # Accumulate the workspace_storage_usage delta per workspace and apply it
         # in ONE upsert per workspace after the loop — a bulk purge otherwise
         # issued one UPSERT round-trip per uploaded file (v0.42 review #30).
         usage_delta: dict[UUID, list[int]] = {}  # ws -> [delta_bytes, delta_files]
-        now = utcnow()
+        now = deleted_at or utcnow()
         for file in files:
             file.deleted_at = now
             if file.status == "uploaded":
@@ -951,7 +1012,70 @@ class FileStorageService:
                 file_count=len(files),
                 workspaces=[str(w) for w in released],
             )
-        return released
+        return files, visible, released
+
+    async def restore_context_files(self, context: Context) -> ContextFilesRestore:
+        """Bring back the files a context deletion purged (#1960), if still here.
+
+        A file stamped with the context's own ``deleted_at`` and still
+        ``uploaded`` was soft-deleted by ``delete_context``. It comes back when
+        the deletion is inside :data:`FILE_RESTORE_WINDOW` and no live file in
+        the workspace holds the same content hash again
+        (``uq_file_objects_workspace_sha256_active`` — a re-upload since the
+        deletion keeps the old row deleted). Restored rows get ``deleted_at``
+        cleared and their bytes added back to ``workspace_storage_usage``.
+        Does not commit; the caller bumps the Redis counter after its commit
+        (``storage_quota_service.bump_committed_storage_bytes``).
+        """
+        files, outcome = await self._restorable_context_files(context, lock=True)
+        for file in files:
+            file.deleted_at = None
+        if files:
+            await self._upsert_workspace_usage(
+                context.workspace_id, delta_bytes=outcome.bytes_restored, delta_files=len(files)
+            )
+        return outcome
+
+    async def count_restorable_context_files(self, context: Context) -> ContextFilesRestore:
+        """What :meth:`restore_context_files` would do, without changing a row (dry run)."""
+        _, outcome = await self._restorable_context_files(context, lock=False)
+        return outcome
+
+    async def _restorable_context_files(
+        self, context: Context, *, lock: bool
+    ) -> tuple[list[FileObject], ContextFilesRestore]:
+        """One query: the context's purged files, each with whether a live twin blocks it."""
+        assert context.deleted_at is not None
+        twin = aliased(FileObject)
+        has_live_twin = (
+            select(twin.id)
+            .where(
+                twin.workspace_id == context.workspace_id,
+                func.lower(twin.sha256) == func.lower(FileObject.sha256),
+                twin.deleted_at.is_(None),
+                twin.status != "failed",
+            )
+            .exists()
+            .label("has_live_twin")
+        )
+        stmt = select(FileObject, has_live_twin).where(
+            FileObject.workspace_id == context.workspace_id,
+            FileObject.context_id == context.id,
+            FileObject.deleted_at == context.deleted_at,
+            FileObject.status == "uploaded",
+        )
+        past_window = context_files_past_restore_window(context)
+        if lock and not past_window:
+            stmt = stmt.with_for_update(of=FileObject)
+        rows = (await self.db.execute(stmt)).all()
+        if past_window:
+            return [], ContextFilesRestore(left_past_window=len(rows))
+        files = [file for file, twinned in rows if not twinned]
+        return files, ContextFilesRestore(
+            restored=len(files),
+            bytes_restored=sum(f.size_bytes for f in files),
+            skipped_duplicates=len(rows) - len(files),
+        )
 
     # ------------------------------------------------------------------
     # Counter helper (UPSERT pattern)

@@ -12,7 +12,7 @@ import re
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import ObjectDeletedError
@@ -87,6 +87,9 @@ class ContextService:
             db: SQLAlchemy async session
         """
         self.db = db
+        #: Redis bytes a ``delete_context`` purged, released after the commit
+        #: that made the purge durable (#1960, ``_release_pending_storage``).
+        self._storage_release_pending: dict[UUID, int] = {}
 
     # ========================================================================
     # Collection Name Utilities
@@ -1184,14 +1187,36 @@ class ContextService:
 
         # Optional: delete source (_commit=False for atomic transaction)
         if delete_source:
+            # #1960: the source's files fold into the target with its memories
+            # instead of being purged with the source. Dedup is per workspace,
+            # so re-binding cannot collide; the quota does not move.
+            from models.file_objects import FileObject
+
+            await self.db.execute(
+                update(FileObject)
+                .where(
+                    FileObject.context_id == source_context_id,
+                    FileObject.deleted_at.is_(None),
+                )
+                .values(context_id=target_context_id)
+                .execution_options(synchronize_session=False)
+            )
             await self.delete_context(user_id, source_context_id, _commit=False)
 
-        await self.db.commit()
+        try:
+            await self.db.commit()
+        except Exception:
+            # Nothing was purged, so nothing is released (#1960).
+            self._storage_release_pending = {}
+            raise
 
         # #1798: the source's own points go once the merge is durable — the
         # copies above carry the target's context_id and are not touched.
+        # #1960: the files moved to the target, so nothing is normally pending
+        # here; a reservation that slipped in between is released all the same.
         if delete_source:
             await self._remove_context_points(str(source.workspace_id), str(source_context_id))
+            await self._release_pending_storage()
 
         # `merged` counts ROWS transferred, which is what the caller can see in
         # the context's memory count. It used to count Qdrant points, so a
@@ -1237,6 +1262,13 @@ class ContextService:
         purge; ``services/context_restore.py`` (#1804) brings the context back
         from them and the embedding sweep rebuilds the vectors.
 
+        #1960: the context's files are soft-deleted with it (same timestamp)
+        and their bytes leave the storage quota, so deleting a context frees
+        storage — the capacity-over lock (#1941) lifts without deleting files
+        one by one. The Redis counter is released after the commit
+        (``_release_pending_storage``); a ``_commit=False`` caller does that
+        itself. A restore within the file GC window brings the files back.
+
         Args:
             user_id: User ID (for access verification and audit trail)
             context_id: Context UUID
@@ -1250,6 +1282,9 @@ class ContextService:
             NotFoundException: If context not found
             ValidationError: If trying to delete default context
         """
+        # A previous delete on this service that was rolled back must not
+        # release its bytes with this one.
+        self._storage_release_pending = {}
         context = await self.get_context(user_id, context_id)
 
         # Cannot delete default context
@@ -1275,11 +1310,21 @@ class ContextService:
         memories_to_delete = list(memories_result.scalars().all())
         # #1804: the context and its memories share one timestamp, which is
         # how a restore (services/context_restore.py) tells the memories this
-        # deletion tombstoned from ones forgotten before it.
+        # deletion tombstoned from ones forgotten before it. #1960: the files
+        # are paired the same way, so ``context.deleted_at`` must never be
+        # rewritten while the context is deleted — the files would orphan.
         deleted_at = utcnow()
         for memory in memories_to_delete:
             memory.deleted_at = deleted_at
             memory.deleted_by = user_id
+
+        # #1960: the context's files go with it, stamped alike so a restore
+        # within the GC window finds them (FileStorageService.restore_context_files).
+        from services.file_storage_service import FileStorageService
+
+        self._storage_release_pending = await FileStorageService(self.db).purge_files_for_contexts(
+            [context.id], deleted_at=deleted_at
+        )
 
         # Hard-delete neural edges (no soft-delete needed, reconstructable)
         await self.db.execute(
@@ -1389,8 +1434,29 @@ class ContextService:
 
         if _commit:
             await self._remove_context_points(str(context.workspace_id), str(context_id))
+            await self._release_pending_storage()
 
         return context
+
+    async def _release_pending_storage(self) -> None:
+        """Release the Redis storage counter for the files a delete purged (#1960).
+
+        Runs after the commit that made the soft-deletes durable, so Redis
+        follows the database (the R5 contract ``delete_file`` keeps). A
+        failure here leaves the counter high until the next DB sweep, never
+        low. Clears the pending map so a second call is a no-op.
+        """
+        pending = self._storage_release_pending
+        self._storage_release_pending = {}
+        if not pending:
+            return
+        from services import storage_quota_service
+
+        for workspace_id, size_bytes in pending.items():
+            if size_bytes > 0:
+                await storage_quota_service.release_storage_bytes(
+                    workspace_id=workspace_id, size_bytes=size_bytes
+                )
 
     async def _remove_context_points(self, workspace_id: str, context_id: str) -> None:
         """Remove a deleted context's points from the vector store (#1798).

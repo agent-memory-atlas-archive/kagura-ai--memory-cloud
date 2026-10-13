@@ -30,12 +30,14 @@ from typing import Any, cast
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.base import get_db
 from models.file_objects import FileObject
 from services import storage_quota_service
+from services.file_storage_service import FILE_SOFT_DELETE_RETENTION
 from storage.factory import get_blob_storage
 from utils.datetime import utcnow
 from utils.exceptions import ExternalServiceError
@@ -57,7 +59,7 @@ _ORPHAN_GRACE_SECONDS = 3600
 # are gone. There is currently no user-facing undelete API; if one is
 # added (#563) the retention window's framing will shift to a true
 # user-visible "trash" window with stricter race-window guarantees.
-_GC_RETENTION_SECONDS = 7 * 86400
+_GC_RETENTION_SECONDS = int(FILE_SOFT_DELETE_RETENTION.total_seconds())
 
 
 async def sweep_orphan_files() -> dict[str, int]:
@@ -191,6 +193,21 @@ async def sweep_orphan_files() -> dict[str, int]:
     return counts
 
 
+async def _key_held_by_a_live_row(db: AsyncSession, row: FileObject) -> bool:
+    """True when another, live ``file_objects`` row points at ``row.storage_key``."""
+    holders = await db.scalar(
+        select(func.count())
+        .select_from(FileObject)
+        .where(
+            FileObject.workspace_id == row.workspace_id,
+            FileObject.storage_key == row.storage_key,
+            FileObject.deleted_at.is_(None),
+            FileObject.id != row.id,
+        )
+    )
+    return int(holders or 0) > 0
+
+
 async def sweep_soft_deleted_files() -> dict[str, int]:
     """Hard-delete ``file_objects`` rows soft-deleted past retention + their R2 binaries.
 
@@ -210,10 +227,25 @@ async def sweep_soft_deleted_files() -> dict[str, int]:
     Skips entirely when R2 is unconfigured: we cannot clean up the
     binary, so we must not hard-delete the row that points at it.
 
+    Storage keys are content-addressed (``{workspace}/{sha[:2]}/{sha}``), so a
+    file uploaded again after its first row was soft-deleted shares the R2
+    object with that row. Deleting the object with the old row would break the
+    live re-upload (#1960 review: a context deletion purges many rows at once,
+    and a later re-upload of the same content is the normal way back). A row
+    whose key is still held by a live row is hard-deleted without touching R2
+    (``object_kept_shared``).
+
     Returns:
-        ``{"swept": N, "r2_deleted": N, "r2_failed": N, "hard_deleted_no_r2": N}``
+        ``{"swept": N, "r2_deleted": N, "r2_failed": N, "hard_deleted_no_r2": N,
+        "object_kept_shared": N}``
     """
-    counts = {"swept": 0, "r2_deleted": 0, "r2_failed": 0, "hard_deleted_no_r2": 0}
+    counts = {
+        "swept": 0,
+        "r2_deleted": 0,
+        "r2_failed": 0,
+        "hard_deleted_no_r2": 0,
+        "object_kept_shared": 0,
+    }
     threshold = utcnow() - timedelta(seconds=_GC_RETENTION_SECONDS)
 
     try:
@@ -249,7 +281,9 @@ async def sweep_soft_deleted_files() -> dict[str, int]:
             file_id = str(f.id)
             storage_key = f.storage_key
 
-            if storage_key:
+            if storage_key and await _key_held_by_a_live_row(db, f):
+                counts["object_kept_shared"] += 1
+            elif storage_key:
                 try:
                     await storage.delete_object(storage_key)
                     counts["r2_deleted"] += 1
