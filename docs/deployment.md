@@ -1626,6 +1626,47 @@ PLAN_PRO_OWNED_WORKSPACE_GRANT=4      # L owners may own 1 + 4 = 5 workspaces
 PLAN_PROMAX_OWNED_WORKSPACE_GRANT=49  # XL owners may own 50
 ```
 
+### Migration `e95_1951_memories_ws_not_null` (#1951)
+
+`memories.workspace_id` is `NOT NULL` from this migration on, so every memory
+counts toward its workspace's limits (a row written before migration 063 could
+still carry a NULL and escape them). The migration fills the NULL from the
+memory's context and never rewrites a value that is already set. A row with
+neither a workspace nor a context cannot be placed: one that is already
+soft-deleted is purged (it was only waiting for the tombstone sweep), a live
+one makes the migration **refuse to run** with the count and up to ten ids,
+schema untouched. Check before upgrading:
+
+```sql
+-- live rows the migration cannot place (must be 0 before the upgrade)
+SELECT id, user_id, created_at FROM memories
+WHERE workspace_id IS NULL AND context_id IS NULL AND deleted_at IS NULL;
+
+-- soft-deleted rows with neither: the migration hard-deletes these, whatever
+-- CLEANUP_DELETED_MEMORIES_RETENTION_DAYS says — export the ids first if an
+-- erasure audit needs them
+SELECT id, user_id, deleted_at FROM memories
+WHERE workspace_id IS NULL AND context_id IS NULL AND deleted_at IS NOT NULL;
+
+-- rows the migration will fill (sizes the backfill; each is re-queued for
+-- embedding so its search point gets the workspace payload)
+SELECT count(*) FROM memories WHERE workspace_id IS NULL;
+
+-- audit only: rows whose stored workspace disagrees with their context's.
+-- The migration leaves them as they are; decide separately which side is right.
+SELECT count(*) FROM memories m JOIN contexts c ON c.id = m.context_id
+WHERE m.workspace_id <> c.workspace_id;
+```
+
+Such a live row has no context to restore from: give it a `workspace_id` (and
+a `context_id`) by hand after checking its `user_id`, or delete it, then run
+the migration again. The upgrade is one transaction, so `memories` is locked
+from the `ALTER` to the commit — the backfill touches legacy rows only and the
+`SET NOT NULL` scan is a single pass over the table. The `ALTER` waits at most
+`lock_timeout` (10 s) for a reader to finish; past that the upgrade fails
+without changing anything and you rerun it, rather than every query on
+`memories` queueing behind the lock request.
+
 ### Feature set override (`PLAN_<KEY>_FEATURES`)
 
 A tier's `features` set is env-overridable too. `PLAN_<KEY>_FEATURES` is a
