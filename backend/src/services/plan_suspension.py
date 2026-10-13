@@ -45,6 +45,48 @@ def connectors_suspended(workspace: Workspace) -> bool:
     return workspace.effective_max_connectors <= 0
 
 
+async def connectors_suspended_for(db: AsyncSession, workspace_id: UUID) -> bool:
+    """:func:`connectors_suspended` for a workspace known only by id (#1939).
+
+    A missing workspace row reads as not suspended — the caller's own lookup
+    (a connector row, a key row) already decided the target exists.
+    """
+    workspace = await db.get(Workspace, workspace_id)
+    return workspace is not None and connectors_suspended(workspace)
+
+
+async def connector_key_suspended(db: AsyncSession, connector_id: UUID, workspace_id: UUID) -> bool:
+    """Whether a ``connector:{id}`` API key is paused with its connector (#1944).
+
+    One query: the workspace row joined through its connector. A name that
+    matches no connector OF THIS WORKSPACE resolves to ``False`` — the key is
+    an ordinary workspace key — without a second lookup.
+
+    Reads the plan as the session knows it: like every ``effective_*`` reader,
+    this expects the per-request session (a ``Workspace`` already in the
+    identity map, with its cached tier, is not re-read).
+
+    Args:
+        db: Database session.
+        connector_id: The id parsed from the key name.
+        workspace_id: The key's own workspace scope.
+
+    Returns:
+        True when the connector exists in the workspace and the workspace has
+        no connector seats (:func:`connectors_suspended`).
+    """
+    result = await db.execute(
+        select(Workspace)
+        .join(WorkspaceConnector, WorkspaceConnector.workspace_id == Workspace.id)
+        .where(
+            WorkspaceConnector.id == connector_id,
+            WorkspaceConnector.workspace_id == workspace_id,
+        )
+    )
+    workspace = result.scalar_one_or_none()
+    return workspace is not None and connectors_suspended(workspace)
+
+
 def resources_suspended(workspace: Workspace) -> bool:
     """True when the workspace has no resource-token allowance (resource ingest stops)."""
     return workspace.effective_max_resource_tokens <= 0

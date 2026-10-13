@@ -1289,6 +1289,12 @@ Create a new API key (Admin only).
 
 ⚠️ **Important**: The `key` value is shown only once. Store it securely.
 
+`name` is 1–100 characters. Names starting with `connector:` are reserved for
+the write keys the server mints for ai-worker connectors and are refused with
+`422` ([#1944](https://github.com/kagura-ai/memory-cloud/issues/1944)); the
+same applies to every key created through the API (owner-provisioned member
+keys and public-bound keys included).
+
 ---
 
 ### GET /api/v1/config/api-keys
