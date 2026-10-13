@@ -38,6 +38,7 @@ from models.auth import Context, ExternalAPIKey, User, Workspace
 from models.schemas import OpenAIKeyStatusResponse
 from services.email_service import get_email_service
 from services.permission_service import PermissionService
+from services.plan_suspension import seat_limit
 from services.workspace_ownership_service import WorkspaceOwnershipService
 from services.workspace_service import WorkspaceService
 from utils.auth_helpers import get_user_id
@@ -306,6 +307,9 @@ class WorkspaceMemberResponse(BaseModel):
     user_email: str | None = None
     role: str
     joined_at: str | None
+    # #1943: no seat on the workspace's plan — refused until the plan carries
+    # enough seats or a member is removed (the owner always has a seat).
+    seat_paused: bool = False
     credentials_status: CredentialsStatusInfo | None = None  # New: credentials info
 
     # User activity fields
@@ -630,6 +634,13 @@ async def list_members(
     )
 
     members = await workspace_service.list_members(workspace_id)
+    # #1943: ``list_members`` is ordered by the seat ranking, so the first
+    # ``seat_limit`` rows hold the seats and the rest are paused — the flag
+    # is the row's position, no second query, and it cannot drift from the
+    # order the list is shown in.
+    workspace_row = await db.get(Workspace, workspace_id)
+    seats = seat_limit(workspace_row) if workspace_row is not None else len(members)
+    owner_user_id = workspace_row.owner_user_id if workspace_row is not None else None
 
     # Fetch user details + credentials status for each member
     from sqlalchemy import and_, func
@@ -637,7 +648,7 @@ async def list_members(
     from models.auth import APIKey, OAuth2Client
 
     member_responses = []
-    for m in members:
+    for position, m in enumerate(members):
         # Get user details from database
         user_result = await db.execute(select(User).where(User.user_id == m.user_id))
         user_record = user_result.scalar_one_or_none()
@@ -722,6 +733,11 @@ async def list_members(
                 user_email=user_record.email if user_record else None,
                 role=m.role,
                 joined_at=to_utc_iso(m.joined_at),
+                # #1943: past the seats — unless the row is the owner (role or
+                # ``owner_user_id``), who the refusal never pauses either.
+                seat_paused=position >= seats
+                and m.role != WorkspaceRole.OWNER
+                and m.user_id != owner_user_id,
                 credentials_status=credentials_status,
                 last_login_at=to_utc_iso(user_record.last_login_at) if user_record else None,
                 allowed_context_ids=allowed_context_ids_str,

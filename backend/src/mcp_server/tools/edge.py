@@ -284,6 +284,14 @@ async def handle_create_edge(
             if perm_error:
                 return perm_error
 
+            # #1943: a content write — the context must hold a writable slot on the
+            # plan. After the role gate, so a viewer still gets permission_denied.
+            # Resolved at call time: tests patch and guard the helper at
+            # ``services.plan_suspension``.
+            from services.plan_suspension import ensure_context_writable
+
+            await ensure_context_writable(db, context)
+
             ws_id = str(workspace_id) if workspace_id else str(context.workspace_id)
             ctx_id = str(current_context_id)
 
@@ -394,6 +402,14 @@ async def handle_update_edge(
             perm_error = await _check_viewer_permission(db, user_id, workspace_id, "update edges")
             if perm_error:
                 return perm_error
+
+            # #1943: a content write — the context must hold a writable slot on the
+            # plan. After the role gate, so a viewer still gets permission_denied.
+            # Resolved at call time: tests patch and guard the helper at
+            # ``services.plan_suspension``.
+            from services.plan_suspension import ensure_context_writable
+
+            await ensure_context_writable(db, context)
 
             ws_id = str(workspace_id) if workspace_id else str(context.workspace_id)
             ctx_id = str(current_context_id)

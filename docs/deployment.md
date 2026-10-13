@@ -1586,6 +1586,8 @@ runs, so re-subscribing resumes everything with no further action.
 | `max_resource_tokens` | ingest on ordinary resource tokens (REST and MCP `ingest_events`, `FEAT-001`), indexing | the tokens and resources |
 | `sleep_enabled_contexts_limit` | Sleep's LLM phases (nightly and admin-triggered); a `full` context still runs the non-LLM retention purges | each context's `sleep_mode` |
 | `public_calls_per_day` | anonymous public `search` / `info` answer `429` (`api_public_daily`), as bound keys and signed-in callers already did | `is_public` and bound keys |
+| `max_members_per_workspace` below the member count ([#1943](https://github.com/kagura-ai/memory-cloud/issues/1943)) | the members without a seat are refused (`403` `FEAT-001`, `feature: members`) after membership and role — seats go to the owner first, then the earliest joined; a non-member keeps its usual refusal | every membership row; the owner can remove members or upgrade, and the members list marks `seat_paused` |
+| `max_contexts_per_workspace` below the live context count ([#1943](https://github.com/kagura-ai/memory-cloud/issues/1943)) | content writes into the contexts beyond the oldest N (`remember`, updates, agent state, edges, uploads, feedback) are refused (`403` `FEAT-001`, `feature: contexts`); reads, listing, export, delete and metadata updates keep working | every context; the contexts list marks `writes_paused`, and deleting an older context frees its slot |
 
 Pending resource events are never dropped: a held-back batch stays queued and
 is retried hourly. Resource ingest also honours the workspace `memory_limit`
@@ -1598,10 +1600,18 @@ batch of only updates and deletes is never held back. `M` keeps
 anonymous public serving are suspended there too — except that a tier whose
 `PLAN_<KEY>_FEATURES` includes `public_contexts` keeps serving its public
 contexts anonymously (`public_calls_per_day` itself has no override).
-`GET /api/v1/workspaces/{id}/plan` lists what is suspended in `suspended`
+The same evaluation applies between paid tiers (an XL → L drop seats the first 10 members and
+keeps the oldest 20 contexts writable), and to an admin-managed Free workspace with several
+members.
+
+**Before upgrading a self-hosted deployment** whose Free workspaces hold more than one member
+or context (a team on the default Free workspace, say): set `PLAN_FREE_MAX_MEMBERS_PER_WORKSPACE`
+/ `PLAN_FREE_MAX_CONTEXTS_PER_WORKSPACE` to what they hold first. There is no grace period — the
+seats and slots take effect on the first request after the upgrade, and every member but the owner
+of an over-cap Free workspace would answer `403 FEAT-001` until the cap is raised or members are
+removed. Nothing is deleted either way. `GET /api/v1/workspaces/{id}/plan` lists what is suspended in `suspended`
 (only features the workspace still has something for), and the web UI shows
-the owner a banner. Members, contexts beyond the cap and partial overage
-between paid tiers are not suspended.
+the owner a banner.
 
 Override via environment variables (`PLAN_<KEY>_<FIELD>`, key upper-cased):
 

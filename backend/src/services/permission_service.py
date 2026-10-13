@@ -19,9 +19,10 @@ from auth.workspace_roles import (
 from auth.workspace_roles import (
     WORKSPACE_ROLE_WEIGHTS as ORG_ROLE_WEIGHTS,
 )
-from models.auth import Context, ContextMember, WorkspaceMember
+from models.auth import Context, ContextMember, Workspace, WorkspaceMember
 from services.capacity_lock import CapacityPolicy, ensure_not_capacity_locked
 from services.identity_link_service import is_same_owner, owned_by
+from services.plan_suspension import ensure_context_writable, ensure_member_seated
 from services.workspace_service import WorkspaceService
 from utils.exceptions import AuthorizationError, NotFoundException
 from utils.logger import get_logger
@@ -115,8 +116,6 @@ class PermissionService:
         # Issue #276: Verify workspace exists and is not deleted
         from sqlalchemy import select
 
-        from models.auth import Workspace
-
         workspace_result = await self.db.execute(
             select(Workspace).where(
                 Workspace.id == workspace_id,
@@ -154,6 +153,10 @@ class PermissionService:
                 reason="role_too_low",
             )
 
+        # #1943: a member without a seat on the workspace's plan is refused —
+        # after membership and role, so a non-member keeps the uniform refusal.
+        await ensure_member_seated(self.db, workspace, member)
+
         return member
 
     async def resolve_resource_by_slug(
@@ -189,7 +192,8 @@ class PermissionService:
             - Delegates final authorization to ``check_workspace_access`` so
               the workspace-deleted / non-member / role-too-low paths surface
               uniformly.
-            - Returns **404** on "not found OR not accessible" — never 403.
+            - Returns **404** on "not found OR not accessible" — never 403,
+              except a member without a seat on the plan (``FEAT-001``, #1943).
               A 403 would leak existence across workspace boundaries
               (CWE-639 / OWASP A01). The detail string is intentionally
               indistinguishable from a completely unknown slug.
@@ -306,6 +310,10 @@ class PermissionService:
                 a member of its owning workspace with the required role.
                 The uniform 404 hides whether the context exists in another
                 workspace (CWE-639 / OWASP A01).
+            FeatureNotAvailableError: the caller IS a member of the owning
+                workspace but holds no seat on its plan (#1943, FEAT-001
+                ``members``) — raised after membership is established, so it
+                never answers for a context in someone else's workspace.
         """
         context_result = await self.db.execute(
             select(Context).where(
@@ -435,6 +443,9 @@ class PermissionService:
         # the caller gets the full refusal (counts and cleanup URL).
         if capacity is not CapacityPolicy.ALLOWED:
             await ensure_not_capacity_locked(self.db, context.workspace_id)
+            # #1943: a content write into a context without a writable slot.
+            if access == "write":
+                await ensure_context_writable(self.db, context)
 
         return context
 
@@ -610,6 +621,9 @@ class PermissionService:
         # without a membership row.
         if capacity is not CapacityPolicy.ALLOWED:
             await ensure_not_capacity_locked(self.db, context.workspace_id, user_id=user_id)
+            # #1943: a content write into a context without a writable slot.
+            if access == "write":
+                await ensure_context_writable(self.db, context)
 
         return context, effective_role
 
@@ -670,6 +684,10 @@ class PermissionService:
 
         if not workspace_member:
             raise AuthorizationError("Insufficient permissions")
+
+        # #1943: the seat check sits right after the membership row, before the
+        # owner/admin bypass (the owner always has a seat; no query for them).
+        await ensure_member_seated(self.db, context.workspace_id, workspace_member)
 
         # Workspace owner/admin → bypass context checks (full access)
         # Note: allowed_context_ids is ignored for owner/admin
@@ -1102,7 +1120,19 @@ class PermissionService:
 
         # Owner can always access their own memories (RBAC), but the binding
         # still subtracts.
+        async def _seat_held() -> None:
+            # #1943: a member without a seat on the plan is refused here too —
+            # the REST memory-id routes (reference / patch / explore) authorize
+            # through this method alone. A caller with no membership row (an
+            # author who left) keeps the pre-existing semantics.
+            member = await self.workspace_service.get_member(
+                workspace_id, user_id, raise_if_not_found=False
+            )
+            if member is not None:
+                await ensure_member_seated(self.db, workspace_id, member)
+
         if user_id == memory_user_id:
+            await _seat_held()
             return await _binding_ok()
 
         # Check if context is shared
@@ -1132,7 +1162,11 @@ class PermissionService:
             return False
 
         # Shared context: check workspace membership, then the binding.
-        if not await self.is_workspace_member(user_id, workspace_id):
+        shared_member = await self.workspace_service.get_member(
+            workspace_id, user_id, raise_if_not_found=False
+        )
+        if shared_member is None:
             await _emit_rbac_denied()
             return False
+        await ensure_member_seated(self.db, workspace_id, shared_member)  # #1943
         return await _binding_ok()

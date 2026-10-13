@@ -496,6 +496,10 @@ async def _resolve_context_for_read(
     same uniform context_not_found shape (CWE-639 / OWASP A01 uniform
     disclosure) regardless of the underlying deny reason (not found, private
     non-creator, not a workspace member, member-suspended, whitelist miss).
+    One exception by design (#1943): a member of the owning workspace whose
+    plan gives them no seat is refused with ``FeatureNotAvailableError``
+    (FEAT-001 ``members``) — raised after membership is established, so an
+    outsider still sees the uniform not-found.
 
     The ``required_role="viewer"`` default matches the HTTP ``/graph/*`` and
     ``/memory/stats`` reference implementations — writers should pass ``admin``
@@ -517,7 +521,7 @@ async def _resolve_context_for_read(
         # binding filter so an enforce-mode hard deny at THIS pre-gate — which
         # stops the request before any service-layer gate — still persists
         # its denied row (the MCP read face of the #1291/#1292 parity lesson).
-        return await PermissionService(db).resolve_context_for_workspace_read(
+        context = await PermissionService(db).resolve_context_for_workspace_read(
             user_id=user_id,
             context_id=context_id,
             required_role=required_role,
@@ -532,6 +536,7 @@ async def _resolve_context_for_read(
             context_id,
             "Context not found or you don't have access to it.",
         ) from exc
+    return context
 
 
 async def _touch_context_last_used(db: "AsyncSession", context: Any) -> bool:
@@ -693,7 +698,16 @@ async def _get_workspace_member_role(
         )
     )
     member = result.scalar_one_or_none()
-    return member.role if member else None
+    if member is None:
+        return None
+    # #1943: a member without a seat on the plan is refused (FEAT-001), after
+    # membership — the dispatcher's exception mapper renders the same envelope
+    # as the other plan pauses.
+    # Resolved at call time on purpose (tests patch/guard ``services.plan_suspension``).
+    from services.plan_suspension import ensure_member_seated
+
+    await ensure_member_seated(db, workspace_id, member)
+    return member.role
 
 
 async def _check_workspace_membership(

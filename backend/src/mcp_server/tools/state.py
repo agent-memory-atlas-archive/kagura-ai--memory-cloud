@@ -105,6 +105,14 @@ async def handle_set_state(
         if perm_error:
             return perm_error
 
+        # #1943: a content write — the context must hold a writable slot on the
+        # plan. After the role gate, so a viewer still gets permission_denied.
+        # Resolved at call time: tests patch and guard the helper at
+        # ``services.plan_suspension``.
+        from services.plan_suspension import ensure_context_writable
+
+        await ensure_context_writable(db, context)
+
         # Issue #1275: agent-state is a WRITE against the context — apply the
         # subtractive binding gate so a read-only-bound agent (can_read=true,
         # write_policy='deny') cannot mutate state in a context whose binding
