@@ -32,6 +32,7 @@ from models.schemas import (
     ResourceEventRequest,
     ResourceEventResponse,
 )
+from services.capacity_lock import ensure_not_capacity_locked
 from services.connector_provisioning import (
     get_connector_id_for_resource_pk,
     validate_connector_idempotency_key,
@@ -154,6 +155,11 @@ async def verify_resource_token(
     workspace = await db.get(Workspace, context.workspace_id)
     if workspace is not None:
         await ensure_ingest_allowed(db, workspace, token_record.resource_pk)
+        # #1941/#1948: ingest writes memory content, like MCP ingest_events
+        # (blocked at the dispatcher). The membership gate above proved the
+        # token's creator is a member, so the refusal is the full form (counts
+        # and cleanup URL) with no further membership read.
+        await ensure_not_capacity_locked(db, workspace)
 
     return token_record, token_record.quota_events_per_hour, context
 
