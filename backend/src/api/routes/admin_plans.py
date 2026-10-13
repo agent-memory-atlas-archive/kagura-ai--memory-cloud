@@ -33,10 +33,10 @@ from models.auth import (
     WorkspaceInvitation,
     WorkspaceMember,
 )
-from models.memory import Memory
 from models.resource import WorkspaceAddon  # Issue #665: row-based admin grants
 from services.addon_calculator_service import ADDON_UNIT_VALUES, AddonCalculatorService
 from services.effective_quota_service import EffectiveQuotaService
+from services.memory_counts import count_live_memories, live_memory_counts_by_workspace
 from utils import db_transaction
 from utils.datetime import to_utc_iso, utcnow
 from utils.logger import get_logger
@@ -348,31 +348,10 @@ async def list_workspaces_with_plans(
 
         workspace_infos = []
 
-        # Critical Fix: Avoid N+1 query - fetch all workspace members and memories in bulk
+        # Avoid an N+1: one grouped memory count for every listed workspace
+        # (the shared predicate, #1946).
         workspace_ids = [w.id for w in workspaces]
-
-        # Fetch all members for all workspaces in one query
-        all_members_result = await db.execute(
-            select(WorkspaceMember).where(WorkspaceMember.workspace_id.in_(workspace_ids))
-        )
-        members_by_workspace = {}
-        for member in all_members_result.scalars():
-            if member.workspace_id not in members_by_workspace:
-                members_by_workspace[member.workspace_id] = []
-            members_by_workspace[member.workspace_id].append(member.user_id)
-
-        # Fetch all memory counts grouped by workspace
-        memory_counts_result = await db.execute(
-            select(Memory.workspace_id, func.count(Memory.id).label("memory_count"))
-            .where(
-                Memory.workspace_id.in_(workspace_ids),
-                Memory.deleted_at.is_(None),
-            )
-            .group_by(Memory.workspace_id)
-        )
-        memory_counts_by_workspace = {
-            row.workspace_id: row.memory_count for row in memory_counts_result.all()
-        }
+        memory_counts_by_workspace = await live_memory_counts_by_workspace(db, workspace_ids)
 
         for workspace in workspaces:
             total_memories = memory_counts_by_workspace.get(workspace.id, 0)
@@ -746,14 +725,8 @@ async def get_workspace_quotas(
         effective_service = EffectiveQuotaService(db)
         effective = await effective_service.get_effective_quotas(ws_uuid)
 
-        # Get usage: memories count
-        memory_count_result = await db.execute(
-            select(func.count(Memory.id)).where(
-                Memory.workspace_id == ws_uuid,
-                Memory.deleted_at.is_(None),
-            )
-        )
-        memory_count = memory_count_result.scalar() or 0
+        # Get usage: memories count (the shared workspace-scoped count, #1946)
+        memory_count = await count_live_memories(db, ws_uuid)
 
         # Get usage: context count (non-deleted only)
         context_count_result = await db.execute(
@@ -1025,13 +998,7 @@ async def _count_addon_usage(db: AsyncSession, workspace_id: UUID, guard_kind: s
         )
         return result.scalar() or 0
     if guard_kind == "memory":
-        result = await db.execute(
-            select(func.count(Memory.id)).where(
-                Memory.workspace_id == workspace_id,
-                Memory.deleted_at.is_(None),
-            )
-        )
-        return result.scalar() or 0
+        return await count_live_memories(db, workspace_id)
     if guard_kind == "sleep_contexts":
         result = await db.execute(
             select(func.count(Context.id)).where(

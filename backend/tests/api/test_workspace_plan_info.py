@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -67,8 +68,15 @@ def _result(**attrs: object) -> MagicMock:
     return result
 
 
+class PlanClient(NamedTuple):
+    """The test client plus the DB stub it was built with (to count queries)."""
+
+    http: TestClient
+    db: MagicMock
+
+
 @pytest.fixture
-def make_client() -> Iterator[Callable[[str], TestClient]]:
+def make_client() -> Iterator[Callable[..., PlanClient]]:
     async def mock_session():
         return {"user_id": "owner-1", "email": "owner@test.invalid"}
 
@@ -82,14 +90,14 @@ def make_client() -> Iterator[Callable[[str], TestClient]]:
     )
     suspended = suspended_patcher.start()
 
-    def _make(plan_name: str) -> TestClient:
+    def _make(plan_name: str, *, memories: int = 0) -> PlanClient:
         db = MagicMock()
-        # Route order: workspace row → member ids (empty, so the memory count
-        # query is skipped) → context count.
+        # Route order: workspace row → workspace-scoped memory count (#1946, no
+        # member lookup any more) → context count.
         db.execute = AsyncMock(
             side_effect=[
                 _result(scalar_one_or_none=_workspace(plan_name)),
-                _result(all=[]),
+                _result(scalar=memories),
                 _result(scalar=0),
             ]
         )
@@ -99,7 +107,7 @@ def make_client() -> Iterator[Callable[[str], TestClient]]:
 
         app.dependency_overrides[require_session_auth] = mock_session
         app.dependency_overrides[get_db] = mock_db
-        return TestClient(app, raise_server_exceptions=False)
+        return PlanClient(TestClient(app, raise_server_exceptions=False), db)
 
     _make.suspended = suspended  # type: ignore[attr-defined]
     yield _make
@@ -109,7 +117,7 @@ def make_client() -> Iterator[Callable[[str], TestClient]]:
 
 
 def test_quotas_carry_the_resource_token_serve_caps(make_client) -> None:
-    resp = make_client("pro").get(ENDPOINT)
+    resp = make_client("pro").http.get(ENDPOINT)
     assert resp.status_code == 200, resp.text
     quotas = resp.json()["quotas"]
 
@@ -124,14 +132,14 @@ def test_quotas_carry_the_resource_token_serve_caps(make_client) -> None:
 
 
 def test_quotas_shape_matches_the_frontend_type(make_client) -> None:
-    resp = make_client("promax").get(ENDPOINT)
+    resp = make_client("promax").http.get(ENDPOINT)
     assert resp.status_code == 200, resp.text
     assert set(resp.json()["quotas"]) == FRONTEND_QUOTA_KEYS
 
 
 def test_plan_carries_no_price(make_client) -> None:
     """#1733: the billing service owns prices; this payload names the plan only."""
-    resp = make_client("pro").get(ENDPOINT)
+    resp = make_client("pro").http.get(ENDPOINT)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["current_plan"] == "pro"
@@ -141,13 +149,23 @@ def test_plan_carries_no_price(make_client) -> None:
 def test_plan_lists_the_suspended_features(make_client) -> None:
     """#1939: the web UI's "features paused" banner reads this list."""
     make_client.suspended.return_value = ["connectors", "sleep"]
-    resp = make_client("free").get(ENDPOINT)
+    resp = make_client("free").http.get(ENDPOINT)
     assert resp.status_code == 200, resp.text
     assert resp.json()["suspended"] == ["connectors", "sleep"]
     make_client.suspended.assert_awaited_once()
 
 
 def test_paid_plan_lists_nothing_suspended(make_client) -> None:
-    resp = make_client("promax").get(ENDPOINT)
+    resp = make_client("promax").http.get(ENDPOINT)
     assert resp.status_code == 200, resp.text
     assert resp.json()["suspended"] == []
+
+
+def test_usage_memories_is_the_workspace_scoped_count(make_client) -> None:
+    """#1946: ``usage.memories`` is the same count the remember gate compares
+    against the limit — three queries, none of them a member lookup."""
+    client = make_client("free", memories=7)
+    resp = client.http.get(ENDPOINT)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["usage"]["memories"] == 7
+    assert client.db.execute.await_count == 3

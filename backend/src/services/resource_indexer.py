@@ -21,7 +21,7 @@ from uuid import NAMESPACE_DNS, UUID, uuid4, uuid5  # Issue #262: uuid5 for dete
 
 # Third-party imports (PEP8)
 from qdrant_client.models import PointStruct, SparseVector
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Local application imports (PEP8)
@@ -38,6 +38,7 @@ from models.memory import (  # Issue #262: Memory model for resource data storag
 from models.resource import IndexerState, Resource, ResourceEvent, ResourceSchema
 from services.context_routing import resolve_context_routing
 from services.embedding_service import EmbeddingService
+from services.memory_counts import count_live_memories
 from services.plan_suspension import ingest_suspended
 from services.quota_service import QuotaService
 from utils.datetime import to_utc_iso, utcnow
@@ -688,12 +689,10 @@ class ResourceIndexer:
     async def _workspace_memory_room(self, workspace_id: UUID) -> int:
         """How many more memories the workspace may hold (#1939).
 
-        The workspace's OWN live memories (``Memory.workspace_id`` match,
-        not soft-deleted) against ``Workspace.effective_memory_limit``.
-        Deliberately not ``QuotaService.check_memory_quota``'s member-join
-        count, which also counts the members' memories in other workspaces
-        and so could hold a small workspace's ingest back for good. No row
-        lock: the batch embeds for a while after this read.
+        The workspace's live memories (``services.memory_counts``, the same
+        count the remember gate uses since #1946) against
+        ``Workspace.effective_memory_limit``. No row lock: the batch embeds
+        for a while after this read.
 
         Returns:
             ``limit - live``; zero or negative when the workspace is full or
@@ -702,14 +701,7 @@ class ResourceIndexer:
         workspace = await self.db.get(Workspace, workspace_id)
         if workspace is None:
             return 0
-        live = (
-            await self.db.execute(
-                select(func.count(Memory.id)).where(
-                    Memory.workspace_id == workspace_id,
-                    Memory.deleted_at.is_(None),
-                )
-            )
-        ).scalar() or 0
+        live = await count_live_memories(self.db, workspace_id)
         return workspace.effective_memory_limit - live
 
     async def _plan_suspended(self, context: Context, resource_pk: UUID) -> bool:
