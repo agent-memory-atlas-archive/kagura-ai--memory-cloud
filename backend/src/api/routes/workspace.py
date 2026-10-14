@@ -426,13 +426,26 @@ async def get_workspace_usage_current(
         public_calls_week = usage.public_week
         rest_calls_week = usage.rest_week
 
+        from config.settings import get_settings
         from services.capacity_lock import capacity_lock_state
+        from services.capacity_purge import purge_at
 
         lock = await capacity_lock_state(db, workspace)
+        # No deletion date while the purge is off: it would not happen then.
+        deletion = (
+            purge_at(workspace.capacity_locked_since)
+            if get_settings().capacity_purge_enabled
+            else None
+        )
+        lock_info = (
+            CapacityLockInfo(**lock.as_dict(), purge_at=to_utc_iso(deletion))
+            if lock is not None
+            else None
+        )
 
         # Build response with aggregated data and effective limits (base + addons)
         return UsageCurrentResponse(
-            capacity_lock=CapacityLockInfo(**lock.as_dict()) if lock is not None else None,
+            capacity_lock=lock_info,
             plan=PlanLimits(
                 plan_name=workspace.plan_name,
                 memory_limit=effective_memory_limit,

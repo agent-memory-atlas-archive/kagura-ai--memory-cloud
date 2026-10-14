@@ -1818,6 +1818,23 @@ class Workspace(Base):
         String(32), nullable=False, server_default=ENTITLEMENT_SOURCE_ADMIN_GRANT
     )
 
+    # #1969: when the daily capacity sweep first saw this Free, billing-managed
+    # workspace over the Free capacity (naive UTC). Cleared by the same sweep
+    # once it is within capacity again or no longer a lock candidate, so the
+    # 30-day purge clock restarts after a cleanup or a re-subscription. NULL
+    # for every paid, admin-managed or self-hosted workspace.
+    capacity_locked_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # #1969: when the day-29 "1 day left" mail of the current lock went out
+    # (or may have: delivery uncertain), naive UTC. The purge runs only on a
+    # later calendar day, so no data is deleted without that final warning.
+    # Cleared together with ``capacity_locked_since``.
+    capacity_purge_final_notice_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # #1969: when the first countdown mail of the current lock went out (or
+    # may have), naive UTC. The purge also needs it at least 7 calendar days
+    # earlier, so a late-enabled notice flag never yields a one-day warning.
+    # Cleared together with ``capacity_locked_since``.
+    capacity_purge_first_notice_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     # Issue #709: Per-workspace embedding spend caps (USD, BYOK-only). NULL =
     # "inherit tier default from ``PlanTier.embedding_*_cap_usd``"; non-NULL =
     # admin-set override. These are **override** columns (REPLACE the tier
@@ -2097,6 +2114,13 @@ class Workspace(Base):
         # ``workspace_slot_bonus_nonneg`` precedent; tests/test_schema_drift.py
         # verifies the SQL text matches the migration's ADD CONSTRAINT.
         CheckConstraint("referral_memory_bonus >= 0", name="referral_memory_bonus_nonneg"),
+        # #1969: the capacity-purge sweep reads stamped rows only; kept in
+        # lockstep with alembic e96_1969_ws_cap_locked_since.
+        Index(
+            "ix_workspaces_capacity_locked_since",
+            "capacity_locked_since",
+            postgresql_where=text("capacity_locked_since IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
