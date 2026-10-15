@@ -225,6 +225,27 @@ class Settings(BaseSettings):
         ),
     )
 
+    scheduler_leader_retry_seconds: int = Field(
+        default=60,
+        ge=5,
+        description=(
+            "How often a standby API worker retries the APScheduler leader lock "
+            "(#1980). Only the lock holder runs the background cron jobs, so "
+            "after the leader process dies another worker takes over within "
+            "this interval."
+        ),
+    )
+    scheduler_leader_ping_seconds: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "How often the APScheduler leader checks that its lock connection is "
+            "alive (#1980). After a Postgres restart the old leader keeps "
+            "dispatching jobs for at most this long plus 15 s while a standby "
+            "may already hold the lock."
+        ),
+    )
+
     # OAuth2 - Google
     google_client_id: str = Field(default="", description="Google OAuth2 Client ID")
     google_client_secret: str = Field(default="", description="Google OAuth2 Client Secret")
@@ -504,7 +525,7 @@ class Settings(BaseSettings):
         description="Seconds a caller waits for a free pooled Redis connection (Issue #1556)",
     )
 
-    # PostgreSQL connection pool (Issue #1978). Both ``db.base`` engines — the
+    # PostgreSQL connection pool (Issue #1980). Both ``db.base`` engines — the
     # async application engine and the sync OAuth2 engine — use these values,
     # so one process can hold up to ``2 * (db_pool_size + db_max_overflow)``
     # connections. A request waits up to ``db_pool_timeout`` seconds for a
@@ -520,18 +541,34 @@ class Settings(BaseSettings):
     db_pool_size: int = Field(
         default=5,
         ge=1,
-        description="Persistent pooled PostgreSQL connections per engine (Issue #1978)",
+        description="Persistent pooled PostgreSQL connections per engine (Issue #1980)",
     )
     db_max_overflow: int = Field(
         default=10,
         ge=0,
-        description="Extra PostgreSQL connections per engine beyond db_pool_size (Issue #1978)",
+        description="Extra PostgreSQL connections per engine beyond db_pool_size (Issue #1980)",
     )
     db_pool_timeout: float = Field(
         default=30.0,
         gt=0,
-        description="Seconds a request waits for a free pooled PostgreSQL connection (Issue #1978)",
+        description="Seconds a request waits for a free pooled PostgreSQL connection (Issue #1980)",
     )
+
+    @model_validator(mode="after")
+    def _db_pool_leaves_a_request_connection(self) -> "Settings":
+        """Refuse a pool the scheduler leader would fill on its own (#1980).
+
+        The leader holds one pooled connection for the process lifetime, so a
+        pool of exactly one connection (``DB_POOL_SIZE=1``, ``DB_MAX_OVERFLOW=0``)
+        would leave requests and ``/readiness`` waiting on it forever once this
+        process becomes leader.
+        """
+        if self.db_pool_size + self.db_max_overflow < 2:
+            raise ValueError(
+                "DB_POOL_SIZE + DB_MAX_OVERFLOW must be at least 2: the scheduler "
+                "leader keeps one pooled connection, requests need another"
+            )
+        return self
 
     # API Settings
     api_host: str = Field(default="0.0.0.0", description="API host")

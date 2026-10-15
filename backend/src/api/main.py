@@ -94,45 +94,31 @@ async def lifespan(app: FastAPI):
         except Exception as e:  # noqa: BLE001 — startup must not die on a pricing sync
             logger.error("llm_pricing_overrides_sync_failed", error=str(e))
 
-    # Start background task scheduler
-    from tasks import (
-        get_scheduler,
-        schedule_bm25_drift_tasks,
-        schedule_capacity_purge_tasks,
-        schedule_credentials_tasks,
-        schedule_device_code_tasks,
-        schedule_email_action_token_tasks,
-        schedule_embedding_tasks,
-        schedule_erasure_tasks,
-        schedule_file_tasks,
-        schedule_known_device_tasks,
-        schedule_mcp_tasks,
-        schedule_neural_tasks,
-        schedule_resource_indexer_jobs,
-        schedule_security_notification_tasks,
-        schedule_semantic_edge_reverify_tasks,
-        schedule_sleep_tasks,
-        start_scheduler,
-    )
+    # Start background task scheduler — in ONE process of the deployment
+    # (#1980). With UVICORN_WORKERS > 1 every worker runs this lifespan; the
+    # Postgres advisory-lock leader registers the jobs and starts APScheduler,
+    # the other workers stand by and take over when the leader dies. start()
+    # only creates the background loop (its first tick tries the lock), so
+    # startup never waits on Postgres. The leader object (and through it the
+    # loop task) is held strongly on app.state.
+    from tasks import register_scheduled_jobs
+    from tasks.scheduler_leader import SchedulerLeader
 
-    scheduler = get_scheduler()
-    schedule_neural_tasks(scheduler)
-    schedule_mcp_tasks(scheduler)
-    schedule_credentials_tasks(scheduler)
-    schedule_device_code_tasks(scheduler)
-    schedule_security_notification_tasks(scheduler)
-    schedule_email_action_token_tasks(scheduler)
-    schedule_known_device_tasks(scheduler)
-    schedule_embedding_tasks(scheduler)
-    schedule_resource_indexer_jobs(scheduler)
-    schedule_sleep_tasks(scheduler)
-    schedule_bm25_drift_tasks(scheduler)
-    schedule_erasure_tasks(scheduler)
-    schedule_file_tasks(scheduler)
-    schedule_capacity_purge_tasks(scheduler)
-    schedule_semantic_edge_reverify_tasks(scheduler)
-    start_scheduler()
-    logger.info("background_tasks_scheduled")
+    scheduler_leader = SchedulerLeader(
+        register_jobs=register_scheduled_jobs,
+        retry_seconds=get_settings().scheduler_leader_retry_seconds,
+        ping_seconds=get_settings().scheduler_leader_ping_seconds,
+    )
+    app.state.scheduler_leader = scheduler_leader
+    await scheduler_leader.start()
+    logger.info("background_tasks_scheduled", scheduler_leader="pending")
+
+    # MCP session cleanup runs in EVERY worker (#1980): it cleans this
+    # process's own session table, which the scheduler leader cannot reach.
+    # Strong reference on app.state (the loop holds tasks only weakly).
+    from tasks.mcp_tasks import start_local_session_cleanup
+
+    app.state.mcp_session_cleanup_task = start_local_session_cleanup()
 
     # WHERE axis (#1332): one-shot geo payload backfill for points embedded
     # before the location payload existed. Best-effort — but hold a strong
@@ -160,10 +146,20 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             logger.info("geo_payload_backfill_cancelled_on_shutdown")
 
-    # Stop scheduler
-    from tasks import shutdown_scheduler
+    # Stop this worker's MCP session cleanup loop (#1980).
+    cleanup_task = getattr(app.state, "mcp_session_cleanup_task", None)
+    if cleanup_task is not None and not cleanup_task.done():
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass  # expected: we cancelled it ourselves
 
-    shutdown_scheduler()
+    # Stop the leader loop and scheduler, release the leader lock (#1980).
+    # Before close_db(): the lock connection belongs to the engine's pool.
+    scheduler_leader = getattr(app.state, "scheduler_leader", None)
+    if scheduler_leader is not None:
+        await scheduler_leader.stop()
     logger.info("scheduler_stopped")
 
     # Release blob storage (Issue #485)
@@ -605,7 +601,7 @@ def _database_unavailable_response(
     Args:
         request: The failing request.
         exc: The exception that reached the handler.
-        reason: Cause reported as ``details.reason`` and in the log (#1978),
+        reason: Cause reported as ``details.reason`` and in the log (#1980),
             so pool exhaustion is told apart from the database being down
             without changing the frozen ``DB-002`` code, status or message.
 

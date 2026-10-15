@@ -2118,7 +2118,7 @@ With it set, Sleep's judge calls on the managed lane also pass
 not deleted for you: each workspace owner can still list and delete their own
 stored keys (#1613).
 
-## Database Connection Pool — Issue #1978
+## Database Connection Pool — Issue #1980
 
 Each API process opens PostgreSQL connections through SQLAlchemy's `QueuePool` (`backend/src/db/base.py`). Three variables size it:
 
@@ -2128,13 +2128,125 @@ Each API process opens PostgreSQL connections through SQLAlchemy's `QueuePool` (
 | `DB_MAX_OVERFLOW` | `10` | Extra connections opened under load and closed again when returned (minimum `0`). |
 | `DB_POOL_TIMEOUT` | `30` | Seconds a request waits for a free connection once `DB_POOL_SIZE + DB_MAX_OVERFLOW` are checked out (must be greater than `0`). |
 
-`DB_POOL_SIZE=0` and `DB_MAX_OVERFLOW=-1`, which SQLAlchemy reads as "unlimited", are refused at startup, and so is `DB_POOL_TIMEOUT=0`: the async pool's timed checkout cancels a zero-second wait before it can take an idle connection, so every request would read as `pool_exhausted`. For fail-fast behaviour use a small positive value such as `1`. Keep `DB_POOL_SIZE + DB_MAX_OVERFLOW` at `15` or more: the analysis labeler borrows up to 8 connections at once next to its orchestrator session, and the API logs `database_pool_below_fanout` at startup when the configured pool is smaller than that.
+`DB_POOL_SIZE=0` and `DB_MAX_OVERFLOW=-1`, which SQLAlchemy reads as "unlimited", are refused at startup, and so is `DB_POOL_TIMEOUT=0`: the async pool's timed checkout cancels a zero-second wait before it can take an idle connection, so every request would read as `pool_exhausted`. For fail-fast behaviour use a small positive value such as `1`. `DB_POOL_SIZE + DB_MAX_OVERFLOW` must be at least `2`, because the scheduler leader keeps one pooled connection for the process lifetime and requests need another. Keep it at `15` or more: the analysis labeler borrows up to 8 connections at once next to its orchestrator session, and the API logs `database_pool_below_fanout` at startup when the configured pool is smaller than that.
 
 **Sizing.** The sync engine used by the OAuth2 server shares the same three values, so one process can hold up to `2 × (DB_POOL_SIZE + DB_MAX_OVERFLOW)` connections. Across the deployment, `uvicorn workers × 2 × (DB_POOL_SIZE + DB_MAX_OVERFLOW)`, plus the connections the Sleep and background-worker jobs open, plus the operators' `psql` sessions, must stay below PostgreSQL's `max_connections`. Raise `max_connections` first if the sum does not fit.
 
 **When the pool runs out.** A request that cannot get a connection within `DB_POOL_TIMEOUT` gets `503` with error `DB-002`, `Retry-After: 5` and `details.reason: "pool_exhausted"`; `connection_refused` (the database did not accept the connection) and `database_error` (any other SQLAlchemy failure) tell the other causes apart. The `database_error` log event carries the same `reason` field. A shorter `DB_POOL_TIMEOUT` (for example `5`) makes exhaustion fail fast as that 503 instead of holding the request for 30 seconds; the default stays `30` until the deployment's values are chosen.
 
 Two lanes do not carry `details.reason`: MCP tool calls report the same failure as the envelope error `service_unavailable` (`backend/src/mcp_server/tools/_errors.py` classifies the pool timeout with the other dependency failures), and a REST request authenticated with an OAuth Bearer token whose token lookup itself hits the exhausted pool answers `401` because that lookup keeps the silent-failure contract of #1742. In both cases the server log still names the exception type.
+
+## Multiple API workers and Postgres connections — Issue #1980
+
+By default each API container (`api-blue` / `api-green` in the single-server
+compose files) runs **one** uvicorn process. `UVICORN_WORKERS` in `.env.prod`
+starts that many worker processes per container instead (the compose files pass
+`--workers ${UVICORN_WORKERS:-1}`). Unset, nothing changes.
+
+Each worker is a full, independent process:
+
+- **Its own connection pools.** Every worker opens its own async SQLAlchemy
+  pool, its own sync pool (OAuth2 only) and its own Redis pool
+  (`REDIS_MAX_CONNECTIONS` is per worker, see below). The DB pool size per
+  engine is `DB_POOL_SIZE + DB_MAX_OVERFLOW` (Issue #1980).
+- **Its own in-process caches.** The LLM price cache (`llm_pricing_service`),
+  the tag vocabulary `TTLCache` (`tag_resolution`), the MCP rate-limit
+  settings cache (`_RATE_LIMIT_CACHE`, 60 s) and the MCP capacity-gate
+  "not a candidate" cache (`_NOT_CANDIDATE_CACHE`, 30 s) are per process.
+  The two MCP caches are judgement caches: a workspace that has just hit
+  its limit can pass on each worker until that worker's cached entry
+  expires, so the admit window after a limit grows with the worker count. They are caches over
+  Postgres / Redis, which stay the source of truth, so N copies only lower the
+  hit rate; nothing becomes inconsistent.
+- **Known limit: legacy MCP sessions are per process.** The session table of
+  the legacy MCP era (`backend/src/mcp_server/session.py`, `MCPSessionManager`
+  — clients that still open with the `initialize` handshake) and its `DELETE`
+  tombstones (#1740) live in each worker's memory. With several workers a
+  legacy client's next request can land on another worker, which re-adopts
+  its server-minted session id as it would after a restart: the negotiated
+  `protocol_version` is unknown there, so the revision `initialize` agreed on
+  is lost. A `DELETE` tombstone is only honoured by the worker that received
+  the `DELETE`; another worker may re-adopt that id. Clients on the current
+  stateless revision (2026-07-28, `mcp_server/transport_stateless`) carry no
+  session and are unaffected. This holds for `UVICORN_WORKERS > 1` until
+  legacy sessions move to a shared store.
+- **The background scheduler runs on one process of the deployment at a
+  time.** Every worker runs the app lifespan, but only the one that takes the
+  Postgres advisory lock `apscheduler_leader` registers the cron jobs and
+  starts APScheduler (log line `scheduler_leader_acquired`, with its `pid`).
+  Startup does not wait for this: the first attempt runs in the background
+  right after boot. The leader keeps the lock on one connection of its own
+  async pool, so that worker's effective DB pool is one connection smaller.
+  The others log `scheduler_leader_standby` once and retry every
+  `SCHEDULER_LEADER_RETRY_SECONDS` (default `60`, minimum `5`). When the leader
+  process exits — a worker restart, or `deploy.sh` stopping the old color after
+  a blue/green switch — Postgres drops its lock and a standby in either color
+  takes over within that interval; a cron tick that falls in that gap is
+  skipped. The leader checks its lock connection every
+  `SCHEDULER_LEADER_PING_SECONDS` (default `10`, minimum `1`); when it breaks
+  or stops answering (e.g. Postgres restarted) the leader stops its scheduler
+  (`scheduler_leader_lost`) and competes again. If Postgres is unreachable at
+  startup the worker logs `scheduler_leader_check_failed`, keeps serving
+  requests and retries.
+
+  The lock serialises schedulers, not job executions, and has two bounded
+  overlaps:
+  - **Handover:** the old leader's scheduler stops without waiting for running
+    jobs, so a job already running on the old leader can overlap the new
+    leader's first tick of the same job.
+  - **Postgres restart:** after a Postgres restart the old leader keeps
+    dispatching for at most `SCHEDULER_LEADER_PING_SECONDS` + 15 s while a
+    standby may already hold the lock.
+
+  The Sleep, neural and capacity purge jobs stay `single_flight` guarded
+  against both.
+- **Every worker still runs its own MCP session cleanup.** It cleans that
+  process's session table (the known limit above), so it is a per-worker loop
+  every `MCP_SESSION_CLEANUP_INTERVAL` seconds (default `600`), not a
+  scheduler job.
+
+### Sizing `POSTGRES_MAX_CONNECTIONS`
+
+Every connection the workers can open must fit under Postgres'
+`max_connections`, which the compose files set from `POSTGRES_MAX_CONNECTIONS`
+(default `100`, the image's own default). Per color:
+
+```
+UVICORN_WORKERS × 2 × (DB_POOL_SIZE + DB_MAX_OVERFLOW)   # async + sync engine per worker
+```
+
+The scheduler leader's lock connection is checked out of that worker's own
+async pool, so it does not add to this ceiling.
+
+During a blue/green switch both colors run, so double it. Then add every
+other client of the same Postgres — co-resident workers, Sleep or CLI runs
+started with `docker compose exec` / `run`, an operator's `psql` — and keep
+the total below `POSTGRES_MAX_CONNECTIONS` with some headroom. Example with the pool defaults (5 + 10)
+and `UVICORN_WORKERS=2`: `2 × 2 × 15 = 60` per color, `120` during a
+switch — above the default `100`, so raise `POSTGRES_MAX_CONNECTIONS` first.
+Every Postgres connection costs memory on the data host, so prefer a smaller
+pool over an enormous `max_connections`.
+
+### How many workers
+
+Start from the CPU, not from the pool: a 4-core host is typically served well
+by 2–4 workers. Before adding workers, check under load that the API process
+is actually CPU-bound; if it is waiting on a full DB pool (`503 DB-002`,
+timeouts while CPU is idle), tune the pool (Issue #1980) first. Each worker
+also holds its own copy of the application in memory.
+
+### Rolling it out
+
+1. Set `POSTGRES_MAX_CONNECTIONS` in `.env.prod` and recreate the Postgres
+   container — it reads `max_connections` only at start, so this is a short
+   database restart. Check with `SHOW max_connections;`.
+2. Set `UVICORN_WORKERS` and deploy as usual; confirm exactly one
+   `scheduler_leader_acquired` line across both colors.
+
+On a split host the Postgres service is defined in `docker-compose.data.yml`
+on the data host. That host does not `git fetch` this repository, so the
+`command:` line for `max_connections` has to be carried over to its copy of
+the file by hand — follow your ops runbook for changing the data host.
 
 ## Redis Connection Pool (rate limits and daily quotas) — Issue #1556
 

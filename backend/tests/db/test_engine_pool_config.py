@@ -1,4 +1,4 @@
-"""``db.base`` engines read their pool sizing from Settings (#1978).
+"""``db.base`` engines read their pool sizing from Settings (#1980).
 
 A production bench exhausted the hardcoded 5 + 10 pool at concurrency 8, so
 ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` / ``DB_POOL_TIMEOUT`` size both the
@@ -79,6 +79,20 @@ def test_unlimited_values_are_rejected(
         settings_module.Settings()
 
 
+def test_single_connection_pool_is_rejected(fresh_engines: pytest.MonkeyPatch) -> None:
+    """The scheduler leader holds one pooled connection for life (#1980); a pool of
+    one would starve every request once this process leads."""
+    from pydantic import ValidationError
+
+    fresh_engines.setenv("DB_POOL_SIZE", "1")
+    fresh_engines.setenv("DB_MAX_OVERFLOW", "0")
+    with pytest.raises(ValidationError, match="at least 2"):
+        settings_module.Settings()
+
+    fresh_engines.setenv("DB_MAX_OVERFLOW", "1")
+    assert _pool_values(db_base._get_engine()) == (1, 1, 30.0)
+
+
 @pytest.mark.parametrize(
     ("pool_size", "max_overflow", "warns"),
     [(5, 10, False), (5, 9, True), (15, 0, False), (1, 0, True)],
@@ -86,7 +100,7 @@ def test_unlimited_values_are_rejected(
 def test_fanout_floor_warning(
     monkeypatch: pytest.MonkeyPatch, pool_size: int, max_overflow: int, warns: bool
 ) -> None:
-    """``database_pool_below_fanout`` fires only when size + overflow < 15 (#1978)."""
+    """``database_pool_below_fanout`` fires only when size + overflow < 15 (#1980)."""
     from unittest.mock import MagicMock
 
     log = MagicMock()
