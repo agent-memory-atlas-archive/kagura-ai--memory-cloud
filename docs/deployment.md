@@ -2118,6 +2118,24 @@ With it set, Sleep's judge calls on the managed lane also pass
 not deleted for you: each workspace owner can still list and delete their own
 stored keys (#1613).
 
+## Database Connection Pool — Issue #1978
+
+Each API process opens PostgreSQL connections through SQLAlchemy's `QueuePool` (`backend/src/db/base.py`). Three variables size it:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DB_POOL_SIZE` | `5` | Connections the pool keeps open (minimum `1`). |
+| `DB_MAX_OVERFLOW` | `10` | Extra connections opened under load and closed again when returned (minimum `0`). |
+| `DB_POOL_TIMEOUT` | `30` | Seconds a request waits for a free connection once `DB_POOL_SIZE + DB_MAX_OVERFLOW` are checked out (must be greater than `0`). |
+
+`DB_POOL_SIZE=0` and `DB_MAX_OVERFLOW=-1`, which SQLAlchemy reads as "unlimited", are refused at startup, and so is `DB_POOL_TIMEOUT=0`: the async pool's timed checkout cancels a zero-second wait before it can take an idle connection, so every request would read as `pool_exhausted`. For fail-fast behaviour use a small positive value such as `1`. Keep `DB_POOL_SIZE + DB_MAX_OVERFLOW` at `15` or more: the analysis labeler borrows up to 8 connections at once next to its orchestrator session, and the API logs `database_pool_below_fanout` at startup when the configured pool is smaller than that.
+
+**Sizing.** The sync engine used by the OAuth2 server shares the same three values, so one process can hold up to `2 × (DB_POOL_SIZE + DB_MAX_OVERFLOW)` connections. Across the deployment, `uvicorn workers × 2 × (DB_POOL_SIZE + DB_MAX_OVERFLOW)`, plus the connections the Sleep and background-worker jobs open, plus the operators' `psql` sessions, must stay below PostgreSQL's `max_connections`. Raise `max_connections` first if the sum does not fit.
+
+**When the pool runs out.** A request that cannot get a connection within `DB_POOL_TIMEOUT` gets `503` with error `DB-002`, `Retry-After: 5` and `details.reason: "pool_exhausted"`; `connection_refused` (the database did not accept the connection) and `database_error` (any other SQLAlchemy failure) tell the other causes apart. The `database_error` log event carries the same `reason` field. A shorter `DB_POOL_TIMEOUT` (for example `5`) makes exhaustion fail fast as that 503 instead of holding the request for 30 seconds; the default stays `30` until the deployment's values are chosen.
+
+Two lanes do not carry `details.reason`: MCP tool calls report the same failure as the envelope error `service_unavailable` (`backend/src/mcp_server/tools/_errors.py` classifies the pool timeout with the other dependency failures), and a REST request authenticated with an OAuth Bearer token whose token lookup itself hits the exhausted pool answers `401` because that lookup keeps the silent-failure contract of #1742. In both cases the server log still names the exception type.
+
 ## Redis Connection Pool (rate limits and daily quotas) — Issue #1556
 
 Per-minute rate limits and the daily MCP / REST / Public API quotas above are counters in Redis, incremented by `RateLimitMiddleware` on every authenticated request. The singleton client (`backend/src/db/redis.py`) uses a `BlockingConnectionPool`: when all pooled connections are checked out, a request waits up to `REDIS_POOL_TIMEOUT_SECONDS` (default `2.0`) for one to free up instead of failing immediately. Size the pool with `REDIS_MAX_CONNECTIONS` (default `50`, per API worker process). Quota checks are **fail-open** by design — if Redis is down, or the pool wait times out, the request is allowed and the counter update is lost (or, if Redis fails between the `INCR` and the `EXPIRE` that follows it, only partially applied). Each such miss logs exactly one `quota_check_failed_open` warning with `quota` (`per_minute`, `daily_mcp`, `daily_public`, `daily_rest`), `key_prefix` and `error_class` fields. Alert on that event: a sustained stream of it means quotas are not being enforced and either Redis or the pool size needs attention.
