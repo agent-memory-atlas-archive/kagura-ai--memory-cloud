@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Any, NamedTuple, cast
 from uuid import UUID
 
-from sqlalchemy import and_, desc, func, select, update
+from sqlalchemy import TextClause, and_, bindparam, desc, func, select, text, update
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 
 from models.auth import CONTEXT_TRUST_TIER_TRUSTED, Context
@@ -23,6 +29,94 @@ from utils.exceptions import NotFoundException
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# Issue #1985: every multi-row write to ``memories`` from a read path takes its
+# row locks in ``id`` order through an ordered ``FOR UPDATE`` subquery. A plain
+# ``UPDATE ... WHERE id = ANY(:ids)`` locks rows in whatever order the plan
+# visits them, so two concurrent recalls over overlapping pages could still
+# lock the same rows in opposite orders and deadlock (SQLSTATE 40P01).
+#
+# The access-stat statements add ``SKIP LOCKED``: statistics are best-effort,
+# so a row another transaction holds (a concurrent recall, or a Sleep run that
+# keeps its transaction open across passes) is simply not bumped this time. A
+# statement that never waits cannot be part of a deadlock cycle. The cost is
+# that ``access_count`` / ``last_used_at`` / ``accessed_by_clients`` can miss a
+# surfacing under contention.
+_IDS_PARAM = bindparam("ids", type_=PG_ARRAY(PG_UUID(as_uuid=True)))
+
+
+# The client append is a CASE, not a WHERE filter (#457): a row the client
+# already touched still has its access_count bumped. The statements are built
+# once from literal fragments; every value is a bound parameter (``ids``,
+# ``client``, ``now``).
+_ACCESS_STATS_HEAD = "UPDATE memories AS m SET access_count = m.access_count + 1, "
+_ADOPTION_SET = "reference_count = m.reference_count + 1, "
+_ACCESS_STATS_TAIL = (
+    "last_used_at = :now, "
+    "accessed_by_clients = CASE "
+    "WHEN CAST(:client AS VARCHAR) = ANY(COALESCE(m.accessed_by_clients, CAST('{}' AS VARCHAR[]))) "
+    "THEN m.accessed_by_clients "
+    "ELSE array_append(COALESCE(m.accessed_by_clients, CAST('{}' AS VARCHAR[])), "
+    "CAST(:client AS VARCHAR)) END "
+    "FROM (SELECT id FROM memories WHERE id = ANY(:ids) AND deleted_at IS NULL "
+    "ORDER BY id FOR UPDATE SKIP LOCKED) AS locked "
+    "WHERE m.id = locked.id "
+    "RETURNING m.id, m.access_count, m.reference_count, m.last_used_at, "
+    "m.accessed_by_clients, m.scope"
+)
+
+# Surfacing access (recall, explore): access_count only.
+ACCESS_STATS_STATEMENT: TextClause = text(_ACCESS_STATS_HEAD + _ACCESS_STATS_TAIL).bindparams(
+    _IDS_PARAM
+)
+# Adoption access (reference(), #1046): access_count and reference_count.
+ADOPTION_ACCESS_STATS_STATEMENT: TextClause = text(
+    _ACCESS_STATS_HEAD + _ADOPTION_SET + _ACCESS_STATS_TAIL
+).bindparams(_IDS_PARAM)
+
+# Working → persistent promotion (bound ``ids``, ``now``). Sleep and the
+# legacy consolidation task are the authority and wait for their rows
+# (PROMOTE_STATEMENT); recall's opportunistic promotion never waits and leaves
+# a held row for a later recall or the next Sleep run (PROMOTE_SKIP_LOCKED).
+_PROMOTE_HEAD = (
+    "UPDATE memories AS m SET scope = 'persistent', promoted_at = :now "
+    "FROM (SELECT id FROM memories WHERE id = ANY(:ids) AND deleted_at IS NULL "
+    "AND scope <> 'persistent' ORDER BY id FOR UPDATE"
+)
+_PROMOTE_TAIL = ") AS locked WHERE m.id = locked.id RETURNING m.id, m.promoted_at"
+PROMOTE_STATEMENT: TextClause = text(_PROMOTE_HEAD + _PROMOTE_TAIL).bindparams(_IDS_PARAM)
+PROMOTE_SKIP_LOCKED_STATEMENT: TextClause = text(
+    _PROMOTE_HEAD + " SKIP LOCKED" + _PROMOTE_TAIL
+).bindparams(_IDS_PARAM)
+
+
+class AccessStats(NamedTuple):
+    """A memory's statistics as the access-stat statement left them (#1985).
+
+    Read from the locked, updated row, so a caller deciding promotion sees
+    every client and count, including a concurrent recall's.
+    """
+
+    access_count: int
+    reference_count: int
+    last_used_at: datetime | None
+    accessed_by_clients: list[str] | None
+    scope: str
+
+
+def _loaded_memory(db: AsyncSession, memory_id: UUID) -> Memory | None:
+    """The ``Memory`` already in ``db``'s identity map for ``memory_id``, if any.
+
+    A set-based UPDATE bypasses the ORM, so the caller copies the returned
+    values onto this object with ``set_committed_value`` (current, not dirty).
+    Mock sessions have no real identity map and yield None.
+    """
+    sync_session = getattr(db, "sync_session", None)
+    if not isinstance(sync_session, Session):
+        return None
+    obj = sync_session.identity_map.get(sync_session.identity_key(Memory, memory_id))
+    return obj if isinstance(obj, Memory) else None
 
 
 class MemoryRepository(BaseRepository[Memory]):
@@ -265,7 +359,10 @@ class MemoryRepository(BaseRepository[Memory]):
     async def update_access_stats(
         self, memory_id: UUID, client: str, *, count_as_adoption: bool = False
     ) -> None:
-        """Update access statistics.
+        """Update access statistics for one memory.
+
+        Delegates to :meth:`bulk_update_access_stats` so the lock-ordered
+        statement is the only write path for access stats (#1985).
 
         Args:
             memory_id: Memory ID
@@ -277,57 +374,117 @@ class MemoryRepository(BaseRepository[Memory]):
                 activation) leave this False so adoption stays distinguishable
                 from mere surfacing. ``access_count`` is bumped either way, so the
                 invariant ``access_count >= reference_count`` always holds.
+        """
+        await self.bulk_update_access_stats(
+            [memory_id], client, count_as_adoption=count_as_adoption
+        )
 
-        Updates:
+    async def bulk_update_access_stats(
+        self,
+        memory_ids: Sequence[UUID],
+        client: str,
+        *,
+        count_as_adoption: bool = False,
+    ) -> dict[UUID, AccessStats]:
+        """Bump access statistics for several memories in one lock-ordered UPDATE.
+
+        Issue #1985: the rows are locked in ``id`` order through an ordered
+        ``FOR UPDATE SKIP LOCKED`` subquery, so the statement never waits: a
+        row another transaction holds is left out (not bumped this time) and
+        missing from the result. Statistics are best-effort; never waiting is
+        what keeps this write out of every deadlock cycle. Soft-deleted and
+        unknown ids are skipped too. Runs in the caller's transaction; the
+        caller commits.
+
+        Updates per row:
             - access_count += 1
             - reference_count += 1 (only when count_as_adoption=True)
             - last_used_at = now
-            - accessed_by_clients append client
+            - client appended to accessed_by_clients (once)
+
+        A ``Memory`` already loaded in this session gets the new values as
+        committed state (no second UPDATE on the next flush).
+
+        Args:
+            memory_ids: Memories to bump (order and duplicates do not matter).
+            client: Client name to record.
+            count_as_adoption: Also bump ``reference_count`` (#1046).
+
+        Returns:
+            Each updated memory's statistics after the bump, keyed by id (rows
+            skipped as locked, deleted or unknown are absent).
         """
-        memory = await self.get(memory_id)
-        if not memory:
-            return
-
-        memory.access_count = (memory.access_count or 0) + 1
-        if count_as_adoption:
-            memory.reference_count = (memory.reference_count or 0) + 1
-        memory.last_used_at = utcnow()
-
-        # Add client to accessed_by_clients
-        if not memory.accessed_by_clients:
-            memory.accessed_by_clients = []
-
-        if client not in memory.accessed_by_clients:
-            memory.accessed_by_clients.append(client)
-
-        await self.db.flush()
-
+        ids = sorted(set(memory_ids))
+        if not ids:
+            return {}
+        statement = ADOPTION_ACCESS_STATS_STATEMENT if count_as_adoption else ACCESS_STATS_STATEMENT
+        result = await self.db.execute(statement, {"ids": ids, "client": client, "now": utcnow()})
+        updated: dict[UUID, AccessStats] = {}
+        for memory_id, *values in result.all():
+            stats = AccessStats(*values)
+            updated[memory_id] = stats
+            loaded = _loaded_memory(self.db, memory_id)
+            if loaded is not None:
+                set_committed_value(loaded, "access_count", stats.access_count)
+                set_committed_value(loaded, "reference_count", stats.reference_count)
+                set_committed_value(loaded, "last_used_at", stats.last_used_at)
+                set_committed_value(loaded, "accessed_by_clients", stats.accessed_by_clients)
         logger.debug(
             "access_stats_updated",
-            memory_id=str(memory_id),
-            access_count=memory.access_count,
-            reference_count=memory.reference_count,
+            memory_count=len(updated),
             count_as_adoption=count_as_adoption,
         )
+        return updated
+
+    async def bulk_promote_to_persistent(
+        self, memory_ids: Sequence[UUID], *, skip_locked: bool = False
+    ) -> list[UUID]:
+        """Promote several working memories to persistent, locking rows in id order.
+
+        By default the statement waits for each row (Sleep and the legacy
+        consolidation task must not silently skip a promotion). With
+        ``skip_locked=True`` (recall's opportunistic promotion) a row another
+        transaction holds is left as is and absent from the result, so the
+        call never waits (#1985).
+
+        Rows already persistent, soft-deleted or unknown are skipped. Runs in
+        the caller's transaction; the caller commits and logs the promotion. A
+        ``Memory`` already loaded in this session gets the new scope as
+        committed state.
+
+        Args:
+            memory_ids: Candidate memories.
+            skip_locked: Leave rows another transaction holds instead of waiting.
+
+        Returns:
+            The ids that were promoted, in id order.
+        """
+        ids = sorted(set(memory_ids))
+        if not ids:
+            return []
+        statement = PROMOTE_SKIP_LOCKED_STATEMENT if skip_locked else PROMOTE_STATEMENT
+        result = await self.db.execute(statement, {"ids": ids, "now": utcnow()})
+        promoted: list[UUID] = []
+        for memory_id, promoted_at in result.all():
+            promoted.append(memory_id)
+            loaded = _loaded_memory(self.db, memory_id)
+            if loaded is not None:
+                set_committed_value(loaded, "scope", "persistent")
+                set_committed_value(loaded, "promoted_at", promoted_at)
+        promoted.sort()
+        logger.debug("memories_promoted_to_persistent", memory_count=len(promoted))
+        return promoted
 
     async def promote_to_persistent(self, memory_id: UUID) -> None:
-        """Promote working memory to persistent.
+        """Promote one working memory to persistent.
+
+        Delegates to :meth:`bulk_promote_to_persistent` so promotion has one
+        lock-ordered write path (#1985).
 
         Args:
             memory_id: Memory ID
         """
-        memory = await self.get(memory_id)
-        if not memory:
-            return
-
-        if memory.scope == "persistent":
-            return  # Already persistent
-
-        memory.scope = "persistent"
-        memory.promoted_at = utcnow()
-        await self.db.flush()
-
-        logger.info("memory_promoted_to_persistent", memory_id=str(memory_id))
+        await self.bulk_promote_to_persistent([memory_id])
 
     async def get_by_resource_id(
         self,
