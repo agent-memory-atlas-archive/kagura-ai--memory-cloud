@@ -200,9 +200,7 @@ async def get_api_key(authorization: str | None = Header(None)) -> str | None:
     return authorization[7:]  # Remove "Bearer " prefix
 
 
-async def verify_api_key(
-    api_key: str, *, raise_on_lookup_error: bool = False
-) -> VerifiedKey | None:
+async def verify_api_key(api_key: str) -> VerifiedKey | None:
     """Verify API key and return a ``VerifiedKey`` view.
 
     Issue #169: ``workspace_id`` for workspace-scoped API keys.
@@ -212,7 +210,13 @@ async def verify_api_key(
 
     Standalone function for MCP authentication (non-FastAPI context).
     This function does not use FastAPI dependencies, making it suitable
-    for use in MCP server authentication flows.
+    for use in MCP server authentication flows. No REST route calls it:
+    the REST dependencies call ``APIKeyManager.verify_key`` directly.
+
+    A failed lookup propagates instead of reading as an invalid key
+    (#1742, #1981): the MCP transport answers 503, so an outage (pool
+    exhausted, database down) never tells the client that its credential
+    is bad. Only ``None`` means "no such key".
 
     **Public-bound key rejection (#626)**: A key with
     ``bound_context_id != None`` is intended ONLY for the REST public
@@ -229,10 +233,6 @@ async def verify_api_key(
 
     Args:
         api_key: API key to verify (e.g., "kagura_...")
-        raise_on_lookup_error: ``True`` lets a failed lookup (database down,
-            any unexpected error) raise instead of answering "invalid key".
-            MCP authentication passes it (#1742), so an outage is a 503, not
-            a 401 that tells the client its credential is bad.
 
     Returns:
         ``VerifiedKey`` if valid AND not public-bound; ``None`` if
@@ -245,11 +245,17 @@ async def verify_api_key(
             user_id = result.user_id
             ...
     """
+    import contextlib
+
     from auth.api_keys import APIKeyManager
     from db.base import get_db
 
-    try:
-        async for db in get_db():
+    # ``aclosing`` closes the ``get_db`` generator — and with it the session —
+    # when this returns or raises, not whenever the generator is garbage
+    # collected: a lookup that fails under pool pressure must hand its
+    # connection back at once (same shape as ``_verify_oauth2_token``).
+    async with contextlib.aclosing(get_db()) as sessions:
+        async for db in sessions:
             manager = APIKeyManager(db)
             verified = await manager.verify_key(api_key)
             if verified is None:
@@ -268,8 +274,7 @@ async def verify_api_key(
             # post-yield `await session.commit()` never runs — the last_used_at
             # flushed by verify_key would be rolled back. Commit explicitly.
             # Isolated try/except: a commit failure must NOT fail auth
-            # (last_used_at is non-critical metadata, and the outer
-            # `except Exception: return None` would otherwise reject a valid key).
+            # (last_used_at is non-critical metadata).
             try:
                 await db.commit()
             except Exception as commit_err:
@@ -281,11 +286,6 @@ async def verify_api_key(
 
             set_agent_scope_from_verified(verified)
             return verified
-    except Exception:
-        if raise_on_lookup_error:
-            raise
-        # Silent failure - return None on any error
-        return None
     return None
 
 
