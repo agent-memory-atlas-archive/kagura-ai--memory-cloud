@@ -5,6 +5,7 @@ in `process_pending_embedding` to bootstrap the Neural Memory graph for
 new memories.
 """
 
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -24,6 +25,10 @@ def _make_memory(workspace_id=None, context_id=None, user_id="user1"):
     # #1403: real (non-mock) starting value for the server-only supersede
     # suggestion column the storage path assigns to.
     memory.supersede_candidate = None
+    # #2016: the judge's pair fingerprint reads these as text.
+    memory.summary = "new summary"
+    memory.content = "new content"
+    memory.created_at = datetime(2026, 10, 2)
     return memory
 
 
@@ -33,11 +38,15 @@ def _make_config(
     min_similarity=0.4,
     weight=0.3,
     suggest=True,
+    verify_mode="off",
 ):
     """Build a NeuralMemoryConfig mock."""
     config = MagicMock()
     config.knn_seed_enabled = enabled
     config.supersede_suggest_enabled = suggest
+    config.supersede_verify_mode = verify_mode
+    config.supersede_verify_min_confidence = 0.7
+    config.supersede_verify_max_calls_per_day = 200
     config.knn_seed_k = k
     config.knn_seed_min_similarity = min_similarity
     config.knn_seed_weight = weight
@@ -55,6 +64,7 @@ def _make_db():
     db = MagicMock()
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
+    db.refresh = AsyncMock()
 
     # begin_nested() returns an async context manager
     nested_cm = MagicMock()
@@ -1306,3 +1316,357 @@ class TestSupersedeSuggestConfig:
         finally:
             NeuralMemoryConfig.invalidate_cache()
         assert config.supersede_suggest_enabled is True
+
+
+class TestSupersedeVerification:
+    """#2016: with supersede_verify_mode="llm" the pair is judged before the
+    candidate is stored; the verdict rides in the column."""
+
+    @staticmethod
+    def _run(memory, db, config, judge, *, stored=None):
+        dup_id = str(uuid4())
+        candidates = [
+            {"id": str(memory.id), "score": 1.0, "payload": {}, "embedding": []},
+            {"id": dup_id, "score": 0.93, "payload": {}, "embedding": []},
+        ]
+        old = MagicMock()
+        old.id = dup_id
+        old.summary, old.content = "old summary", "old content"
+        old.created_at = datetime(2026, 10, 1)
+        row = MagicMock()
+        row.scalar_one_or_none = MagicMock(return_value=old)
+        db.execute = AsyncMock(return_value=row)
+        memory.supersede_candidate = stored
+        return dup_id, candidates, judge
+
+    @pytest.mark.asyncio
+    async def test_llm_mode_stores_the_verdict(self):
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        verdict = {"verdict": "supersedes", "confidence": 0.92, "verified": True}
+        judge = AsyncMock(return_value=verdict)
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+            patch("services.memory_service.logger") as mock_logger,
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_awaited_once()
+        assert judge.await_args.kwargs["new"] is memory
+        assert str(judge.await_args.kwargs["old"].id) == dup_id
+        stored = memory.supersede_candidate
+        assert stored["memory_id"] == dup_id
+        assert stored["verification"] == verdict
+        events = {c.args[0]: c.kwargs for c in mock_logger.info.call_args_list if c.args}
+        assert events["supersede_candidate_detected"]["verdict"] == "supersedes"
+
+    @pytest.mark.asyncio
+    async def test_parallel_verdict_is_stored_too(self):
+        """A parallel verdict is kept in the column (the resolver hides it and
+        a re-embed will not re-judge the pair)."""
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        verdict = {"verdict": "parallel", "confidence": 0.8, "verified": False}
+        judge = AsyncMock(return_value=verdict)
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        assert memory.supersede_candidate["verification"]["verdict"] == "parallel"
+        assert memory.supersede_candidate["memory_id"] == dup_id
+
+    @pytest.mark.asyncio
+    async def test_judge_none_stores_unverified_candidate(self):
+        """A judge that answers None (off, capped, failed) leaves the candidate
+        as before #2016: no verification key at all."""
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        judge = AsyncMock(return_value=None)
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        assert memory.supersede_candidate == {
+            "memory_id": dup_id,
+            "similarity": 0.93,
+            "detected_at": memory.supersede_candidate["detected_at"],
+        }
+
+    @pytest.mark.asyncio
+    async def test_off_mode_never_calls_the_judge_or_loads_the_target(self):
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="off")
+        judge = AsyncMock()
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_not_called()
+        db.execute.assert_not_called()
+        assert "verification" not in memory.supersede_candidate
+
+    @pytest.mark.asyncio
+    async def test_unmoved_pair_reuses_the_stored_verdict(self):
+        """A mechanical re-embed (same target, same texts, similarity within
+        the resurface delta) does not spend a judge call: the stored verdict
+        is kept."""
+        from services.supersede_verify import pair_fingerprint
+
+        memory = _make_memory()
+        memory.summary, memory.content = "new summary", "new content"
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        judge = AsyncMock()
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+        old = db.execute.return_value.scalar_one_or_none.return_value
+        previous = {
+            "verdict": "parallel",
+            "confidence": 0.8,
+            "verified": False,
+            "fingerprint": pair_fingerprint(old, memory),
+        }
+        memory.supersede_candidate = {
+            "memory_id": dup_id,
+            "similarity": 0.925,
+            "detected_at": "2026-10-01T00:00:00Z",
+            "verification": previous,
+        }
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_not_called()
+        assert memory.supersede_candidate["verification"] == previous
+        assert memory.supersede_candidate["similarity"] == 0.93
+
+    @pytest.mark.asyncio
+    async def test_edited_text_is_judged_again(self):
+        """The same pair with an edited summary (fingerprint moved) is re-judged
+        even though the similarity barely moved — cosine cannot see the edit
+        that flips the verdict."""
+        memory = _make_memory()
+        memory.summary, memory.content = "Depot A opens 9:00", "c"
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        fresh = {"verdict": "supersedes", "confidence": 0.9, "verified": True}
+        judge = AsyncMock(return_value=fresh)
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+        memory.supersede_candidate = {
+            "memory_id": dup_id,
+            "similarity": 0.925,
+            "detected_at": "2026-10-01T00:00:00Z",
+            "verification": {"verdict": "parallel", "fingerprint": "stale-texts"},
+        }
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_awaited_once()
+        assert memory.supersede_candidate["verification"] == fresh
+
+    @pytest.mark.asyncio
+    async def test_dismissal_during_the_judge_call_wins(self):
+        """A tombstone committed while the judge was out (re-read after the
+        call) suppresses the write; the verdict is not stored."""
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        dup_id, candidates, _ = self._run(memory, db, config, None)
+
+        async def judge(*_a, **_k):
+            # Simulates update_memory(dismiss_supersede_candidate=true) landing
+            # mid-call; db.refresh would reload this from the row.
+            memory.supersede_candidate = {
+                "dismissed": {"memory_id": dup_id, "similarity": 0.93, "dismissed_at": "x"}
+            }
+            return {"verdict": "supersedes", "confidence": 0.9, "verified": True}
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        db.refresh.assert_awaited_once()
+        assert "dismissed" in memory.supersede_candidate
+        db.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accept_during_the_judge_call_wins(self):
+        """A supersedes edge created while the judge was out (create_edge
+        accepted the suggestion and cleared the column) suppresses the write."""
+        from models.memory import EDGE_TYPE_SUPERSEDES
+
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        dup_id, candidates, _ = self._run(memory, db, config, None)
+        repo = _make_edge_repo()
+        accepted = MagicMock()
+        accepted.edge_type = EDGE_TYPE_SUPERSEDES
+        # First get_edge (before the judge): nothing; second (after): accepted.
+        repo.get_edge = AsyncMock(side_effect=[None, accepted])
+
+        async def judge(*_a, **_k):
+            memory.supersede_candidate = None  # cleared by the accept
+            return {"verdict": "supersedes", "confidence": 0.9, "verified": True}
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=repo),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        assert repo.get_edge.await_count == 2
+        assert memory.supersede_candidate is None
+        db.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_neighbour_written_later_is_not_judged(self):
+        """The top-1 neighbour was created AFTER this memory (its embedding
+        finished first): asking whether the earlier text supersedes the later
+        one inverts the question, so the candidate stays unverified."""
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        judge = AsyncMock()
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+        db.execute.return_value.scalar_one_or_none.return_value.created_at = datetime(2026, 10, 3)
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_not_called()
+        assert memory.supersede_candidate["memory_id"] == dup_id
+        assert "verification" not in memory.supersede_candidate
+
+    @pytest.mark.asyncio
+    async def test_llm_mode_with_a_tombstone_never_calls_the_judge(self):
+        """The #1504 dismissal guard runs before the judge: a rejected pair
+        costs no LLM call."""
+        memory = _make_memory()
+        db = _make_db()
+        config = _make_config(enabled=False, verify_mode="llm")
+        judge = AsyncMock()
+        dup_id, candidates, _ = self._run(memory, db, config, judge)
+        memory.supersede_candidate = {
+            "dismissed": {"memory_id": dup_id, "similarity": 0.93, "dismissed_at": "x"}
+        }
+
+        with (
+            patch("neural.config.NeuralMemoryConfig.from_db", new=AsyncMock(return_value=config)),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock(return_value=candidates)),
+            patch("repositories.neural_edge.NeuralEdgeRepository", return_value=_make_edge_repo()),
+            patch("services.supersede_verify.judge_pair", new=judge),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        judge.assert_not_called()
+        db.execute.assert_not_called()
+        assert "dismissed" in memory.supersede_candidate

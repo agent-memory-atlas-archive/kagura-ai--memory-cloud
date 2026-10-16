@@ -1642,12 +1642,19 @@ class MemoryService:
             return None
 
         from services.supersede_dismissal import build_tombstone, dismissed_entry
+        from services.supersede_verify import is_parallel
 
         stored = memory.supersede_candidate
         if not isinstance(stored, dict) or not stored.get("memory_id"):
             # Already a tombstone, or nothing pending.
             if dismissed_entry(stored) is None:
                 logger.info("supersede_dismiss_noop", memory_id=str(memory.id))
+            return None
+        if is_parallel(stored):
+            # #2016: the judge already set this pair aside and the caller was
+            # never shown it — nothing to reject, and the verdict stays so
+            # the pair is not re-judged.
+            logger.info("supersede_dismiss_noop", memory_id=str(memory.id), reason="parallel")
             return None
 
         target_id = str(stored["memory_id"])
@@ -3292,6 +3299,14 @@ class MemoryService:
         from services.agent_binding_service import filter_memory_rows_by_binding
 
         try:
+            from services.supersede_verify import (
+                CONTENT_HEAD_CHARS,
+                is_parallel,
+                is_verified,
+                min_confidence_from_env,
+                verification_stale,
+            )
+
             pending: dict[UUID, dict] = {}
             for memory in memories.values():
                 cand = memory.supersede_candidate
@@ -3319,6 +3334,9 @@ class MemoryService:
                     Memory.context_id,
                     Memory.type,
                     Memory.source_type,
+                    # #2016: the head of the text the judge saw, to tell a
+                    # stale verdict apart without reading whole contents.
+                    func.substr(Memory.content, 1, CONTENT_HEAD_CHARS).label("content_head"),
                 ).where(
                     Memory.id.in_(target_ids),
                     Memory.deleted_at.is_(None),
@@ -3331,6 +3349,11 @@ class MemoryService:
                 self.db, list(rows.all()), operation=operation, user_id=user_id
             )
             live = {row.id: row for row in kept_rows}
+
+            # #2016: the floor is env-only and applied here, at read time, so
+            # a raised floor applies to stored verdicts too (a single-field
+            # read: the resolver must not inherit from_env()'s validation).
+            min_confidence = min_confidence_from_env()
 
             resolved: dict[UUID, SupersedeCandidate] = {}
             for source_id, p in pending.items():
@@ -3345,11 +3368,27 @@ class MemoryService:
                     continue  # never enrich across a context the caller isn't reading
                 cand = p["candidate"]
                 try:
+                    # #2016: a verdict about an OLD text that has since been
+                    # edited is about text that no longer exists — neither the
+                    # parallel suppression nor ``verified`` may rest on it.
+                    stale = verification_stale(
+                        cand,
+                        old_summary=target.summary,
+                        old_content_head=getattr(target, "content_head", None),
+                    )
+                    if not stale and is_parallel(cand):
+                        # The judge said these are two facts, not an update —
+                        # kept in the column so the pair is not re-judged,
+                        # never surfaced.
+                        continue
+                    verified = not stale and is_verified(cand, min_confidence=min_confidence)
                     resolved[source_id] = SupersedeCandidate(
                         memory_id=target.id,
                         summary=target.summary,
                         similarity=float(cand["similarity"]),
                         detected_at=cand.get("detected_at"),
+                        # only a confirming verdict is a key on the wire.
+                        verified=True if verified else None,
                     )
                 except (PydanticValidationError, ValueError, TypeError):
                     continue  # malformed stored value → drop just this suggestion
@@ -6884,6 +6923,183 @@ _KNN_SEED_UNCALIBRATED_WARNED: set[tuple[str, int]] = set()
 _SUPERSEDE_SUGGEST_LAST_SEEN: bool | None = None
 
 
+async def _detect_supersede_candidate(
+    db: AsyncSession,
+    *,
+    memory: Memory,
+    raw_top: dict[str, Any],
+    edge_repo: Any,
+    config: Any,
+    workspace_id_str: str,
+    context_id_str: str,
+) -> None:
+    """Store ``raw_top`` as ``memory``'s supersede suggestion (#1403, #2016).
+
+    ``raw_top`` is the RAW top-1 neighbour (excluding self) at or above
+    ``_SUPERSEDE_SUGGEST_THRESHOLD`` — INDEPENDENT of the calibrated/operator
+    seed-edge threshold. Coupling it to the seed neighbours would let an
+    operator seed threshold (knn_seed_min_similarity) > the suggest threshold
+    silently suppress a valid suggestion (e.g. a 0.87 near-duplicate filtered
+    out before the check). It also runs before the seed-edge idempotency guard:
+    a memory created with linked_memory_ids / linked_source_uris / supersedes
+    gets a declared edge synchronously (via _create_declared_links) before the
+    seeding task runs, so gating detection behind that guard silently skipped it
+    for exactly the explicit-link workflow — the case most likely to BE a
+    supersede (#1403 review F2). Detection only READS candidates and writes the
+    server-only ``supersede_candidate`` column; it creates no edge, so it is
+    safe independent of edge state. Seeding runs async (decoupled from the
+    remember response), so rather than block remember() the candidate is
+    PERSISTED onto the new memory's dedicated server-only column (never the
+    client-writable details blob) and surfaced — liveness-guarded — on the next
+    recall()/reference(). Suggestion only: the edge is never auto-created (the
+    #1208 over-supersede prevention keeps edge authorship with the user/agent,
+    who confirms via create_edge).
+
+    #2016: with ``config.supersede_verify_mode == "llm"`` the pair is put to
+    the Sleep judge first (``services.supersede_verify``) and its verdict is
+    stored beside the candidate; an earlier verdict for the same, unmoved pair
+    is reused instead of re-judged. A judge that is off, capped or failing
+    leaves the candidate exactly as before.
+    """
+    from models.memory import EDGE_TYPE_SUPERSEDES
+    from services.supersede_dismissal import is_dismissed
+    from services.supersede_verify import (
+        VERIFY_MODE_LLM,
+        judge_pair,
+        pair_fingerprint,
+        reuse_verification,
+    )
+
+    memory_id_str = str(memory.id)
+    target_id_str = str(raw_top["id"])
+    raw_top_score = float(raw_top["score"])
+
+    # Don't resurrect an ACCEPTED suggestion. If a 'supersedes' edge from this
+    # memory to the candidate already exists, the user already actioned the
+    # suggestion and _accept_supersede_candidate_if_matching cleared the
+    # column. Since detection runs independent of the seed guard (F2), a
+    # re-embed (update_memory edit / sleep reindex / backfill) would otherwise
+    # re-populate the candidate and re-surface it on recall — breaking the
+    # accept-and-clear self-heal contract (#1403 review F2 guard).
+    existing_super = await edge_repo.get_edge(
+        memory.user_id,
+        memory.id,
+        UUID(target_id_str),
+        workspace_id=workspace_id_str,
+        context_id=context_id_str,
+    )
+    already_superseded = (
+        existing_super is not None and existing_super.edge_type == EDGE_TYPE_SUPERSEDES
+    )
+    # #1504: don't resurrect a REJECTED suggestion either. The accept-side
+    # guard above keys on the edge; rejection leaves no edge by design (the
+    # memories stay independent), so it keys on the tombstone instead. Keeping
+    # both guards here means a re-embed cannot undo either decision
+    # (``tests/services/test_supersede_dismissal.py`` pins that this ``if``
+    # gates the write on both).
+    already_dismissed = is_dismissed(
+        memory.supersede_candidate, target_id=target_id_str, similarity=raw_top_score
+    )
+    if already_dismissed:
+        logger.info(
+            "supersede_candidate_suppressed_by_dismissal",
+            memory_id=memory_id_str,
+            candidate_memory_id=target_id_str,
+            similarity=round(raw_top_score, 4),
+        )
+    if not already_superseded and not already_dismissed:
+        candidate: dict[str, Any] = {
+            "memory_id": target_id_str,
+            "similarity": round(raw_top_score, 4),
+            "detected_at": to_utc_iso(utcnow()),
+        }
+        if getattr(config, "supersede_verify_mode", None) == VERIFY_MODE_LLM:
+            old = (
+                await db.execute(
+                    select(Memory).where(
+                        Memory.id == UUID(target_id_str), Memory.deleted_at.is_(None)
+                    )
+                )
+            ).scalar_one_or_none()
+            verification = None
+            newer_target = (
+                old is not None
+                and old.created_at is not None
+                and memory.created_at is not None
+                and old.created_at > memory.created_at
+            )
+            if newer_target:
+                # The neighbour was written AFTER this memory (its embedding
+                # just finished first). Asking whether the earlier text
+                # "supersedes" the later one would invert the question — the
+                # candidate stays unverified, exactly as before #2016.
+                logger.info(
+                    "supersede_verify_skipped_newer_target",
+                    memory_id=memory_id_str,
+                    candidate_memory_id=target_id_str,
+                )
+            elif old is not None:
+                verification = reuse_verification(
+                    memory.supersede_candidate,
+                    target_id=target_id_str,
+                    similarity=raw_top_score,
+                    fingerprint=pair_fingerprint(old, memory),
+                )
+                if verification is None:
+                    verification = await judge_pair(
+                        db,
+                        config=config,
+                        user_id=memory.user_id,
+                        workspace_id=workspace_id_str,
+                        context_id=context_id_str,
+                        new=memory,
+                        old=old,
+                    )
+                    # The judge took a round trip; a dismissal or an accept
+                    # committed meanwhile by update_memory / create_edge must
+                    # win over this write (re-read the column, then re-check).
+                    await db.refresh(memory, attribute_names=["supersede_candidate"])
+                    if is_dismissed(
+                        memory.supersede_candidate,
+                        target_id=target_id_str,
+                        similarity=raw_top_score,
+                    ):
+                        logger.info(
+                            "supersede_candidate_suppressed_by_dismissal",
+                            memory_id=memory_id_str,
+                            candidate_memory_id=target_id_str,
+                            similarity=round(raw_top_score, 4),
+                        )
+                        return
+                    refreshed = await edge_repo.get_edge(
+                        memory.user_id,
+                        memory.id,
+                        UUID(target_id_str),
+                        workspace_id=workspace_id_str,
+                        context_id=context_id_str,
+                    )
+                    if refreshed is not None and refreshed.edge_type == EDGE_TYPE_SUPERSEDES:
+                        return
+            if verification is not None:
+                candidate["verification"] = verification
+
+        # Reassign the dedicated column (JSON, not a MutableDict — a
+        # reassignment is what flags it dirty). Do NOT touch updated_at:
+        # detection is a system annotation, not a user edit (#1317). Commit is
+        # safe: the caller already committed the embedding_status update before
+        # invoking this function, so nothing else is pending here.
+        memory.supersede_candidate = candidate
+        await db.commit()
+        verification = candidate.get("verification")
+        logger.info(
+            "supersede_candidate_detected",
+            memory_id=memory_id_str,
+            candidate_memory_id=candidate["memory_id"],
+            similarity=candidate["similarity"],
+            verdict=verification.get("verdict") if isinstance(verification, dict) else None,
+        )
+
+
 async def _create_knn_seed_edges(
     db: AsyncSession,
     memory: Memory,
@@ -7060,93 +7276,25 @@ async def _create_knn_seed_edges(
             collection_name=collection_name,
         )
 
-        # #1403 option B: supersede-suggestion signal — detected from the RAW top-1
-        # neighbor (excluding self), INDEPENDENT of the calibrated/operator seed-edge
-        # threshold. Coupling it to `seed_neighbors` would let an operator seed
-        # threshold (knn_seed_min_similarity) > _SUPERSEDE_SUGGEST_THRESHOLD silently
-        # suppress a valid suggestion (e.g. a 0.87 near-duplicate filtered out before
-        # the check). It ALSO runs before the `existing_edges` seed-idempotency guard
-        # below: a memory created with linked_memory_ids/linked_source_uris/supersedes
-        # gets a declared edge synchronously (via _create_declared_links) before this
-        # async task runs, so gating detection behind that guard silently skipped it
-        # for exactly the explicit-link workflow — the case most likely to BE a
-        # supersede (#1403 review F2). Detection only READS candidates and writes the
-        # server-only supersede_candidate column; it creates no edge, so it is safe
-        # independent of edge state. Seeding runs async (decoupled from the remember
-        # response), so rather than block remember() we PERSIST the candidate onto the
-        # new memory's dedicated server-only supersede_candidate column (never the
-        # client-writable details blob) and surface it — liveness-guarded — on the
-        # next recall()/reference(). Suggestion only: the edge is never auto-created
-        # (the #1208 over-supersede prevention keeps edge authorship with the
-        # user/agent, who confirms via create_edge).
-        # edge_repo is shared by the supersede detection (below) and the seed
-        # idempotency guard (further down).
+        # #1403 option B: the supersede-suggestion detection reads the RAW
+        # top-1 neighbour, independent of the seed threshold, and runs before
+        # the seed idempotency guard — see _detect_supersede_candidate.
+        # edge_repo is shared by the detection and the seed guard below.
         edge_repo = NeuralEdgeRepository(db)
 
         non_self = [c for c in candidates if str(c["id"]) != memory_id_str]
         if non_self and suggest_enabled:
             raw_top = max(non_self, key=lambda c: float(c["score"]))
-            raw_top_score = float(raw_top["score"])
-            if raw_top_score >= _SUPERSEDE_SUGGEST_THRESHOLD:
-                # Don't resurrect an ACCEPTED suggestion. If a 'supersedes' edge
-                # from this memory to the candidate already exists, the user
-                # already actioned the suggestion and _accept_supersede_candidate
-                # _if_matching cleared the column. Since detection now runs
-                # independent of the seed guard (F2), a re-embed (update_memory
-                # edit / sleep reindex / backfill) would otherwise re-populate the
-                # candidate and re-surface it on recall — breaking the
-                # accept-and-clear self-heal contract (#1403 review F2 guard).
-                from models.memory import EDGE_TYPE_SUPERSEDES
-
-                existing_super = await edge_repo.get_edge(
-                    memory.user_id,
-                    memory.id,
-                    UUID(str(raw_top["id"])),
-                    workspace_id=workspace_id_str,
-                    context_id=context_id_str,
+            if float(raw_top["score"]) >= _SUPERSEDE_SUGGEST_THRESHOLD:
+                await _detect_supersede_candidate(
+                    db,
+                    memory=memory,
+                    raw_top=raw_top,
+                    edge_repo=edge_repo,
+                    config=config,
+                    workspace_id_str=workspace_id_str,
+                    context_id_str=context_id_str,
                 )
-                already_superseded = (
-                    existing_super is not None and existing_super.edge_type == EDGE_TYPE_SUPERSEDES
-                )
-                # #1504: don't resurrect a REJECTED suggestion either. The
-                # accept-side guard above keys on the edge; rejection leaves no
-                # edge by design (the memories stay independent), so it keys on
-                # the tombstone instead. Keeping both guards here means a
-                # re-embed cannot undo either decision.
-                from services.supersede_dismissal import is_dismissed
-
-                already_dismissed = is_dismissed(
-                    memory.supersede_candidate,
-                    target_id=str(raw_top["id"]),
-                    similarity=raw_top_score,
-                )
-                if already_dismissed:
-                    logger.info(
-                        "supersede_candidate_suppressed_by_dismissal",
-                        memory_id=memory_id_str,
-                        candidate_memory_id=str(raw_top["id"]),
-                        similarity=round(raw_top_score, 4),
-                    )
-                if not already_superseded and not already_dismissed:
-                    candidate = {
-                        "memory_id": str(raw_top["id"]),
-                        "similarity": round(raw_top_score, 4),
-                        "detected_at": to_utc_iso(utcnow()),
-                    }
-                    # Reassign the dedicated column (JSON, not a MutableDict — a
-                    # reassignment is what flags it dirty). Do NOT touch
-                    # updated_at: detection is a system annotation, not a user
-                    # edit (#1317). Commit is safe: the caller already committed
-                    # the embedding_status update before invoking this function,
-                    # so nothing else is pending here.
-                    memory.supersede_candidate = candidate
-                    await db.commit()
-                    logger.info(
-                        "supersede_candidate_detected",
-                        memory_id=memory_id_str,
-                        candidate_memory_id=candidate["memory_id"],
-                        similarity=candidate["similarity"],
-                    )
 
         # #2006: everything below creates seed edges, which needs a calibrated
         # (or operator) threshold. Without one — or with seeding switched off
