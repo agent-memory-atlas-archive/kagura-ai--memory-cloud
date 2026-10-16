@@ -32,10 +32,12 @@ def _make_config(
     k=5,
     min_similarity=0.4,
     weight=0.3,
+    suggest=True,
 ):
     """Build a NeuralMemoryConfig mock."""
     config = MagicMock()
     config.knn_seed_enabled = enabled
+    config.supersede_suggest_enabled = suggest
     config.knn_seed_k = k
     config.knn_seed_min_similarity = min_similarity
     config.knn_seed_weight = weight
@@ -90,16 +92,18 @@ class TestKnnSeeding:
     """Unit tests for _create_knn_seed_edges."""
 
     @pytest.mark.asyncio
-    async def test_disabled_flag_skips_search(self):
-        """When knn_seed_enabled=False, no Qdrant search happens."""
+    async def test_both_consumers_off_skips_search(self):
+        """#2010: with seeding AND suggestions off, nothing reads the neighbour
+        query, so no Qdrant search happens."""
         memory = _make_memory()
         db = _make_db()
 
         with (
             patch(
                 "neural.config.NeuralMemoryConfig.from_db",
-                new=AsyncMock(return_value=_make_config(enabled=False)),
+                new=AsyncMock(return_value=_make_config(enabled=False, suggest=False)),
             ),
+            patch.object(memory_service, "_SUPERSEDE_SUGGEST_LAST_SEEN", False),
             patch("db.qdrant.search_memories_qdrant", new=AsyncMock()) as mock_search,
         ):
             await _create_knn_seed_edges(
@@ -1083,3 +1087,222 @@ class TestKnnSeeding:
         assert stored["memory_id"] == dup_id
         db.commit.assert_awaited_once()
         mock_repo.create_edge_if_absent.assert_not_called()
+
+
+class TestSupersedeSuggestFlag:
+    """#2010: knn_seed_enabled gates only seed edges; supersede_suggest_enabled
+    gates only the #1403 detection."""
+
+    @staticmethod
+    def _candidates(memory, dup_id):
+        return [
+            {"id": str(memory.id), "score": 1.0, "payload": {}, "embedding": []},
+            {"id": dup_id, "score": 0.93, "payload": {}, "embedding": []},
+            {"id": str(uuid4()), "score": 0.70, "payload": {}, "embedding": []},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_seed_off_still_detects_candidate_without_edges(self):
+        """knn_seed_enabled=False must not silence suggestions: the neighbour
+        query runs (2 hits suffice), the candidate is stored, no seed edge is
+        written and the seed threshold is never resolved."""
+        memory = _make_memory()
+        db = _make_db()
+        mock_repo = _make_edge_repo()
+        dup_id = str(uuid4())
+
+        with (
+            patch(
+                "neural.config.NeuralMemoryConfig.from_db",
+                new=AsyncMock(return_value=_make_config(enabled=False)),
+            ),
+            patch(
+                "neural.calibration.resolve_knn_threshold",
+                new=AsyncMock(return_value=0.5),
+            ) as mock_threshold,
+            patch(
+                "db.qdrant.search_memories_qdrant",
+                new=AsyncMock(return_value=self._candidates(memory, dup_id)),
+            ) as mock_search,
+            patch(
+                "repositories.neural_edge.NeuralEdgeRepository",
+                return_value=mock_repo,
+            ),
+            patch(
+                "tasks.neural_calibration.maybe_trigger_bootstrap",
+                new=AsyncMock(return_value=True),
+            ) as mock_bootstrap,
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        mock_search.assert_awaited_once()
+        assert mock_search.await_args.kwargs["limit"] == 2
+        stored = memory.supersede_candidate
+        assert stored is not None
+        assert stored["memory_id"] == dup_id
+        mock_repo.create_edge_if_absent.assert_not_called()
+        mock_repo.get_outgoing_edges.assert_not_called()
+        mock_threshold.assert_not_called()
+        mock_bootstrap.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_suggest_off_seeds_edges_without_candidate(self):
+        """supersede_suggest_enabled=False: seed edges are created as before,
+        but no supersede_candidate is stored, and one INFO line says so."""
+        memory = _make_memory()
+        db = _make_db()
+        mock_repo = _make_edge_repo()
+        dup_id = str(uuid4())
+
+        with (
+            patch(
+                "neural.config.NeuralMemoryConfig.from_db",
+                new=AsyncMock(return_value=_make_config(min_similarity=0.6, suggest=False)),
+            ),
+            patch(
+                "neural.calibration.resolve_knn_threshold",
+                new=AsyncMock(return_value=0.6),
+            ),
+            patch(
+                "db.qdrant.search_memories_qdrant",
+                new=AsyncMock(return_value=self._candidates(memory, dup_id)),
+            ),
+            patch(
+                "repositories.neural_edge.NeuralEdgeRepository",
+                return_value=mock_repo,
+            ),
+            patch.object(memory_service, "_SUPERSEDE_SUGGEST_LAST_SEEN", None),
+            patch("services.memory_service.logger") as mock_logger,
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+            assert memory_service._SUPERSEDE_SUGGEST_LAST_SEEN is False
+
+        assert memory.supersede_candidate is None
+        mock_repo.get_edge.assert_not_called()
+        # Both non-self neighbours clear the 0.6 seed threshold → two seed edges.
+        dst_ids = {str(c.kwargs["dst_id"]) for c in mock_repo.create_edge_if_absent.call_args_list}
+        assert dup_id in dst_ids
+        assert str(memory.id) not in dst_ids
+        assert mock_repo.create_edge_if_absent.await_count == 2
+        events = [c.args[0] for c in mock_logger.info.call_args_list if c.args]
+        assert events.count("supersede_suggest_disabled") == 1
+        assert "supersede_candidate_detected" not in events
+
+    @pytest.mark.asyncio
+    async def test_suggest_disabled_logged_per_transition_not_per_ingest(self):
+        """The disabled notice is one line per off-transition: three ingests
+        while off log once; on, then off again, logs a second time."""
+        db = _make_db()
+        configs = [_make_config(enabled=False, suggest=False)] * 3 + [
+            _make_config(enabled=False, suggest=True),
+            _make_config(enabled=False, suggest=False),
+        ]
+        with (
+            patch(
+                "neural.config.NeuralMemoryConfig.from_db",
+                new=AsyncMock(side_effect=configs),
+            ),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock()) as mock_search,
+            patch.object(memory_service, "_SUPERSEDE_SUGGEST_LAST_SEEN", None),
+            patch("services.memory_service.logger") as mock_logger,
+        ):
+            for _ in configs:
+                await _create_knn_seed_edges(
+                    db=db,
+                    memory=_make_memory(),
+                    vector=[0.1] * 512,
+                    collection_name="kagura_memories",
+                    model_name="text-embedding-3-small",
+                )
+
+        # The one suggest-on ingest ran the query (seeding off → limit 2, no hits).
+        assert mock_search.await_count == 1
+        events = [c.args[0] for c in mock_logger.info.call_args_list if c.args]
+        assert events.count("supersede_suggest_disabled") == 2
+
+    @pytest.mark.asyncio
+    async def test_seed_on_uncalibrated_suggest_off_skips_search(self):
+        """Seeding on but no calibration row (threshold None) and suggestions
+        off: nothing would read the neighbour query, so it is skipped and the
+        bootstrap trigger still fires (#2010 review)."""
+        memory = _make_memory()
+        db = _make_db()
+        with (
+            patch(
+                "neural.config.NeuralMemoryConfig.from_db",
+                new=AsyncMock(return_value=_make_config(min_similarity=None, suggest=False)),
+            ),
+            patch(
+                "neural.calibration.resolve_knn_threshold",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("db.qdrant.search_memories_qdrant", new=AsyncMock()) as mock_search,
+            patch(
+                "tasks.neural_calibration.maybe_trigger_bootstrap",
+                new=AsyncMock(return_value=False),
+            ) as mock_bootstrap,
+            patch.object(memory_service, "_SUPERSEDE_SUGGEST_LAST_SEEN", False),
+        ):
+            await _create_knn_seed_edges(
+                db=db,
+                memory=memory,
+                vector=[0.1] * 512,
+                collection_name="kagura_memories",
+                model_name="text-embedding-3-small",
+            )
+
+        mock_bootstrap.assert_awaited_once()
+        mock_search.assert_not_called()
+        assert memory.supersede_candidate is None
+
+
+class TestSupersedeSuggestConfig:
+    """#2010: the flag is env-only — default on, SUPERSEDE_SUGGEST_ENABLED=false
+    turns it off, and a neural_config row never reaches it."""
+
+    def test_default_on(self):
+        from neural.config import NeuralMemoryConfig
+
+        assert NeuralMemoryConfig().supersede_suggest_enabled is True
+
+    def test_env_turns_it_off(self, monkeypatch):
+        from neural.config import NeuralMemoryConfig
+
+        monkeypatch.setenv("SUPERSEDE_SUGGEST_ENABLED", "false")
+        assert NeuralMemoryConfig.from_env().supersede_suggest_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_db_row_does_not_override(self, monkeypatch):
+        from neural.config import NeuralMemoryConfig
+
+        monkeypatch.delenv("SUPERSEDE_SUGGEST_ENABLED", raising=False)
+        NeuralMemoryConfig.invalidate_cache()
+
+        class _Row:
+            key = "supersede_suggest_enabled"
+
+            @staticmethod
+            def get_typed_value():
+                return "false"
+
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [_Row()]
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=result)
+        try:
+            config = await NeuralMemoryConfig.from_db(db)
+        finally:
+            NeuralMemoryConfig.invalidate_cache()
+        assert config.supersede_suggest_enabled is True
