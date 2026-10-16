@@ -633,3 +633,104 @@ def test_entries_from_rows_version_rows_default_to_the_rendered_rows():
     default = entries_from_rows(CTX, [row], total=1, limit=10, user_id="u1")
     explicit = entries_from_rows(CTX, [row], total=1, limit=10, user_id="u1", version_rows=[row])
     assert default.tool_triggered_version == explicit.tool_triggered_version
+
+
+# ---------------------------------------------------------------------------
+# The last-used fallback's candidate (a user credential with no ``?guardrails=``
+# and no agent binding): the context this user's own last tool call touched,
+# from usage_stats — never Context.last_used_at, which any member bumps.
+# ---------------------------------------------------------------------------
+
+
+def _ctx(last_used_at=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(id=uuid4(), last_used_at=last_used_at)
+
+
+def _db(picked):
+    """A session whose one ``execute`` answers the usage_stats pick with ``picked``."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    result = SimpleNamespace(scalar_one_or_none=lambda: picked)
+    return SimpleNamespace(execute=AsyncMock(return_value=result))
+
+
+def _sql(db) -> str:
+    return str(db.execute.await_args.args[0].compile())
+
+
+@pytest.mark.asyncio
+async def test_select_last_used_context_reads_this_users_newest_call(monkeypatch):
+    from services.guardrail_digest import select_last_used_context
+
+    picked = uuid4()
+    db = _db(picked)
+
+    assert await select_last_used_context(db, user_id="user-1", key_workspace_id=None) == picked
+    sql = _sql(db)
+    assert "usage_stats.user_id" in sql and "usage_stats.context_id IS NOT NULL" in sql
+    assert "usage_stats.date >=" in sql  # the 30-day window rides the (user_id, date) index
+    assert "ORDER BY usage_stats.created_at DESC" in sql and "LIMIT" in sql
+    assert "usage_stats.workspace_id" not in sql  # an unscoped credential: any workspace
+
+
+@pytest.mark.asyncio
+async def test_select_last_used_context_confines_a_workspace_scoped_key_to_its_workspace():
+    from services.guardrail_digest import select_last_used_context
+
+    ws, picked = uuid4(), uuid4()
+    db = _db(picked)
+
+    assert await select_last_used_context(db, user_id="user-1", key_workspace_id=ws) == picked
+    assert "usage_stats.workspace_id =" in _sql(db)
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_account_without_a_call_gets_its_sole_context(monkeypatch):
+    from services import context_service as cs_mod
+    from services.guardrail_digest import select_last_used_context
+
+    only = _ctx()
+    seen: dict = {}
+
+    async def fake_list(self, user_id, *, raise_on_lookup_error=False):
+        seen["args"] = (user_id, raise_on_lookup_error)
+        return [only]
+
+    monkeypatch.setattr(cs_mod.ContextService, "list_contexts", fake_list)
+
+    assert await select_last_used_context(_db(None), user_id="u", key_workspace_id=None) == only.id
+    # The listing that list_contexts (the tool) uses; a failed lookup raises so
+    # the caller's fail-open path logs it as a warning.
+    assert seen["args"] == ("u", True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing", [[], [None, None]])
+async def test_no_call_and_no_sole_context_is_none(monkeypatch, listing):
+    """Several never-used contexts, or none: nothing to guess at."""
+    from services import context_service as cs_mod
+    from services.guardrail_digest import select_last_used_context
+
+    async def fake_list(self, user_id, *, raise_on_lookup_error=False):
+        return [_ctx(x) for x in listing]
+
+    monkeypatch.setattr(cs_mod.ContextService, "list_contexts", fake_list)
+
+    assert await select_last_used_context(_db(None), user_id="u", key_workspace_id=None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_scoped_key_outside_its_workspace_is_none_not_a_warning(monkeypatch):
+    from services import permission_service as ps_mod
+    from services.guardrail_digest import select_last_used_context
+    from utils.exceptions import AuthorizationError
+
+    async def denied(self, user_id, workspace_id):
+        raise AuthorizationError("not a member")
+
+    monkeypatch.setattr(ps_mod.PermissionService, "get_accessible_contexts", denied)
+
+    assert await select_last_used_context(_db(None), user_id="u", key_workspace_id=uuid4()) is None

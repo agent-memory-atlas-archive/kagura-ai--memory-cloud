@@ -61,6 +61,10 @@ class VerifiedKey(NamedTuple):
             (``shadow`` | ``enforce``), read in the same verify-time lookup
             so the binding chokepoints need no second agents query. None for
             unbound keys.
+        is_connector_key: A connector's shared key (``connector:<uuid>`` name
+            on a workspace-scoped key). Its owner is not the person on the
+            other end of the connector, so the MCP handshake withholds the
+            owner's last-used guardrail digest from it.
     """
 
     id: int
@@ -70,6 +74,7 @@ class VerifiedKey(NamedTuple):
     key_prefix: str | None = None
     agent_id: UUID | None = None
     agent_enforcement_mode: str | None = None
+    is_connector_key: bool = False
 
 
 def apply_zero_knowledge_hide(key: APIKey) -> None:
@@ -355,7 +360,12 @@ class APIKeyManager:
         # not usage (this runs before the agent liveness touch and the
         # last_used_at write).
         connector_id = connector_id_from_key_name(key_record.name)
-        if connector_id is not None and key_record.workspace_id is not None:
+        # The name decides ``is_connector_key`` for the MCP handshake's last-used
+        # digest fallback: a user-minted key that merely looks like a connector
+        # key stays an ordinary key here but is withheld that digest — the safe
+        # direction, since the fallback is about who is behind the credential.
+        is_connector_key = connector_id is not None and key_record.workspace_id is not None
+        if is_connector_key:
             from services.plan_suspension import connector_key_suspended
 
             if await connector_key_suspended(self.db, connector_id, key_record.workspace_id):
@@ -428,6 +438,7 @@ class APIKeyManager:
             key_prefix=key_record.key_prefix,
             agent_id=key_record.agent_id,
             agent_enforcement_mode=agent_enforcement_mode,
+            is_connector_key=is_connector_key,
         )
 
     async def list_keys(
