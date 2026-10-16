@@ -24,6 +24,7 @@ from services.context_routing import resolve_routing_from_config
 from services.embedding_service import EmbeddingService
 from services.identity_link_service import linked_user_ids, opens_contexts_as_self
 from services.llm_call_log_writer import LLMCallLogWriter
+from services.recall_timings import RecallTimings
 from services.reranker_service import RerankerService
 from utils.exceptions import ExternalServiceError, OpenAIError
 from utils.logger import get_logger
@@ -71,6 +72,7 @@ class SearchService:
         include_vectors: bool = False,
         is_shared_context_read: bool = False,
         degradation: dict[str, Any] | None = None,
+        timings: RecallTimings | None = None,
     ) -> list[dict]:
         """Search with configurable mode: hybrid, semantic, or keyword.
 
@@ -107,6 +109,13 @@ class SearchService:
                 workspace members are visible to the cross-workspace reader.
                 Single-context and cross-context (``context_ids``) paths both
                 honor this flag.
+            timings: #1989 out-parameter. When given, the embed / qdrant /
+                fulltext / rerank stages are timed into it (``stage()``) and
+                ``embed_cache_hit`` is set from the embedding service's
+                ``outcome`` (never from the token count). ``rerank_ms`` is kept
+                when a provider scored or the rerank failed open, not when
+                there was nothing to score or no provider. A degraded embed or
+                vector search records its time-to-failure in its own stage.
 
         Returns:
             List of search results with scores
@@ -258,6 +267,8 @@ class SearchService:
         # the semantic arm fails and a hybrid search degrades to keyword
         # -only (#1515).
         effective_search_mode: SearchMode = search_mode
+        if timings is None:
+            timings = RecallTimings()  # discarded; keeps the stage blocks unconditional
 
         if search_mode in ("hybrid", "semantic"):
             try:
@@ -275,13 +286,24 @@ class SearchService:
                 # otherwise a TOCTOU race between the preflight ``has_byok_key``
                 # probe in ``MemoryService.recall`` and this resolution could
                 # silently route to the uncapped platform key.
-                query_vector, embedding_tokens = await embed_svc.embed_with_usage(
-                    normalized_query,
-                    user_id,
-                    context_id=primary_context_id,
-                    workspace_id=workspace_id,
-                    disallow_env_fallback=is_shared_context_read,
-                )
+                embed_outcome: dict[str, Any] = {}
+                try:
+                    with timings.stage("embed"):
+                        query_vector, embedding_tokens = await embed_svc.embed_with_usage(
+                            normalized_query,
+                            user_id,
+                            context_id=primary_context_id,
+                            workspace_id=workspace_id,
+                            disallow_env_fallback=is_shared_context_read,
+                            outcome=embed_outcome,
+                        )
+                finally:
+                    # The service says whether the vector came from the cache;
+                    # the token count cannot (providers without usage
+                    # accounting, e.g. Ollama, report 0 for a cold embed too).
+                    # Read it on failure as well: a provider call that raised
+                    # was a miss, and the slowest embeds are those.
+                    timings.embed_cache_hit = embed_outcome.get("cache_hit")
                 if embedding_tokens > 0:
                     # Cache hits return 0 tokens and intentionally produce no
                     # llm_call_log row (B1 pin) — the table is "API was
@@ -310,18 +332,19 @@ class SearchService:
                         ),
                         fail_on_error=False,
                     )
-                semantic_results = await search_memories_qdrant(
-                    user_id=user_id,
-                    query_vector=query_vector,
-                    workspace_id=workspace_id,
-                    context_id=context_id,
-                    limit=fetch_size,
-                    filters=filters,
-                    is_shared_context=is_shared_context,
-                    collection_name=collection,
-                    include_vectors=include_vectors,
-                    owner_ids=owner_ids,
-                )
+                with timings.stage("qdrant"):
+                    semantic_results = await search_memories_qdrant(
+                        user_id=user_id,
+                        query_vector=query_vector,
+                        workspace_id=workspace_id,
+                        context_id=context_id,
+                        limit=fetch_size,
+                        filters=filters,
+                        is_shared_context=is_shared_context,
+                        collection_name=collection,
+                        include_vectors=include_vectors,
+                        owner_ids=owner_ids,
+                    )
             except ExternalServiceError as exc:
                 # The semantic arm is down (embedding provider or vector
                 # store). A hybrid search can still answer from BM25, so
@@ -356,17 +379,18 @@ class SearchService:
             logger.debug(
                 "fulltext_search_starting", query=normalized_query[:50], fetch_size=fetch_size
             )
-            fulltext_results = await search_memories_fulltext(
-                user_id=user_id,
-                query=normalized_query,
-                workspace_id=workspace_id,
-                context_id=context_id,
-                limit=fetch_size,
-                filters=filters,
-                is_shared_context=is_shared_context,
-                collection_name=collection,
-                owner_ids=owner_ids,
-            )
+            with timings.stage("fulltext"):
+                fulltext_results = await search_memories_fulltext(
+                    user_id=user_id,
+                    query=normalized_query,
+                    workspace_id=workspace_id,
+                    context_id=context_id,
+                    limit=fetch_size,
+                    filters=filters,
+                    is_shared_context=is_shared_context,
+                    collection_name=collection,
+                    owner_ids=owner_ids,
+                )
 
         # Merge results based on the mode actually served. That is
         # effective_search_mode, not search_mode: a hybrid search whose
@@ -413,16 +437,25 @@ class SearchService:
                     # Graceful degradation: Continue without reranking
 
             if plan_allows:
+                rerank_outcome: dict[str, Any] = {}
                 try:
-                    merged_results = await self.reranker_service.rerank(
-                        query=query,
-                        candidates=merged_results[:fetch_size],  # Dynamic fetch size (Issue #130)
-                        user_id=user_id,
-                        k=k,
-                        context_id=primary_context_id,
-                        workspace_id=workspace_id,  # NEW: Issue #146
-                    )
-                    logger.debug("reranking_completed", results=len(merged_results))
+                    with timings.stage("rerank"):
+                        merged_results = await self.reranker_service.rerank(
+                            query=query,
+                            candidates=merged_results[:fetch_size],  # Dynamic fetch size (#130)
+                            user_id=user_id,
+                            k=k,
+                            context_id=primary_context_id,
+                            workspace_id=workspace_id,  # NEW: Issue #146
+                            outcome=rerank_outcome,
+                        )
+                    if rerank_outcome.get("scored"):
+                        logger.debug("reranking_completed", results=len(merged_results))
+                    else:
+                        # Nothing to score or no active provider: no rerank to
+                        # report (#1989 rerank_ms means one ran). A rerank that
+                        # raised keeps its time-to-failure, like a failed embed.
+                        timings.discard("rerank")
                 except Exception as e:
                     # Fail open to the un-reranked hybrid results — never fail
                     # the recall. ``rerank_failed_open`` is the stable event
