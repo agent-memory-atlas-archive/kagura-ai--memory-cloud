@@ -42,7 +42,12 @@ from services.memory_service import (
     DuplicateCandidateError,
 )
 from utils.datetime import to_utc_iso
-from utils.exceptions import AuthorizationError, NotFoundException, QuotaExceededError
+from utils.exceptions import (
+    AuthorizationError,
+    ContentSizeExceededError,
+    NotFoundException,
+    QuotaExceededError,
+)
 from utils.response_budget import (
     DEFAULT_MAX_CHARS,
     BudgetArgumentError,
@@ -119,6 +124,104 @@ def _guardrail_author_denied(operation: str) -> list[TextContent]:
     )
 
 
+# Sentence ends: an ASCII terminator followed by whitespace or the end of the
+# text, a CJK terminator, or a line break. Scanned by hand — this module never
+# compiles a pattern (tests/utils/test_tool_trigger_regex.py keeps the stored
+# tool_trigger regexes from ever running server-side, and the guard is per
+# module).
+_ASCII_SENTENCE_END = frozenset(".!?")
+_CJK_SENTENCE_END = frozenset("。！？")
+
+
+def _sentence_ends(text: str) -> list[int]:
+    """Indexes just past each sentence end of ``text``, in order."""
+    ends: list[int] = []
+    last = len(text) - 1
+    for i, ch in enumerate(text):
+        if ch in _CJK_SENTENCE_END or ch == "\n":
+            ends.append(i + 1)
+        elif ch in _ASCII_SENTENCE_END and (i == last or text[i + 1].isspace()):
+            ends.append(i + 1)
+    return ends
+
+
+# Below this many characters a sentence boundary is not worth the loss; cut at a word.
+_SUMMARY_KEEP_AT_LEAST = 200
+PAYLOAD_HELP = (
+    "One memory holds up to 1,000,000 characters across summary, context_summary, "
+    "content and details. Split long material into several memories, one topic each, "
+    "and keep the summary to one or two sentences."
+)
+MISSING_FIELDS_HELP = (
+    "summary, content and type are required. If the call carried a large payload, the "
+    "client may have dropped fields: " + PAYLOAD_HELP
+)
+# A lint the cut makes moot: the agent cannot shorten a summary the server just cut.
+_LINT_MOOT_AFTER_CUT = frozenset({"summary_long"})
+
+
+def fit_summary(args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Cut a too-long ``summary`` to ``SUMMARY_MAX_LENGTH`` instead of refusing it.
+
+    Surrounding whitespace never counts. The cut lands on the last sentence end
+    at or before the cap (at least ``_SUMMARY_KEEP_AT_LEAST`` characters in,
+    judged on the whole text so a period right at the cap followed by more text
+    is not an end), else on a word boundary with ``…``. The full text is kept:
+    when ``content`` does not already open with it, it is prepended there — unless
+    that alone would push the memory over ``MAX_CONTENT_SIZE``, in which case the
+    content is left as sent. Returns the arguments to build the request from and
+    the response fields that report the cut (``summary_truncated``,
+    ``summary_original_length``); the arguments unchanged with ``{}`` when the
+    summary fits. A non-string summary passes through for the schema to refuse.
+    """
+    from config.constants import MAX_CONTENT_SIZE
+    from models.schemas import SUMMARY_MAX_LENGTH, SUMMARY_MIN_LENGTH
+
+    raw = args.get("summary")
+    if not isinstance(raw, str):
+        return args, {}
+    summary = raw.strip()
+    if len(summary) <= SUMMARY_MAX_LENGTH:
+        return args, {}
+    cut: str | None = None
+    for end in _sentence_ends(summary):
+        if end > SUMMARY_MAX_LENGTH:
+            break
+        if end - 1 >= _SUMMARY_KEEP_AT_LEAST:
+            cut = summary[:end].rstrip()
+    if cut is None:
+        head = summary[: SUMMARY_MAX_LENGTH - 1].rstrip()
+        if summary[SUMMARY_MAX_LENGTH - 1].isspace():
+            stem = head  # the word that ends right at the cap is whole: keep it
+        else:
+            words = head.rsplit(None, 1)
+            stem = words[0] if len(words) == 2 and len(words[0]) >= _SUMMARY_KEEP_AT_LEAST else head
+        if len(stem) < SUMMARY_MIN_LENGTH:
+            # Mostly whitespace: keep the raw head so the schema's minimum still holds.
+            stem = summary[: SUMMARY_MAX_LENGTH - 1]
+        cut = stem + "…"
+    fitted = dict(args)
+    fitted["summary"] = cut
+    content = args.get("content")
+    if isinstance(content, str):
+        # Whitespace-insensitive, and only the opening of the content is read:
+        # a content that already starts with the summary (CRLF, wrapped lines)
+        # is not given a second copy, and a 1 MB content is not re-joined.
+        opening = " ".join(content[: 2 * len(summary)].split())
+        already = " ".join(summary.split()) in opening
+        fits = len(summary) + 2 + len(content) <= MAX_CONTENT_SIZE
+        if not already and fits:
+            fitted["content"] = summary + "\n\n" + content if content else summary
+    return fitted, {"summary_truncated": True, "summary_original_length": len(summary)}
+
+
+def lint_after_fit(lint: Any, fitted: dict[str, Any]) -> Any:
+    """The write lint minus the hints a summary cut makes moot."""
+    if not fitted or not lint:
+        return lint
+    return [hint for hint in lint if hint.code not in _LINT_MOOT_AFTER_CUT]
+
+
 def remember_request_from_args(args: dict[str, Any]) -> Any:
     """The ``RememberRequest`` for ``remember``'s arguments — also one ``remember_batch``
     item, so a new ``remember`` field reaches both tools from this one place."""
@@ -164,6 +267,7 @@ async def handle_remember(
             "missing_fields",
             f"Missing required fields: {', '.join(missing)}",
             missing_fields=missing,
+            help=MISSING_FIELDS_HELP,
         )
 
     from db.base import get_db
@@ -176,6 +280,7 @@ async def handle_remember(
         tags_normalize, dedupe = parse_write_options(args)
     except ValueError as e:
         return _error_response("validation_error", str(e))
+    args, summary_fit = fit_summary(args)
     request = remember_request_from_args(args)
 
     start_time = time.time()
@@ -228,7 +333,10 @@ async def handle_remember(
                             **_persistence_response_field(result.persistence, verbose=verbose),
                             # #1502: advisory recall-ability hints; absent when
                             # the write looks fine.
-                            **_lint_response_field(result.lint),
+                            **_lint_response_field(lint_after_fit(result.lint, summary_fit)),
+                            # The summary was over the cap and cut at a sentence
+                            # boundary; the full text went into content.
+                            **summary_fit,
                             **_context_response_fields(current_context),
                         }
                     ),
@@ -273,6 +381,20 @@ async def handle_remember(
         except _ContextNotFoundError as e:
             await db.rollback()
             return e.to_response()
+        except ContentSizeExceededError as e:
+            # A request-size limit, not a plan quota: the caller splits or
+            # shortens, and the numbers say by how much.
+            await db.rollback()
+            await _log_tool_usage(
+                db, user_id, "remember", start_time, 413, args.get("context_id"), workspace_id
+            )
+            return _error_response(
+                "payload_too_large",
+                e.message,
+                limit=e.limit,
+                actual=e.actual,
+                help=PAYLOAD_HELP,
+            )
         except QuotaExceededError as e:
             # The quota family (total memory_limit, #1549 daily memories_per_day)
             # is a 429, not a crash: same ``quota_exceeded`` envelope as
