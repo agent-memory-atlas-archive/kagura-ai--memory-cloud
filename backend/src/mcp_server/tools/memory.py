@@ -1020,7 +1020,82 @@ async def handle_load_guardrails(
     return _error_response("internal_error", "Database session unavailable")
 
 
-def _recall_result_item(r: Any) -> dict[str, Any]:
+# #2002: recall's ``verbosity`` values. "compact" is the default — a cheap
+# first pass an agent can afford without certainty, then reference(memory_id).
+RECALL_VERBOSITIES = ("compact", "full")
+# Characters of ``summary`` a compact item carries, the ellipsis included.
+COMPACT_SUMMARY_CHARS = 160
+_ELLIPSIS = "…"
+
+
+def _compact_summary(summary: str) -> tuple[str, bool]:
+    """The head of ``summary`` a compact item carries, and whether text was cut.
+
+    A summary within ``COMPACT_SUMMARY_CHARS`` is returned as stored. A longer
+    one is flattened first (every run of whitespace, newlines included, becomes
+    one space), then cut at the last space that leaves room for the ellipsis.
+    When that space falls in the first half — a URL, path or UUID would
+    otherwise collapse the head to a few words — the cut is made mid-token.
+
+    Args:
+        summary: The stored summary.
+
+    Returns:
+        The head and ``True`` when characters (not just whitespace) were dropped.
+    """
+    if len(summary) <= COMPACT_SUMMARY_CHARS:
+        return summary, False
+    flat = " ".join(summary.split())
+    if len(flat) <= COMPACT_SUMMARY_CHARS:
+        return flat, False
+    head = flat[: COMPACT_SUMMARY_CHARS - 1]
+    boundary = head.rfind(" ")
+    if boundary >= COMPACT_SUMMARY_CHARS // 2:
+        head = head[:boundary]
+    return head.rstrip() + _ELLIPSIS, True
+
+
+def _compact_recall_item(r: Any) -> dict[str, Any]:
+    """The ``verbosity="compact"`` projection of one recall result (#2002).
+
+    What an agent needs to judge a hit and fetch it: id, the head of the
+    summary (``summary_cut: true`` when it was shortened), type, importance,
+    score, created_at and updated_at (null on a memory never edited), plus the
+    rare annotations it must act on. tags, context_summary and scope stay in
+    ``verbosity="full"``.
+    """
+    summary, cut = _compact_summary(r.summary)
+    item: dict[str, Any] = {"memory_id": str(r.memory_id), "summary": summary}
+    if cut:
+        item["summary_cut"] = True
+    item.update(
+        {
+            "type": r.type,
+            "importance": r.importance,
+            "score": round(r.score, 4) if r.score is not None else None,
+            "created_at": to_utc_iso(r.created_at),
+            "updated_at": to_utc_iso(r.updated_at),
+        }
+    )
+    _add_recall_annotations(item, r)
+    return item
+
+
+def _add_recall_annotations(item: dict[str, Any], r: Any) -> None:
+    """Copy the fact-succession annotations onto ``item`` when present."""
+    # #1208: superseded_by is only set under include_superseded=true;
+    # contradicts lists opposing memories (never hidden, both sides annotated).
+    if r.superseded_by:
+        item["superseded_by"] = str(r.superseded_by)
+    if r.contradicts:
+        item["contradicts"] = [str(c) for c in r.contradicts]
+    # #1403: liveness-guarded near-duplicate this memory may supersede — a
+    # client can offer confirm→create_edge.
+    if r.supersede_candidate:
+        item["supersede_candidate"] = r.supersede_candidate.model_dump(mode="json")
+
+
+def _recall_result_item(r: Any, verbosity: str = "full") -> dict[str, Any]:
     """Project one recall result onto the MCP envelope.
 
     #1599: the annotations that are empty on almost every result are omitted
@@ -1030,10 +1105,13 @@ def _recall_result_item(r: Any) -> dict[str, Any]:
 
     Args:
         r: A ``MemoryResponse`` from ``RecallResponse.results``.
+        verbosity: ``"full"`` (every Layer 1-2 field) or ``"compact"`` (#2002).
 
     Returns:
         The result item, Layers 1-2 only.
     """
+    if verbosity == "compact":
+        return _compact_recall_item(r)
     item: dict[str, Any] = {"memory_id": str(r.memory_id), "summary": r.summary}
     # Truthiness, like the annotations below: a stored "" (remember() has no
     # min_length) says as little as None, so it is absent too.
@@ -1054,25 +1132,15 @@ def _recall_result_item(r: Any) -> dict[str, Any]:
             "updated_at": to_utc_iso(r.updated_at),
         }
     )
-    # #1208: fact-succession annotations. superseded_by is only set under
-    # include_superseded=true; contradicts lists opposing memories (never
-    # hidden, both sides annotated).
     # #1851: an untagged result says nothing with ``"tags": []``; absent like
     # the other empty annotations.
     if r.tags:
         item["tags"] = r.tags
-    if r.superseded_by:
-        item["superseded_by"] = str(r.superseded_by)
-    if r.contradicts:
-        item["contradicts"] = [str(c) for c in r.contradicts]
-    # #1403: liveness-guarded near-duplicate this memory may supersede — a
-    # client can offer confirm→create_edge.
-    if r.supersede_candidate:
-        item["supersede_candidate"] = r.supersede_candidate.model_dump(mode="json")
+    _add_recall_annotations(item, r)
     return item
 
 
-def _recall_envelope(result: Any, context: Any) -> dict[str, Any]:
+def _recall_envelope(result: Any, context: Any, verbosity: str = "full") -> dict[str, Any]:
     """Build the recall MCP envelope from a ``RecallResponse``.
 
     Kept out of the handler so the response-size guard
@@ -1082,12 +1150,19 @@ def _recall_envelope(result: Any, context: Any) -> dict[str, Any]:
     Args:
         result: The ``RecallResponse`` from ``MemoryService.recall``.
         context: The resolved primary context.
+        verbosity: ``"full"`` or ``"compact"`` (#2002).
 
     Returns:
         The envelope ``handle_recall`` serializes.
     """
-    results_data = [_recall_result_item(r) for r in result.results]
-    response_data: dict[str, Any] = {
+    results_data = [_recall_result_item(r, verbosity) for r in result.results]
+    response_data: dict[str, Any] = {}
+    # Issue #1047: top-level relevance confidence (level=none → the agent
+    # can stop probing early / go external instead of hallucinating). #2002:
+    # the first key, so the verdict is read before the hits.
+    if result.confidence is not None:
+        response_data["confidence"] = result.confidence.model_dump()
+    response_data |= {
         "status": "success",
         "results": results_data,
         "count": len(results_data),
@@ -1106,11 +1181,6 @@ def _recall_envelope(result: Any, context: Any) -> dict[str, Any]:
         response_data["explore_hints"] = [
             {"memory_id": str(h.memory_id), "reason": h.reason} for h in result.explore_hints
         ]
-
-    # Issue #1047: top-level relevance confidence (level=none → the agent
-    # can stop probing early / go external instead of hallucinating).
-    if result.confidence is not None:
-        response_data["confidence"] = result.confidence.model_dump()
 
     # #1503: only present on an empty tag-filtered recall — it tells the
     # agent whether the topic is absent or just spelled differently.
@@ -1162,6 +1232,17 @@ async def handle_recall(
     max_chars, arg_error = _parse_max_chars_arg(args)
     if arg_error:
         return arg_error
+    # #2002: an omitted (or null) verbosity follows the deployment default,
+    # "compact" unless MCP_RECALL_DEFAULT_VERBOSITY says otherwise.
+    verbosity = args.get("verbosity")
+    if verbosity is None:
+        from config.settings import get_settings
+
+        verbosity = get_settings().mcp_recall_default_verbosity
+    if verbosity not in RECALL_VERBOSITIES:
+        return _error_response(
+            "validation_error", "verbosity must be 'compact' or 'full'", received=verbosity
+        )
 
     request = RecallRequest(
         query=args["query"],
@@ -1292,7 +1373,7 @@ async def handle_recall(
             # Built before the usage row / commit, as the item projection always
             # was: a result that cannot be rendered fails the call as a whole.
             response_data = _bound_recall_envelope(
-                _recall_envelope(result, current_context), max_chars
+                _recall_envelope(result, current_context, verbosity), max_chars
             )
 
             await _log_tool_usage(
