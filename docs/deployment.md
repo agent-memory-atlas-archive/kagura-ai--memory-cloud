@@ -1393,6 +1393,40 @@ The sweep reads Postgres one page of points at a time and ends its
 transaction after each page, so a long scan is not cut short by
 `idle_in_transaction_session_timeout`.
 
+### Files left in contexts deleted before v0.101 — Issue #1966
+
+Until #1960 (v0.101.0) deleting a context left its files live: hidden from
+every listing and from the storage page, but still counted by the upload
+quota (`workspace_storage_usage` and the Redis counter). The capacity lock and
+the downgrade eligibility (#1961) never counted them, so such a workspace could
+downgrade to Free and then have every upload refused with no lock to explain
+it. Since #1966 the Redis counter reseeds from the same definition the lock
+uses (committed files in live contexts or workspace-scoped), and the leftover
+rows are cleared once with a one-shot command:
+
+```bash
+python -m src.cli.backfill_deleted_context_files                # plan: one line per deleted context, changes nothing
+python -m src.cli.backfill_deleted_context_files --apply --yes  # contexts inside the file restore window
+python -m src.cli.backfill_deleted_context_files --apply --include-past-window   # the rest (permanent, see below)
+```
+
+The command runs one context per transaction, rewrites that workspace's Redis
+counter from the shared definition right after the commit
+(`storage_quota_counter_reseeded`), and logs `deleted_context_files_backfilled`
+per context (files, uploaded bytes, released bytes). A second run finds
+nothing; a context restored, or deleted again, between the plan and its turn
+is skipped. `--workspace <id>` limits a run to one workspace.
+
+The files are stamped with their context's own `deleted_at`. For a context
+deleted inside the file restore window (6 days) `restore_context` brings them
+back with the context, like any deletion since #1960. For a context deleted
+earlier — most of what this command finds — the plan prints `past window`:
+those files cannot be restored and the nightly file GC removes their objects
+on its next run. **That deletion is permanent**, so those contexts are skipped
+unless `--include-past-window` is given. Until then such a context can still
+be restored with its files; run the plan, read the warning, and keep the
+backups' retention in mind before `--apply --include-past-window`.
+
 ### Restoring a deleted context — Issue #1804
 
 Deleting a context soft-deletes it and its memories, and removes their points.

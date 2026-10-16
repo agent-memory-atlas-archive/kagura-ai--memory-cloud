@@ -23,7 +23,6 @@ import asyncio
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.redis import get_cache, get_redis_client, incrby_counter, set_cache
@@ -321,6 +320,41 @@ async def release_storage_bytes(
             )
 
 
+async def reseed_storage_counter(workspace_id: UUID, db: AsyncSession) -> int | None:
+    """Rewrite the Redis counter from the database aggregate, with the seed TTL.
+
+    For writes that change what the counter should hold without going
+    through a reservation (the #1966 backfill). Neither a decrement nor a
+    delete is safe there: a decrement creates a negative key with no TTL
+    when none exists and subtracts bytes a reseed already left out; a
+    delete races the reservation Lua (``GET`` → nil → ``INCRBY``, no
+    ``EXPIRE``), which would leave a TTL-less key holding one reservation's
+    delta instead of the aggregate. ``SET`` with the 24h TTL can at worst
+    lose one in-flight increment, never the aggregate, and the next TTL
+    expiry reseeds anyway. Fail-open on Redis errors: the stale value keeps
+    its TTL and is logged.
+
+    Returns:
+        The value written, or ``None`` when Redis refused it.
+    """
+    key = _build_key(workspace_id)
+    seeded = await _aggregate_from_db(workspace_id, db)
+    try:
+        await set_cache(key, str(seeded), ttl=86400)
+    except RedisError as exc:
+        logger.error(
+            "storage_quota_counter_reseed_failed",
+            workspace_id=str(workspace_id),
+            seeded_bytes=seeded,
+            error=str(exc),
+        )
+        return None
+    logger.info(
+        "storage_quota_counter_reseeded", workspace_id=str(workspace_id), seeded_bytes=seeded
+    )
+    return seeded
+
+
 async def get_current_storage_usage(
     workspace_id: UUID,
     db: AsyncSession,
@@ -369,20 +403,15 @@ async def _get_or_seed_counter(
 
 
 async def _aggregate_from_db(workspace_id: UUID, db: AsyncSession) -> int:
-    """Sum committed (uploaded, not deleted) ``file_objects`` size_bytes
-    for ``workspace_id``.
+    """Sum the committed bytes of ``workspace_id`` the way every other gate does.
 
-    Excludes ``status='reserved'`` rows because those are tracked in
-    Redis until ``confirm_upload`` flips them to ``uploaded``. Excludes
-    ``status='failed'`` and soft-deleted rows.
+    One definition (#1966): ``services/storage_counts.reducible_storage_bytes_stmt``
+    — ``status='uploaded'``, not soft-deleted, and in a live context or
+    workspace-scoped. ``reserved`` rows are tracked in Redis until
+    ``confirm_upload`` flips them; ``failed`` rows, soft-deleted rows and files
+    left in soft-deleted contexts (before #1960; backfilled by
+    ``cli/backfill_deleted_context_files``) are not committed storage.
     """
-    from models.file_objects import FileObject
+    from services.storage_counts import reducible_storage_bytes
 
-    result = await db.execute(
-        select(func.coalesce(func.sum(FileObject.size_bytes), 0)).where(
-            FileObject.workspace_id == workspace_id,
-            FileObject.status == "uploaded",
-            FileObject.deleted_at.is_(None),
-        )
-    )
-    return int(result.scalar_one())
+    return await reducible_storage_bytes(db, workspace_id)

@@ -242,9 +242,7 @@ class TestReserveStorageBytes:
     async def test_cold_start_reseeds_from_db(self, workspace_id):
         """Redis miss → DB aggregate → set_cache (with TTL) → atomic Lua."""
         db_session = MagicMock()
-        result = MagicMock()
-        result.scalar_one = MagicMock(return_value=2048)
-        db_session.execute = AsyncMock(return_value=result)
+        db_session.scalar = AsyncMock(return_value=2048)  # #1966: the shared statement
 
         with (
             patch.object(storage_quota_service, "get_cache", AsyncMock(return_value=None)),
@@ -368,9 +366,7 @@ class TestGetCurrentStorageUsage:
     @pytest.mark.asyncio
     async def test_falls_back_to_db_on_redis_error(self, workspace_id):
         db_session = MagicMock()
-        result = MagicMock()
-        result.scalar_one = MagicMock(return_value=8192)
-        db_session.execute = AsyncMock(return_value=result)
+        db_session.scalar = AsyncMock(return_value=8192)  # #1966: the shared statement
 
         with patch.object(
             storage_quota_service,
@@ -381,3 +377,29 @@ class TestGetCurrentStorageUsage:
                 await storage_quota_service.get_current_storage_usage(workspace_id, db_session)
                 == 8192
             )
+
+
+class TestReseedStorageCounter:
+    """#1966: a backfill rewrites the counter from the aggregate, with the seed TTL."""
+
+    @pytest.mark.asyncio
+    async def test_sets_the_aggregate_with_the_seed_ttl(self):
+        ws_id = uuid4()
+        db = MagicMock()
+        db.scalar = AsyncMock(return_value=1234)
+        with patch.object(storage_quota_service, "set_cache", AsyncMock()) as set_cache:
+            assert await storage_quota_service.reseed_storage_counter(ws_id, db) == 1234
+        set_cache.assert_awaited_once_with(
+            storage_quota_service._build_key(ws_id), "1234", ttl=86400
+        )
+
+    @pytest.mark.asyncio
+    async def test_redis_errors_are_logged_not_raised(self):
+        from utils.exceptions import RedisError
+
+        db = MagicMock()
+        db.scalar = AsyncMock(return_value=1234)
+        with patch.object(
+            storage_quota_service, "set_cache", AsyncMock(side_effect=RedisError("down"))
+        ):
+            assert await storage_quota_service.reseed_storage_counter(uuid4(), db) is None
