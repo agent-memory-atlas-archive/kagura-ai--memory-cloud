@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.constants import RERANK_PROMPT_FORMATS
 from models.auth import ExternalAPIKey
 from repositories.config_repository import ContextSearchConfigRepository
+from utils.content_chunks import rerank_document
 from utils.encryption import get_encryptor
 from utils.exceptions import CohereError, VoyageError
 from utils.logger import get_logger
@@ -1396,10 +1397,8 @@ class RerankerService:
             return candidates
 
         # Prepare documents for reranking
-        documents = [
-            f"{c['payload']['summary']} {c['payload'].get('context_summary', '')}"
-            for c in candidates
-        ]
+        # #2015: plus the matched chunk's text when a content chunk found it.
+        documents = [rerank_document(c) for c in candidates]
 
         # Every candidate is scored (the cut to k comes after) so the shared
         # no-signal guard below sees the whole list, for every provider (#2033).

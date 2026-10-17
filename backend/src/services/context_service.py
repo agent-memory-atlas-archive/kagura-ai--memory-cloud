@@ -537,6 +537,7 @@ class ContextService:
                 reinforce_max_boost=float(cfg.reinforce_max_boost),
                 reinforce_require_host_arbitration=cfg.reinforce_require_host_arbitration,
                 routing_mode=cfg.routing_mode,
+                content_chunks_enabled=cfg.content_chunks_enabled,
             )
             if cfg is not None
             else None
@@ -1188,6 +1189,24 @@ class ContextService:
             if new_id not in upserted:
                 rows_by_new_id[new_id].embedding_status = "pending"
                 unvectored += 1
+
+        # #2015: the copy carries summary points only. A target with content
+        # chunk vectors gets its long merged memories re-queued, so the
+        # embedding sweep rebuilds them with their chunk points.
+        if tgt_cfg is not None and getattr(tgt_cfg, "content_chunks_enabled", False) is True:
+            from utils.content_chunks import split_content
+
+            requeued = 0
+            for row in rows_by_new_id.values():
+                if row.embedding_status == "success" and split_content(row.content):
+                    row.embedding_status = "pending"
+                    requeued += 1
+            if requeued:
+                logger.info(
+                    "merge_content_chunks_requeued",
+                    target_context_id=str(target_context_id),
+                    memories=requeued,
+                )
 
         # #1497: never remove the source unless every LIVE row reached the target.
         #

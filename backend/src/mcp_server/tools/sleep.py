@@ -131,6 +131,8 @@ async def _re_embed_to_qdrant(
     workspace_id: str,
     context_id: str,
     collection_name: str,
+    *,
+    db: Any = None,
 ) -> None:
     """Re-embed a restored memory back into Qdrant.
 
@@ -147,6 +149,7 @@ async def _re_embed_to_qdrant(
         workspace_id,
         context_id,
         collection_name,
+        db=db,
     )
 
 
@@ -466,7 +469,13 @@ async def _restore_sleep_tombstone(
         summary["errors"].append(not_restorable)
         return
     await _re_embed_to_qdrant(
-        mem, ctx.user_id, ctx.embedding_svc, ctx.ws_id, ctx.ctx_id_str, ctx.collection_name
+        mem,
+        ctx.user_id,
+        ctx.embedding_svc,
+        ctx.ws_id,
+        ctx.ctx_id_str,
+        ctx.collection_name,
+        db=db,
     )
     summary[counter_key] += 1
 
@@ -531,10 +540,16 @@ async def _undo_update_importance(
         summary["importance_kept"] += 1
         return
     try:
+        from services.content_chunk_writer import chunk_cascade_needed
+
         await update_memory_payload_in_qdrant(
             memory_id=action.memory_id,
             payload_updates={"importance": old_importance},
             collection_name=ctx.collection_name,
+            # #2015: a context with content_chunks_enabled off has no chunks.
+            cascade_chunks=(
+                await chunk_cascade_needed(db, UUID(ctx.ctx_id_str)) if ctx.ctx_id_str else True
+            ),
         )
     except Exception:
         pass  # Non-fatal: Qdrant payload sync

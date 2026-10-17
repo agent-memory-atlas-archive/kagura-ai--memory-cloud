@@ -282,6 +282,42 @@ async def test_find_duplicate_candidate_applies_the_detection_threshold(db_sessi
         await run(0.91)
 
 
+@pytest.mark.asyncio
+async def test_find_duplicate_candidate_ignores_content_chunks(db_session, quiet_write):
+    """#2015: the dedupe probe compares summaries only, even on a context with
+    content_chunks_enabled — a paragraph of a long memory matching the new
+    summary is not a duplicate of it."""
+    from models.config import ContextSearchConfig
+
+    owner = f"o-{uuid4().hex[:6]}"
+    ws, ctx = await _scope(db_session, owner)
+    db_session.add(
+        ContextSearchConfig(
+            context_id=ctx.id,
+            embedding_model="text-embedding-3-small",
+            embedding_dimensions=1536,
+            content_chunks_enabled=True,
+        )
+    )
+    await db_session.commit()
+    embedder = MagicMock(embed=AsyncMock(return_value=[0.1, 0.2]))
+    search = AsyncMock(return_value=[])
+    with (
+        patch(
+            "services.context_routing.resolve_context_routing",
+            new=AsyncMock(return_value=("collection", embedder)),
+        ),
+        patch("db.qdrant.search_memories_qdrant", new=search),
+    ):
+        await MemoryService(db_session)._find_duplicate_candidate(
+            user_id=owner,
+            workspace_id_str=str(ws.id),
+            context_id_str=str(ctx.id),
+            summary="JWT expiry caused a 401",
+        )
+    assert "include_chunks" not in search.await_args.kwargs
+
+
 # ------------------------------------------------------ inner review (#1853)
 
 

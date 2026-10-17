@@ -155,6 +155,13 @@ async def lifespan(app: FastAPI):
 
     app.state.dense_vector_config_task = asyncio.create_task(run_dense_vector_config_reconcile())
 
+    # #2015: every dense search / delete / payload update filters on chunk_of,
+    # so collections created before it need the payload index. Idempotent and
+    # fail-soft, once per process, in the background.
+    from db.qdrant import ensure_chunk_of_index_on_all
+
+    app.state.chunk_of_index_task = asyncio.create_task(ensure_chunk_of_index_on_all())
+
     # #2020 / #2033: one cheap calibration smoke check of the local rerank
     # model — /v1/rerank, or the Ollama path for a self_hosted default — (a
     # relevant vs an irrelevant document) per process, so a mis-formatted
@@ -195,6 +202,14 @@ async def lifespan(app: FastAPI):
             await dense_task
         except asyncio.CancelledError:
             logger.info("dense_vector_config_cancelled_on_shutdown")
+
+    chunk_index_task = getattr(app.state, "chunk_of_index_task", None)
+    if chunk_index_task is not None and not chunk_index_task.done():
+        chunk_index_task.cancel()
+        try:
+            await chunk_index_task
+        except asyncio.CancelledError:
+            pass  # expected: we cancelled it ourselves
 
     # Stop the rerank calibration check if it is still waiting on a
     # reranker that has not come up (#2020).

@@ -162,12 +162,45 @@ class ContextSearchConfigRepository:
             raise ValueError(error_msg)
 
         # Update fields
+        chunks_were_on = getattr(config, "content_chunks_enabled", False) is True
         update_dict = update_data.model_dump(exclude_unset=True)
         for key, value in update_dict.items():
             setattr(config, key, value)
 
+        # #2015 invariant: a context with content_chunks_enabled off has no
+        # chunk points, and recall only reads chunk points while it is on.
+        # Any flag change purges them BEFORE the commit — off: if the purge
+        # fails the update is rolled back and the flag stays on; on: chunks a
+        # racing writer left while it was off never become visible. Turning
+        # it off purges again AFTER the commit, for a writer that read "on"
+        # between the first purge and the commit (the writer also re-reads
+        # the flag right before its upsert).
+        chunks_now_on = getattr(config, "content_chunks_enabled", False) is True
+        flag_changed = chunks_were_on != chunks_now_on
+        if flag_changed:
+            try:
+                await self._purge_chunk_points(context_id, config)
+            except Exception:
+                await self.db.rollback()
+                raise
+
         await self.db.commit()
         await self.db.refresh(config)
+        if flag_changed and not chunks_now_on:
+            try:
+                await self._purge_chunk_points(context_id, config)
+            except Exception as exc:  # noqa: BLE001 — flag is committed off
+                # Leftovers stay invisible (recall reads chunks only while the
+                # flag is on) and are purged when it is turned on again.
+                logger.warning(
+                    "content_chunks_post_commit_purge_failed",
+                    context_id=str(context_id),
+                    error_class=type(exc).__name__,
+                )
+        if "content_chunks_enabled" in update_dict:
+            from services.content_chunk_writer import forget_cached_chunk_flag
+
+            forget_cached_chunk_flag(context_id)
 
         logger.info(
             "config_updated",
@@ -181,11 +214,34 @@ class ContextSearchConfigRepository:
 
         return config
 
-    async def reset_to_default(self, context_id: UUID) -> ContextSearchConfig:
+    async def _purge_chunk_points(self, context_id: UUID, config: ContextSearchConfig) -> None:
+        """Delete every content chunk point of a context (#2015)."""
+        from db.qdrant import get_collection_name, purge_context_chunk_points
+        from models.auth import Context
+
+        workspace_id = (
+            await self.db.execute(select(Context.workspace_id).where(Context.id == context_id))
+        ).scalar_one_or_none()
+        if workspace_id is None:
+            return
+        await purge_context_chunk_points(
+            str(workspace_id),
+            str(context_id),
+            get_collection_name(config.embedding_model, config.embedding_dimensions),
+        )
+        logger.info("content_chunks_purged", context_id=str(context_id))
+
+    async def reset_to_default(
+        self, context_id: UUID, *, reset_content_chunks: bool = True
+    ) -> ContextSearchConfig:
         """Reset configuration to default values.
 
         Args:
             context_id: Context UUID
+            reset_content_chunks: Also turn ``content_chunks_enabled`` off
+                (#2015). The REST route passes ``False`` when the flag is
+                already off, so a reset by an editor never writes the flag —
+                changing it takes the context owner.
 
         Returns:
             Reset ContextSearchConfig
@@ -195,6 +251,11 @@ class ContextSearchConfigRepository:
         """
         logger.info("config_resetting", context_id=str(context_id))
 
+        # #2015: chunks off (update purges the context's chunk points) — only
+        # when asked, so the flag is otherwise left out of the update.
+        chunk_reset: dict[str, bool] = (
+            {"content_chunks_enabled": False} if reset_content_chunks else {}
+        )
         defaults = ContextSearchConfigUpdate(
             semantic_weight=0.6,
             bm25_weight=0.4,
@@ -209,6 +270,7 @@ class ContextSearchConfigRepository:
             reinforce_enabled=True,
             reinforce_max_boost=0.15,
             reinforce_require_host_arbitration=False,
+            **chunk_reset,
         )
 
         config = await self.update(context_id, defaults)

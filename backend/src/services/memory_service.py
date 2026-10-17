@@ -72,6 +72,7 @@ from models.schemas import (
 )
 from repositories.memory import AccessStats, MemoryRepository
 from services.capacity_lock import CapacityPolicy
+from services.content_chunk_writer import chunk_cascade_needed, write_content_chunks
 from services.context_routing import resolve_collection_name
 from services.context_service import ContextService
 from services.embedding_service import EmbeddingService
@@ -1883,6 +1884,8 @@ class MemoryService:
             payload_updates=payload_updates,
             collection_name=collection,
             delete_keys=delete_keys or None,
+            # #2015: a context that never opted in has no chunk points.
+            cascade_chunks=await chunk_cascade_needed(self.db, memory.context_id),
         )
 
     async def _patch_load_authorized(self, memory_id: UUID, user_id: str) -> Any:
@@ -2133,6 +2136,8 @@ class MemoryService:
                 payload_updates=payload_updates,
                 collection_name=collection,
                 delete_keys=delete_keys or None,
+                # #2015: a context that never opted in has no chunk points.
+                cascade_chunks=await chunk_cascade_needed(self.db, memory.context_id),
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -6025,7 +6030,7 @@ class MemoryService:
                 break
             after = (rows[-1].created_at, rows[-1].id)
 
-        from db.qdrant import delete_points_from_qdrant
+        from db.qdrant import delete_chunk_points, delete_points_from_qdrant
         from services.memory_access_event_writer import (
             MAX_METADATA_MEMORY_IDS,
             emit_memory_access_event,
@@ -6051,6 +6056,18 @@ class MemoryService:
             except Exception:
                 await self.db.rollback()
                 raise
+            # #2015: their content chunk points too. Fail-soft — the rows are
+            # committed tombstones by now, and the orphan sweep removes the
+            # chunks of a tombstoned memory after the grace period.
+            try:
+                await delete_chunk_points(deleted, collection)
+            except Exception as exc:
+                logger.warning(
+                    "content_chunks_delete_failed",
+                    collection=collection,
+                    memories=len(deleted),
+                    error_class=type(exc).__name__,
+                )
             deleted_total += len(deleted)
             await emit_memory_access_event(
                 operation="forget",
@@ -8060,6 +8077,17 @@ async def process_pending_embedding(memory_id: UUID) -> None:
                     context_id=str(memory.context_id),
                     sparse_indices=sparse_indices,
                     sparse_values=sparse_values,
+                    collection_name=collection,
+                )
+
+                # #2015: on an opted-in context, a long content is also
+                # embedded as chunk points. Fail-open, and a no-op (no query)
+                # for content too short to split.
+                await write_content_chunks(
+                    db,
+                    memory,
+                    base_payload=payload,
+                    embed_svc=embed_svc,
                     collection_name=collection,
                 )
 
