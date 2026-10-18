@@ -58,6 +58,7 @@ from services.sleep.prompts import (
     wrap_untrusted_content,
 )
 from services.sleep.reporter import (
+    EmbeddingSpendTracker,
     LLMCallBreakdown,
     PhaseResult,
     SleepBudget,
@@ -247,7 +248,7 @@ class _MergeTally:
     skipped_pinned: int = 0
 
 
-class DedupMergePhase:
+class DedupMergePhase(EmbeddingSpendTracker):
     """Detect and merge duplicate memories."""
 
     def __init__(
@@ -575,6 +576,8 @@ class DedupMergePhase:
         )
         if not pairs:
             result.details = {"message": "no_duplicate_candidates"}
+            # #2060: the candidate search above already billed its embeddings.
+            self.record_spend(result)
             return result
 
         # #1208: in shadow mode losers stay active, so already-settled pairs
@@ -591,6 +594,7 @@ class DedupMergePhase:
                     "message": "all_candidates_already_superseded",
                     "settled_pairs_skipped": settled_pairs_skipped,
                 }
+                self.record_spend(result)  # #2060: embeddings already billed
                 return result
 
         # Step 3: Cluster with Union-Find
@@ -733,18 +737,7 @@ class DedupMergePhase:
         }
 
         result.llm_calls_used = budget.llm_calls_used - llm_calls_before
-        result.tokens_used = self._tokens_used
-        result.llm_call_failures = self._llm_failures  # #1183
-        # #471: attach per-(provider, model) breakdown for child-row write.
-        if self._llm_breakdown is not None:
-            result.llm_breakdown = [self._llm_breakdown]
-        # #475: surface embedding usage; skip identity when no calls
-        # happened so no-memory early-returns don't fabricate it.
-        result.embedding_calls_used = self._embedding_calls_used
-        result.embedding_tokens = self._embedding_tokens_used
-        if self._embedding_calls_used > 0:
-            result.embedding_provider = self.embedding_service.provider
-            result.embedding_model = self.embedding_service.model
+        self.record_spend(result)
 
         logger.info(
             "dedup_merge_phase_completed",
@@ -1051,12 +1044,6 @@ class DedupMergePhase:
                 provider=config.sleep_llm_provider,
                 platform_only=judge_platform_only(config),  # #1569
             )
-            budget.consume(llm_calls=1)
-            self._tokens_used += llm_resp.total_tokens
-            self._llm_breakdown = accumulate_llm_response(self._llm_breakdown, llm_resp)
-
-            return self._parse_dedup_response(llm_resp.parsed, label_to_id)
-
         except Exception as e:
             self._llm_failures += 1  # #1183
             logger.warning("dedup_llm_judge_failed", error=str(e))
@@ -1069,6 +1056,26 @@ class DedupMergePhase:
                     self._llm_breakdown, usage, count_call=False
                 )
             return []
+
+        # The call answered and was billed either way.
+        budget.consume(llm_calls=1)
+        self._tokens_used += llm_resp.total_tokens
+        # #2060: parse OUTSIDE the LLM try, so each call is counted exactly
+        # once. A parse exception used to count as a success AND a failure;
+        # now an answer that cannot be parsed is a billed failure, like the
+        # unparseable JSON LLMService raises on: tokens count, the call does
+        # not, and it still feeds run grading (#1183).
+        try:
+            decisions = self._parse_dedup_response(llm_resp.parsed, label_to_id)
+        except Exception as e:
+            self._llm_failures += 1
+            logger.warning("dedup_llm_response_unparseable", error=str(e))
+            self._llm_breakdown = accumulate_llm_response(
+                self._llm_breakdown, llm_resp, count_call=False
+            )
+            return []
+        self._llm_breakdown = accumulate_llm_response(self._llm_breakdown, llm_resp)
+        return decisions
 
     def _parse_dedup_response(
         self,

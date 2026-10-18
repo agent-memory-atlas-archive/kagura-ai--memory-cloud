@@ -91,6 +91,7 @@ def _make_llm_response(parsed):
     resp.input_tokens = 80
     resp.output_tokens = 40
     resp.cached_input_tokens = 0
+    resp.cache_write_tokens = 0
     resp.provider = "openai"
     resp.model = "gpt-5-nano"
     resp.tokenizer_version = "v1"
@@ -434,6 +435,35 @@ class TestLLMJudge:
         else:
             assert dedup_phase._tokens_used == 0
             assert dedup_phase._llm_breakdown is None
+
+    async def test_parse_failure_is_one_billed_failure(self, dedup_phase):
+        """#2060: an answer that fails to parse is counted once, as a billed
+        failure — tokens and budget count, the call does not, and it feeds run
+        grading. The parse used to run inside the LLM try, so it counted as a
+        success AND a failure.
+        """
+        mem_a = _make_memory()
+        mem_b = _make_memory()
+        scores = {tuple(sorted([mem_a.id, mem_b.id], key=str)): 0.96}
+        budget = SleepBudget()
+        # A judgment that is not an object makes _parse_dedup_response raise.
+        parsed = {"judgments": ["not-an-object"]}
+        dedup_phase.llm_service.complete_json = AsyncMock(return_value=_make_llm_response(parsed))
+        dedup_phase._tokens_used = 0
+        dedup_phase._llm_breakdown = None
+        dedup_phase._llm_failures = 0
+
+        decisions = await dedup_phase._llm_judge(
+            [mem_a, mem_b], scores, "u", "ctx", "ws", budget, _make_config()
+        )
+
+        assert decisions == []
+        assert dedup_phase._llm_failures == 1
+        assert budget.llm_calls_used == 1
+        assert dedup_phase._tokens_used == 120
+        assert dedup_phase._llm_breakdown is not None
+        assert dedup_phase._llm_breakdown.total_tokens == 120
+        assert dedup_phase._llm_breakdown.calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1176,6 +1206,30 @@ class TestExecuteEarlyReturns:
         dedup_phase._find_similar_pairs = AsyncMock(return_value=[])
         result = await dedup_phase.execute(config, "u", "ws", "ctx", SleepBudget())
         assert result.details == {"message": "no_duplicate_candidates"}
+
+    async def test_no_candidate_pairs_still_reports_the_embedding_spend(self, dedup_phase):
+        """#2060: the candidate search embeds before finding no pairs; that
+        billed usage reaches the result instead of being dropped."""
+        config = _make_config()
+        dedup_phase._fetch_active_memories = AsyncMock(
+            return_value=[_make_memory(), _make_memory()]
+        )
+
+        async def _search_that_embeds(*_args, **_kwargs):  # noqa: ANN002, ANN003
+            dedup_phase._embedding_calls_used += 2
+            dedup_phase._embedding_tokens_used += 300
+            return []
+
+        dedup_phase._find_similar_pairs = _search_that_embeds
+        dedup_phase.embedding_service.provider = "openai"
+        dedup_phase.embedding_service.model = "text-embedding-3-small"
+
+        result = await dedup_phase.execute(config, "u", "ws", "ctx", SleepBudget())
+
+        assert result.details == {"message": "no_duplicate_candidates"}
+        assert result.embedding_calls_used == 2
+        assert result.embedding_tokens == 300
+        assert result.embedding_model == "text-embedding-3-small"
 
 
 class TestFetchActiveMemoriesRealDB:
