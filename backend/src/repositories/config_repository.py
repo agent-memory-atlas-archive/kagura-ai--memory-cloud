@@ -9,7 +9,7 @@ from datetime import datetime  # noqa: TC003 - runtime annotation in upsert()
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,10 +30,11 @@ def search_config_defaults(settings: Settings) -> dict[str, Any]:
 
     The one place the deployment default (``DEFAULT_USE_RERANK`` /
     ``DEFAULT_RERANKER_PROVIDER`` / ``DEFAULT_RERANKER_MODEL``) becomes row
-    values. Shared by ``ContextService.create_context``, ``setup_resource``,
+    values. Shared by :func:`new_search_config_defaults` (a new context's row:
+    ``ContextService.create_context``, ``setup_resource``, ``/system/info``),
     :meth:`ContextSearchConfigRepository.create_or_get`,
     :meth:`ContextSearchConfigRepository.reset_to_default`, the MCP
-    ``update_search_config`` fallbacks, ``/system/info`` and the legacy-row
+    ``update_search_config`` fallbacks and the legacy-row
     materialisation in ``embedding_migration_service.switch_context_embedding``.
     Admin context recovery (``api/routes/admin.py``) deliberately does not use
     it: a recovered row pins the non-ranking-modifying values (#1207). The ORM
@@ -58,6 +59,26 @@ def search_config_defaults(settings: Settings) -> dict[str, Any]:
         "reranker_provider": provider,
         "reranker_model": settings.default_reranker_model
         or default_reranker_model_for(provider, settings),
+    }
+
+
+def new_search_config_defaults(settings: Settings) -> dict[str, Any]:
+    """Row values for a NEW context search config (#2015 D8).
+
+    :func:`search_config_defaults` plus ``content_chunks_enabled`` from
+    ``DEFAULT_CONTENT_CHUNKS_ENABLED``. Only where a NEW context is created —
+    ``ContextService.create_context``, ``setup_resource`` — and in
+    ``/system/info``. Never in :meth:`ContextSearchConfigRepository.reset_to_default`
+    (a reset would let an editor turn chunks on, past the owner rule),
+    :meth:`ContextSearchConfigRepository.create_or_get` (a legacy context's
+    row, materialised by any reader), ``cli/apply_rerank_defaults.py`` or the
+    migration's legacy-row materialisation: those rewrite or recreate an
+    existing context's row, and turning chunks on there sends its content to
+    the provider without its owner's choice.
+    """
+    return {
+        **search_config_defaults(settings),
+        "content_chunks_enabled": settings.default_content_chunks_enabled,
     }
 
 
@@ -119,7 +140,10 @@ class ContextSearchConfigRepository:
 
         # Create default config. The reranker fields are passed explicitly so
         # the lazily materialized row (a recall on a row-less legacy context)
-        # gets the same deployment default as create_context (#1572).
+        # gets the same deployment default as create_context (#1572). Not the
+        # content chunk default (#2015 D8): this is an existing context, its
+        # memories already written, and any reader materialises the row —
+        # turning chunks on stays its owner's choice.
         logger.info("config_creating_default", context_id=str(context_id))
         config = ContextSearchConfig(
             context_id=context_id, **search_config_defaults(get_settings())
@@ -162,6 +186,7 @@ class ContextSearchConfigRepository:
             raise ValueError(error_msg)
 
         # Update fields
+        backfill_queued: int | None = None
         chunks_were_on = getattr(config, "content_chunks_enabled", False) is True
         update_dict = update_data.model_dump(exclude_unset=True)
         for key, value in update_dict.items():
@@ -174,18 +199,26 @@ class ContextSearchConfigRepository:
         # racing writer left while it was off never become visible. Turning
         # it off purges again AFTER the commit, for a writer that read "on"
         # between the first purge and the commit (the writer also re-reads
-        # the flag right before its upsert).
+        # the flag right before its upsert). Turning it on also queues the
+        # context's existing long memories for chunking (D4), in the same
+        # transaction as the flag.
         chunks_now_on = getattr(config, "content_chunks_enabled", False) is True
         flag_changed = chunks_were_on != chunks_now_on
         if flag_changed:
             try:
                 await self._purge_chunk_points(context_id, config)
+                if chunks_now_on:
+                    backfill_queued = await self._queue_content_chunk_backfill(context_id)
             except Exception:
                 await self.db.rollback()
                 raise
 
         await self.db.commit()
         await self.db.refresh(config)
+        if backfill_queued is not None:
+            logger.info(
+                "content_chunks_backfill_queued", context_id=str(context_id), count=backfill_queued
+            )
         if flag_changed and not chunks_now_on:
             try:
                 await self._purge_chunk_points(context_id, config)
@@ -213,6 +246,66 @@ class ContextSearchConfigRepository:
         )
 
         return config
+
+    async def _queue_content_chunk_backfill(self, context_id: UUID) -> int:
+        """Re-queue the context's existing long memories for chunking (#2015 D4).
+
+        One UPDATE, in the caller's transaction: every live ``success`` row of
+        the context whose content is long enough to split goes back to
+        ``pending``, and the embedding sweep rebuilds it — summary point and
+        chunk points — under the usual claim and retry. The row keeps its
+        summary point meanwhile, so it stays searchable. Only ``success`` rows:
+        a ``processing`` row is a run in flight (it writes its chunks itself
+        now that the flag is on), ``pending`` / ``failed`` rows are picked up
+        anyway. Neither ``embedding_attempted_at`` (the pipeline's clock) nor
+        ``updated_at`` (an edit's cue) is written. Resource rows
+        (``resource_id``) are left out: they never get chunks.
+
+        Returns:
+            How many rows were queued (0 on a store without chunk points).
+        """
+        from db.qdrant import chunk_points_supported
+        from models.memory import Memory
+        from utils.content_chunks import CONTENT_CHUNK_MIN_CONTENT_CHARS
+
+        if not chunk_points_supported():
+            return 0
+        result = await self.db.execute(
+            update(Memory)
+            .where(
+                Memory.context_id == context_id,
+                Memory.deleted_at.is_(None),
+                Memory.embedding_status == "success",
+                func.char_length(Memory.content) >= CONTENT_CHUNK_MIN_CONTENT_CHARS,
+                Memory.resource_id.is_(None),
+            )
+            .values(embedding_status="pending")
+            .execution_options(synchronize_session=False)
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def content_chunk_backfill_pending(self, context_id: UUID) -> int:
+        """How many of the context's long memories still wait for their chunks.
+
+        The live long non-resource rows not yet ``success`` — what a backfill
+        queued and the sweep has not drained, plus new writes in flight
+        (#2015 D4). Served on the search-config response for the UI.
+        """
+        from models.memory import Memory
+        from utils.content_chunks import CONTENT_CHUNK_MIN_CONTENT_CHARS
+
+        result = await self.db.execute(
+            select(func.count())
+            .select_from(Memory)
+            .where(
+                Memory.context_id == context_id,
+                Memory.deleted_at.is_(None),
+                Memory.embedding_status != "success",
+                func.char_length(Memory.content) >= CONTENT_CHUNK_MIN_CONTENT_CHARS,
+                Memory.resource_id.is_(None),
+            )
+        )
+        return int(result.scalar_one() or 0)
 
     async def _purge_chunk_points(self, context_id: UUID, config: ContextSearchConfig) -> None:
         """Delete every content chunk point of a context (#2015), in every collection.
