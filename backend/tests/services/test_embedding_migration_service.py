@@ -21,6 +21,22 @@ from services.resource_indexer import ResourceRebuildError, resource_point_id
 from utils.exceptions import NotFoundException, ValidationError
 
 SMALL = "text-embedding-3-small"
+
+
+@pytest.fixture(autouse=True)
+def _no_content_chunks():
+    """#2015: the context has content_chunks_enabled off and the target holds
+    no chunk points, unless a test says otherwise (TestContentChunks). The
+    re-embed calls the chunk writer on every page (F21); it writes nothing."""
+    with (
+        patch.object(svc, "content_chunks_enabled", AsyncMock(return_value=False)) as enabled,
+        patch.object(svc, "count_context_chunk_points", AsyncMock(return_value={})) as counted,
+        patch.object(svc, "delete_chunk_points", AsyncMock()) as deleted,
+        patch.object(svc, "rebuild_content_chunks", AsyncMock(return_value=0)),
+    ):
+        yield {"enabled": enabled, "counted": counted, "deleted": deleted}
+
+
 QWEN = "qwen3-embedding:4b"
 
 
@@ -32,6 +48,13 @@ def _result(*, scalar=None, scalars=None, rowcount=0):
         return_value=MagicMock(all=MagicMock(return_value=list(scalars or [])))
     )
     result.rowcount = rowcount
+    return result
+
+
+def _rows_result(rows):
+    """A result whose ``.all()`` returns ``rows`` (tuples)."""
+    result = MagicMock()
+    result.all = MagicMock(return_value=list(rows))
     return result
 
 
@@ -159,13 +182,53 @@ class TestPlan:
         assert plan.memory_count == 8261
 
     @pytest.mark.asyncio
-    async def test_a_context_with_content_chunks_is_refused(self):
-        """#2015: reembed/verify are summary-point only; verify would drop chunks."""
+    async def test_a_context_with_content_chunks_is_planned_with_a_chunk_estimate(self):
+        """#2015 PR 2a: the re-embed rebuilds chunk points, so no refusal; the
+        plan estimates the extra embedding inputs from char_length only."""
         config = _config(SMALL, 512)
         config.content_chunks_enabled = True
-        db = _db([_result(scalar=_context()), _result(scalar=config)])
-        with pytest.raises(ValidationError, match="content_chunks_enabled"):
-            await svc.plan_context_migration(db, uuid4(), QWEN)
+        db = _db(
+            [
+                _result(scalar=_context()),
+                _result(scalar=config),
+                _result(scalar=3),
+                _rows_result(
+                    [
+                        (_memory(), 1500),
+                        (_memory(), 2500),
+                        (_memory(), 40000),
+                        (_resource_memory(), 9000),  # never chunked
+                    ]
+                ),
+            ]
+        )
+        plan = await svc.plan_context_migration(db, uuid4(), QWEN)
+        assert plan.content_chunks_on is True
+        assert plan.chunk_estimate == 2 + 3 + 16
+        lengths_stmt = db.execute.await_args_list[3].args[0]
+        compiled = str(lengths_stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "char_length(memories.content) >= 1500" in compiled
+
+    @pytest.mark.asyncio
+    async def test_a_stored_flag_without_chunk_point_support_has_no_estimate(self):
+        """#2072: the LanceDB store writes no chunk points, so a stored flag
+        neither promises a chunk rebuild nor estimates its embedding spend."""
+        config = _config(SMALL, 512)
+        config.content_chunks_enabled = True
+        db = _db([_result(scalar=_context()), _result(scalar=config), _result(scalar=3)])
+        with patch.object(svc, "chunk_points_supported", return_value=False):
+            plan = await svc.plan_context_migration(db, uuid4(), QWEN)
+        assert (plan.content_chunks_on, plan.chunk_estimate) == (False, 0)
+        assert db.execute.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_a_context_without_content_chunks_has_no_estimate_query(self):
+        config = _config(SMALL, 512)
+        config.content_chunks_enabled = False
+        db = _db([_result(scalar=_context()), _result(scalar=config), _result(scalar=3)])
+        plan = await svc.plan_context_migration(db, uuid4(), QWEN)
+        assert (plan.content_chunks_on, plan.chunk_estimate) == (False, 0)
+        assert db.execute.await_count == 3
 
     @pytest.mark.asyncio
     async def test_purging_a_context_with_content_chunks_is_allowed(self):
@@ -951,3 +1014,427 @@ class TestListing:
         assert await svc.list_migratable_context_ids(db) == ids
         compiled = str(db.execute.await_args.args[0].compile())
         assert "deleted_at IS NULL" in compiled
+
+
+# ------------------------------------------------------------- content chunks
+
+
+def _routed_to_source():
+    """The context still routes to the plan's source (the state before the switch)."""
+    return patch.object(svc, "resolve_context_embedding", AsyncMock(return_value=(SMALL, 512)))
+
+
+class TestSwitchRequeuePredicates:
+    """F20: the rows the switch re-queues and the rows the chunk recheck
+    looks at partition the live rows, NULL ``updated_at`` included.
+
+    Evaluated by a real SQL engine (in-memory SQLite: the same three-valued
+    NULL logic as Postgres), not by reading the compiled text."""
+
+    def test_requeued_and_left_partition_every_row(self):
+        from itertools import product
+
+        from sqlalchemy import (
+            Column,
+            DateTime,
+            Integer,
+            MetaData,
+            String,
+            Table,
+            create_engine,
+            literal_column,
+        )
+        from sqlalchemy import select as sa_select
+
+        from models.memory import Memory
+
+        since = datetime(2026, 10, 1)
+        before, after = datetime(2026, 9, 1), datetime(2026, 10, 2)
+        # Same table and column names as Memory, so its predicates run as-is
+        # (the SELECT names Memory's table; SQLite resolves it to this one).
+        table = Table(
+            Memory.__tablename__,
+            MetaData(),
+            Column("n", Integer, primary_key=True),
+            Column("embedding_status", String),
+            Column("created_at", DateTime),
+            Column("updated_at", DateTime),
+        )
+        combos = list(
+            product(("success", "pending", "failed"), (before, after), (None, before, after))
+        )
+        engine = create_engine("sqlite://")
+        with engine.connect() as conn:
+            table.create(conn)
+            conn.execute(
+                table.insert(),
+                [
+                    {"n": n, "embedding_status": st, "created_at": c, "updated_at": u}
+                    for n, (st, c, u) in enumerate(combos)
+                ],
+            )
+
+            def matching(predicate) -> set[int]:
+                stmt = sa_select(literal_column("n")).select_from(Memory.__table__).where(predicate)
+                return set(conn.execute(stmt).scalars())
+
+            requeued = matching(svc._requeued_by_switch(since))
+            left = matching(svc._left_by_switch(since))
+
+        assert requeued.isdisjoint(left)
+        assert requeued | left == set(range(len(combos)))
+        never_edited = combos.index(("success", before, None))
+        assert never_edited in left  # the F20 row: not re-queued, so still checked
+        assert left == {
+            combos.index(("success", before, None)),
+            combos.index(("success", before, before)),
+        }
+
+
+class TestContentChunks:
+    """#2015 PR 2a: chunk points of an opted-in context follow the migration."""
+
+    @pytest.mark.asyncio
+    async def test_reembed_rebuilds_each_pages_chunks_in_the_target(self):
+        plan = _plan(content_chunks_on=True)
+        note, doc = _memory("u1"), _resource_memory()
+        db = _db([_result(scalars=[note, doc]), _result(scalars=[])])
+        service = MagicMock()
+        service.embed_batch = AsyncMock(side_effect=lambda texts, *a, **k: [[0.1] for _ in texts])
+        payload = {"summary": "s", "type": "note"}
+        with (
+            patch.object(svc, "ensure_kagura_memories_collection", AsyncMock()),
+            patch.object(svc, "add_memory_to_qdrant", AsyncMock()),
+            patch.object(svc, "build_memory_point", return_value=(payload, [], [])),
+            patch.object(svc, "ResourceIndexer", return_value=_indexer()),
+            patch.object(svc, "rebuild_content_chunks", AsyncMock(return_value=5)) as rebuild,
+        ):
+            result = await svc.reembed_context(db, plan, embedding_service=service)
+
+        rebuild.assert_awaited_once()
+        args, kwargs = rebuild.await_args
+        assert args == (db, [note])  # plain rows only, the resource row is the indexer's
+        assert kwargs["collection_name"] == plan.target_collection
+        assert kwargs["embed_svc"] is service  # the TARGET model
+        assert kwargs["base_payloads"] == {note.id: payload}
+        assert kwargs["context_id"] == plan.context_id
+        assert result.chunks_written == 5
+
+    @pytest.mark.asyncio
+    async def test_rebuild_target_chunks_rebuilds_the_listed_memories_page_by_page(self):
+        """F8: the chunks verify found incomplete are rebuilt in the target
+        with the target model before the switch; resource rows are skipped."""
+        plan = _plan()
+        a, b, doc, c = _memory(), _memory(), _resource_memory(), _memory()
+        db = _db([_result(scalars=[a, b]), _result(scalars=[doc, c])])
+        service = MagicMock()
+        with (
+            _routed_to_source(),
+            patch.object(svc, "build_memory_point", return_value=({"p": 1}, [], [])),
+            patch.object(svc, "rebuild_content_chunks", AsyncMock(side_effect=[4, 2])) as rebuild,
+        ):
+            result = await svc.rebuild_target_chunks(
+                db, plan, [c.id, a.id, b.id, doc.id, a.id], batch_size=2, embedding_service=service
+            )
+
+        assert result.chunks_written == 6
+        assert result.rebuilt == 3
+        assert result.still_missing == []  # flag off now: nothing is expected
+        assert db.execute.await_count == 2  # 4 distinct ids, pages of 2
+        first, second = rebuild.await_args_list
+        assert first.args == (db, [a, b])
+        assert second.args == (db, [c])  # the resource row is the indexer's
+        for call in (first, second):
+            assert call.kwargs["collection_name"] == plan.target_collection
+            assert call.kwargs["embed_svc"] is service
+            assert call.kwargs["context_id"] == plan.context_id
+        assert second.kwargs["base_payloads"] == {c.id: {"p": 1}}
+        compiled = str(db.execute.await_args_list[0].args[0].compile())
+        assert "deleted_at IS NULL" in compiled and "context_id" in compiled
+        # Each page's read transaction ends before the embedding calls.
+        assert db.commit.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_rebuild_target_chunks_reports_what_the_switch_will_not_requeue(
+        self, _no_content_chunks
+    ):
+        """After the rebuild the chunks are counted again; a memory whose
+        count still differs is reported, unless the switch re-queues it (the
+        query filters those out with ``requeue_since``)."""
+        plan = _plan()
+        ok, stuck = _memory(), _memory()
+        _no_content_chunks["enabled"].return_value = True
+        _no_content_chunks["counted"].return_value = {str(ok.id): 2, str(stuck.id): 1}
+        since = datetime(2026, 10, 1)
+        db = _db([_result(scalars=[ok, stuck]), _rows_result([(ok.id, 4000), (stuck.id, 4000)])])
+        with (
+            _routed_to_source(),
+            patch.object(svc, "build_memory_point", return_value=({}, [], [])),
+            patch.object(svc, "expected_chunk_count", side_effect=lambda n: 2),
+            patch.object(svc, "rebuild_content_chunks", AsyncMock(return_value=3)),
+        ):
+            result = await svc.rebuild_target_chunks(
+                db, plan, [ok.id, stuck.id], requeue_since=since, embedding_service=MagicMock()
+            )
+        assert result.still_missing == [stuck.id]
+        # Only the rebuilt memories' chunk points are counted.
+        _no_content_chunks["counted"].assert_awaited_once_with(
+            str(plan.workspace_id),
+            str(plan.context_id),
+            plan.target_collection,
+            memory_ids=[ok.id, stuck.id],
+        )
+        # Rows the switch re-queues are not rebuilt now: the sweep does it.
+        rows_read = str(db.execute.await_args_list[0].args[0].compile())
+        assert "updated_at IS NULL" in rows_read and "embedding_status" in rows_read
+        recheck = db.execute.await_args_list[1].args[0]
+        compiled = str(recheck.compile())
+        assert "embedding_status" in compiled and "updated_at <" in compiled
+        assert "created_at <" in compiled
+        assert "updated_at IS NULL" in compiled  # F20: never-edited rows stay checked
+
+    @pytest.mark.asyncio
+    async def test_rebuild_target_chunks_with_no_ids_does_nothing(self):
+        db = _db([])
+        with patch.object(svc, "rebuild_content_chunks", AsyncMock()) as rebuild:
+            result = await svc.rebuild_target_chunks(db, _plan(), [], embedding_service=MagicMock())
+        assert result.rebuilt == 0 and result.chunks_written == 0 and result.still_missing == []
+        rebuild.assert_not_awaited()
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reembed_with_the_flag_off_writes_no_chunks(self):
+        """F21: the writer is called per page whatever the plan says; with the
+        flag off (read fresh) it deletes and writes nothing."""
+        from services import content_chunk_writer as writer
+
+        db = _db([_result(scalars=[_memory()]), _result(scalars=[])])
+        service = MagicMock()
+        service.embed_batch = AsyncMock(side_effect=lambda texts, *a, **k: [[0.1] for _ in texts])
+        with (
+            patch.object(svc, "ensure_kagura_memories_collection", AsyncMock()),
+            patch.object(svc, "add_memory_to_qdrant", AsyncMock()),
+            patch.object(svc, "build_memory_point", return_value=({}, [], [])),
+            patch.object(svc, "rebuild_content_chunks", writer.rebuild_content_chunks),
+            patch.object(writer, "chunk_points_supported", return_value=True),
+            patch.object(writer, "content_chunks_enabled", AsyncMock(return_value=False)) as flag,
+            patch.object(writer, "delete_chunk_points", AsyncMock()) as delete,
+            patch.object(writer, "upsert_chunk_points", AsyncMock()) as upsert,
+        ):
+            result = await svc.reembed_context(db, _plan(), embedding_service=service)
+        flag.assert_awaited_once()
+        delete.assert_not_awaited()
+        upsert.assert_not_awaited()
+        assert result.chunks_written == 0
+
+    @pytest.mark.asyncio
+    async def test_reembed_picks_up_a_flag_turned_on_after_the_plan(self):
+        """F21: plan.content_chunks_on is only the estimate; the page's
+        chunks are written when the flag (read fresh) is on now."""
+        plan = _plan(content_chunks_on=False)
+        note = _memory("u1")
+        db = _db([_result(scalars=[note]), _result(scalars=[])])
+        service = MagicMock()
+        service.embed_batch = AsyncMock(side_effect=lambda texts, *a, **k: [[0.1] for _ in texts])
+        with (
+            patch.object(svc, "ensure_kagura_memories_collection", AsyncMock()),
+            patch.object(svc, "add_memory_to_qdrant", AsyncMock()),
+            patch.object(svc, "build_memory_point", return_value=({}, [], [])),
+            patch.object(svc, "rebuild_content_chunks", AsyncMock(return_value=3)) as rebuild,
+        ):
+            result = await svc.reembed_context(db, plan, embedding_service=service)
+        rebuild.assert_awaited_once()
+        assert result.chunks_written == 3
+
+    @pytest.mark.asyncio
+    async def test_rebuild_target_chunks_is_refused_once_the_target_is_routed(self):
+        """The writer claims nothing, so it is only safe in a collection no
+        worker writes to yet: after the switch it is refused."""
+        plan = _plan()
+        db = _db([])
+        with (
+            patch.object(
+                svc,
+                "resolve_context_embedding",
+                AsyncMock(return_value=(plan.target_model, plan.target_dimensions)),
+            ),
+            patch.object(svc, "rebuild_content_chunks", AsyncMock()) as rebuild,
+            pytest.raises(ValidationError, match="already routes to"),
+        ):
+            await svc.rebuild_target_chunks(db, plan, [uuid4()], embedding_service=MagicMock())
+        rebuild.assert_not_awaited()
+        db.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verify_reports_incomplete_chunks_without_failing(self, _no_content_chunks):
+        plan = _plan()
+        full, partial, short, missing_all = (_memory() for _ in range(4))
+        rows = [full, partial, short, missing_all]
+        _no_content_chunks["enabled"].return_value = True
+        _no_content_chunks["counted"].return_value = {
+            str(full.id): 3,
+            str(partial.id): 1,
+            str(short.id): 2,  # left from an older, longer content
+        }
+        db = _db(
+            [
+                _result(scalars=rows),
+                # char_length >= 1500 rows: full and partial 2500 (3 chunks),
+                # missing_all 1500 (2 chunks); short is not listed.
+                _rows_result([(full.id, 2500), (partial.id, 2500), (missing_all.id, 1500)]),
+            ]
+        )
+        client = MagicMock()
+        client.retrieve = AsyncMock(return_value=[MagicMock(id=str(m.id)) for m in rows])
+        with (
+            patch.object(svc, "get_qdrant_client", return_value=client),
+            patch.object(svc, "list_context_point_ids", AsyncMock(return_value=[])),
+            patch.object(svc, "delete_points_from_qdrant", AsyncMock()),
+        ):
+            result = await svc.verify_context_migration(db, plan)
+
+        assert result.ok  # D2: reported, does not block the switch
+        assert result.chunks_expected == 3 + 3 + 2
+        assert result.chunks_present == 3 + 1 + 2
+        assert result.chunks_missing == sorted([partial.id, short.id, missing_all.id])
+        assert result.chunks_stale_removed == 0
+        _no_content_chunks["counted"].assert_awaited_once_with(
+            str(plan.workspace_id), str(plan.context_id), plan.target_collection
+        )
+        _no_content_chunks["deleted"].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_verify_deletes_the_chunks_of_memories_no_longer_live(self, _no_content_chunks):
+        plan = _plan()
+        live = _memory()
+        forgotten, written_since = str(uuid4()), uuid4()
+        _no_content_chunks["enabled"].return_value = True
+        _no_content_chunks["counted"].return_value = {
+            str(live.id): 2,
+            forgotten: 2,
+            str(written_since): 2,
+        }
+        db = _db(
+            [
+                _result(scalars=[live]),
+                _rows_result([(live.id, 1500)]),
+                # asked again: a row written since the first read is live
+                _result(scalars=[_memory(memory_id=written_since)]),
+            ]
+        )
+        client = MagicMock()
+        client.retrieve = AsyncMock(return_value=[MagicMock(id=str(live.id))])
+        with (
+            patch.object(svc, "get_qdrant_client", return_value=client),
+            patch.object(svc, "list_context_point_ids", AsyncMock(return_value=[])),
+            patch.object(svc, "delete_points_from_qdrant", AsyncMock()),
+        ):
+            result = await svc.verify_context_migration(db, plan)
+
+        _no_content_chunks["deleted"].assert_awaited_once_with([forgotten], plan.target_collection)
+        assert result.chunks_stale_removed == 1
+        assert result.chunks_missing == []
+        # Asked again with the first read's rule: a live row of this context.
+        asked_again = str(db.execute.await_args_list[2].args[0].compile())
+        assert "context_id" in asked_again and "deleted_at IS NULL" in asked_again
+
+    @pytest.mark.asyncio
+    async def test_verify_deletes_the_chunks_of_a_row_that_now_owns_a_resource_point(
+        self, _no_content_chunks
+    ):
+        """Asked again, a live row is kept only as a plain row: a resource
+        row is never chunked, so chunk points under its id are stale."""
+        plan = _plan()
+        doc = _resource_memory()
+        _no_content_chunks["enabled"].return_value = True
+        _no_content_chunks["counted"].return_value = {str(doc.id): 2}
+        db = _db([_result(scalars=[]), _rows_result([]), _result(scalars=[doc])])
+        with (
+            patch.object(svc, "list_context_point_ids", AsyncMock(return_value=[])),
+            patch.object(svc, "delete_points_from_qdrant", AsyncMock()),
+        ):
+            result = await svc.verify_context_migration(db, plan)
+        _no_content_chunks["deleted"].assert_awaited_once_with(
+            [str(doc.id)], plan.target_collection
+        )
+        assert result.chunks_stale_removed == 1
+
+    @pytest.mark.asyncio
+    async def test_verify_with_the_flag_off_removes_every_chunk_of_the_context(
+        self, _no_content_chunks
+    ):
+        """Flag off ⇒ no chunk points, in the target too (a leftover of a
+        failed post-commit purge, or of a migration run before the flag-off)."""
+        plan = _plan()
+        live = _memory()
+        _no_content_chunks["counted"].return_value = {str(live.id): 2}
+        db = _db([_result(scalars=[live])])
+        client = MagicMock()
+        client.retrieve = AsyncMock(return_value=[MagicMock(id=str(live.id))])
+        with (
+            patch.object(svc, "get_qdrant_client", return_value=client),
+            patch.object(svc, "list_context_point_ids", AsyncMock(return_value=[])),
+            patch.object(svc, "delete_points_from_qdrant", AsyncMock()),
+        ):
+            result = await svc.verify_context_migration(db, plan)
+
+        _no_content_chunks["deleted"].assert_awaited_once_with(
+            [str(live.id)], plan.target_collection
+        )
+        assert (result.chunks_expected, result.chunks_missing) == (0, [])
+        assert result.chunks_stale_removed == 1
+        assert db.execute.await_count == 1  # no length query, no live re-check
+
+    @pytest.mark.asyncio
+    async def test_switch_deletes_the_chunks_of_memories_forgotten_since(self, _no_content_chunks):
+        config = _config(SMALL, 512)
+        note, doc = _memory(), _resource_memory()
+        db = _db(
+            [
+                _result(scalar=config),
+                _result(scalar=config),
+                _result(rowcount=0),
+                _result(scalars=[note, doc]),
+                _result(scalars=[]),
+            ]
+        )
+        with patch.object(svc, "delete_points_from_qdrant", AsyncMock()):
+            await svc.switch_context_embedding(
+                db, uuid4(), QWEN, 2560, requeue_since=datetime(2026, 9, 10, 12, 0, 0)
+            )
+        # In the NEW collection, by memory id; resource rows have no chunks.
+        _no_content_chunks["deleted"].assert_awaited_once_with(
+            [str(note.id)], "kagura_memories_qwen3_embedding_4b_2560"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_chunk_delete_still_removes_the_forgotten_summary_points(
+        self, _no_content_chunks
+    ):
+        config = _config(SMALL, 512)
+        note = _memory()
+        db = _db(
+            [
+                _result(scalar=config),
+                _result(scalar=config),
+                _result(rowcount=0),
+                _result(scalars=[note]),
+                _result(scalars=[]),
+            ]
+        )
+        _no_content_chunks["deleted"].side_effect = RuntimeError("qdrant busy")
+        with (
+            patch.object(svc, "delete_points_from_qdrant", AsyncMock()) as delete,
+            pytest.raises(RuntimeError),
+        ):
+            await svc.switch_context_embedding(
+                db, uuid4(), QWEN, 2560, requeue_since=datetime(2026, 9, 10, 12, 0, 0)
+            )
+        delete.assert_awaited_once_with([str(note.id)], "kagura_memories_qwen3_embedding_4b_2560")
+
+    @pytest.mark.asyncio
+    async def test_a_pure_flip_deletes_no_chunks(self, _no_content_chunks):
+        config = _config(SMALL, 512)
+        db = _db([_result(scalar=config), _result(scalar=config)])
+        await svc.switch_context_embedding(db, uuid4(), QWEN, 2560)
+        _no_content_chunks["deleted"].assert_not_awaited()
