@@ -37,7 +37,7 @@ from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select, type_coerce, update
+from sqlalchemy import case, delete, select, tuple_, type_coerce, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -1285,6 +1285,9 @@ class AccountErasureService:
         # scrub: it still finds the subject's memories by their raw user_id,
         # and the subject's tombstones (hard-deleted there) take their
         # revisions with them through the FK cascade either way.
+        # #2044: BEFORE the revision scrub, which NULLs the subject's session
+        # ids that this one matches memories' last-writer sessions against.
+        counts.update(await self._erase_session_provenance(user_id))
         counts["memory_revisions_pseudonymized"] = await self._erase_memory_revisions(user_id)
         counts["memories_scrubbed"] = await self._scrub_surviving_memories(user_id)
 
@@ -1428,6 +1431,69 @@ class AccountErasureService:
             ),
         )
         return (actor.rowcount or 0) + (recipient.rowcount or 0)
+
+    async def _erase_session_provenance(self, user_id: str) -> dict[str, int]:
+        """Scrub the subject's session tokens outside ``memory_revisions`` (#2044).
+
+        - ``memories.session_id`` is the last writer's session: NULLed where
+          that session is one the subject wrote this memory under (the
+          revision log still names the subject as the actor here). Another
+          member's later session on the same memory is left alone. Driven
+          from the subject's own revisions, so other tenants' rows are never
+          scanned.
+        - ``memory_session_rollbacks``: the subject as the session's principal
+          gets the salted pseudonym and a NULL ``session_id``; as the one who
+          requested a rollback, the pseudonym — and a NULL ``session_id`` on
+          a context owner's rollback (no principal), whose id may be the
+          subject's own session.
+
+        Returns:
+            ``memory_sessions_scrubbed`` and ``session_rollbacks_pseudonymized``
+            counts for the erasure summary.
+        """
+        from models.memory import MemorySessionRollback
+
+        subject_sessions = select(MemoryRevision.memory_id, MemoryRevision.session_id).where(
+            MemoryRevision.actor_user_id == user_id,
+            MemoryRevision.session_id.is_not(None),
+        )
+        memories = cast(
+            CursorResult[Any],
+            await self.db.execute(
+                update(Memory)
+                .where(tuple_(Memory.id, Memory.session_id).in_(subject_sessions))
+                .values(session_id=None)
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        pseudonym = self._pseudonym(user_id)
+        principal = cast(
+            CursorResult[Any],
+            await self.db.execute(
+                update(MemorySessionRollback)
+                .where(MemorySessionRollback.principal_user_id == user_id)
+                .values(principal_user_id=pseudonym, session_id=None)
+            ),
+        )
+        requester = cast(
+            CursorResult[Any],
+            await self.db.execute(
+                update(MemorySessionRollback)
+                .where(MemorySessionRollback.requested_by == user_id)
+                .values(
+                    requested_by=pseudonym,
+                    session_id=case(
+                        (MemorySessionRollback.principal_user_id.is_(None), None),
+                        else_=MemorySessionRollback.session_id,
+                    ),
+                )
+            ),
+        )
+        return {
+            "memory_sessions_scrubbed": memories.rowcount or 0,
+            "session_rollbacks_pseudonymized": (principal.rowcount or 0)
+            + (requester.rowcount or 0),
+        }
 
     async def _erase_memory_revisions(self, user_id: str) -> int:
         """Scrub the erased subject out of ``memory_revisions`` (#2043).

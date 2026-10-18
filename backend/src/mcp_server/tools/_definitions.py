@@ -59,7 +59,7 @@ Returns: {status, binding: {key_id, name, context_id, context_name, created_at, 
             "name": "remember",
             "description": """Store a new memory (a decision, fix, pattern, fact or note) for later recall. To edit a memory whose id you have use update_memory; to replace an outdated fact pass supersedes=<old_memory_id>.
 Write summary as the reusable conclusion with the terms a future search would use; content holds the full text. SECURITY: never store secrets, credentials or PII — refuse and ask the user to redact; coordinates go only in details.location, never in context.
-Returns: {status, memory_id, scope, version, persistence?: {scope, committed, promotes_via, consolidation_archive_min_age_days}, lint?, — or, with dedupe='check', {status: 'duplicate_candidate', candidate}; plus context_id, context_name, context_display_name, context_is_private, context_is_locked}. summary_truncated + summary_original_length: the summary was cut to 500 chars. Committed before it returns; a forgotten supersedes surfaces later as a supersede_candidate on recall()/reference(). Errors: quota_exceeded, payload_too_large (limit, actual: the memory is over 1,000,000 chars — split it), validation_error.
+Returns: {status, memory_id, scope, version, persistence?: {scope, committed, promotes_via, consolidation_archive_min_age_days}, lint?, session_id?, — or, with dedupe='check', {status: 'duplicate_candidate', candidate}; plus context_id, context_name, context_display_name, context_is_private, context_is_locked}. summary_truncated + summary_original_length: the summary was cut to 500 chars. Committed before it returns; a forgotten supersedes surfaces later as a supersede_candidate on recall()/reference(). Errors: quota_exceeded, payload_too_large (limit, actual: the memory is over 1,000,000 chars — split it), validation_error.
 Manual: guide(["remember"]).""",
             "inputSchema": {
                 "type": "object",
@@ -151,7 +151,7 @@ Manual: guide(["remember"]).""",
         {
             "name": "remember_batch",
             "description": """Store up to 50 memories in one call — the end-of-session save. Each item takes remember's arguments except context_id, dedupe, tags_normalize and verbose (the batch's apply) and is validated and limited like a single remember; an unknown item key is that item's invalid_argument error. atomic=false (default): items are written independently and reported per item. atomic=true: all or nothing — a failing item, or a dedupe='check' candidate, rolls the batch back and nothing is written.
-Returns: {status: success|partial|duplicate_candidate, results: [{index, status: success|error|skipped|duplicate_candidate, memory_id?, scope?, persistence?, lint?, error?, message?, candidate?}], count, succeeded, candidates, failed, skipped, context_id, context_name, context_display_name, context_is_private, context_is_locked}.
+Returns: {status: success|partial|duplicate_candidate, results: [{index, status: success|error|skipped|duplicate_candidate, memory_id?, scope?, persistence?, lint?, error?, message?, candidate?}], count, succeeded, candidates, failed, skipped, session_id?, context_id, context_name, context_display_name, context_is_private, context_is_locked}.
 Manual: guide(["remember_batch"]).""",
             "inputSchema": {
                 "type": "object",
@@ -193,7 +193,7 @@ Manual: guide(["remember_batch"]).""",
             "name": "update_memory",
             "description": """Update an existing memory in place (memory_id) or upsert by external_id (details.resource_id: found → replaced under a NEW memory_id, not found → created; needs summary, content, type). Use it, not remember, to correct or enrich a memory whose id you have.
 SECURITY: never store secrets, credentials or PII — refuse and ask the user to redact; coordinates go only in details.location, never in context. details is replaced wholesale (resend details.location or it is dropped).
-Returns: {status, memory_id, operation: 'updated'|'created'|'replaced', re_embedded, scope, version, persistence?, supersede_candidate_dismissed?, lint?, context_id, context_name, context_display_name, context_is_private, context_is_locked}. Errors: memory_not_found, validation_error, version_conflict (current_version; nothing written).
+Returns: {status, memory_id, operation: 'updated'|'created'|'replaced', re_embedded, scope, version, persistence?, supersede_candidate_dismissed?, lint?, session_id?, context_id, context_name, context_display_name, context_is_private, context_is_locked}. Errors: memory_not_found, validation_error, version_conflict (current_version; nothing written).
 Manual: guide(["update_memory"]).""",
             "inputSchema": {
                 "type": "object",
@@ -347,7 +347,7 @@ Manual: guide(["recall"]).""",
             "name": "reference",
             "readOnly": True,
             "description": """Read one memory in full (summary, context_summary, content, details, provenance, links) by id, within max_chars. Use it after recall(), which returns summaries only.
-Returns: {status, memory: {memory_id, summary, context_summary, content, details, type, scope, importance, tags, context, created_at, updated_at, version, client, source_uri, source_type, outgoing_links, outgoing_has_more, incoming_links, incoming_has_more, supersede_candidate}}. version=N reads an earlier version: historical: true, current_version, unavailable_fields? (erased), no links or supersede_candidate; list_revisions, a tool outside the core profile, lists the versions — describe_tools(["list_revisions"]) has its schema. supersede_candidate names an older near-duplicate (a suggestion; verified: true when the deployment's judge confirmed it is an update of the same fact): accept with create_edge(edge_type="supersedes"), a tool outside the core profile — describe_tools(["create_edge"]) has its schema. Oversized content arrives as a slice (content_truncated, content_next_offset) or content_omitted; oversized details / context arrive as details_json / context_json pages with *_next_offset, or <field>_omitted; continue with the *_offset parameters. Errors: memory_not_found, invalid_argument, validation_error (no such version; current_version).
+Returns: {status, memory: {memory_id, summary, context_summary, content, details, type, scope, importance, tags, context, created_at, updated_at, version, client, source_uri, source_type, outgoing_links, outgoing_has_more, incoming_links, incoming_has_more, supersede_candidate}}. version=N reads an earlier version (historical: true, current_version, unavailable_fields? if erased; no links or supersede_candidate); list_revisions lists the versions (outside the core profile: describe_tools(["list_revisions"])). supersede_candidate names an older near-duplicate (a suggestion; verified: true when the deployment's judge confirmed it is an update of the same fact): accept with create_edge(edge_type="supersedes"), a tool outside the core profile — describe_tools(["create_edge"]) has its schema. Oversized content arrives as a slice (content_truncated, content_next_offset) or content_omitted; oversized details / context arrive as details_json / context_json pages with *_next_offset, or <field>_omitted; continue with the *_offset parameters. Errors: memory_not_found, invalid_argument, validation_error (no such version; current_version).
 Manual: guide(["reference"]).""",
             "inputSchema": {
                 "type": "object",
@@ -374,7 +374,7 @@ Manual: guide(["reference"]).""",
                     "version": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Read this earlier version instead of the current one. Omit for the current version.",
+                        "description": "An earlier version to read; omit for the current one.",
                     },
                     "content_offset": {
                         "type": "integer",
@@ -570,7 +570,7 @@ Returns: {status, format, version, pinned: [item], tool_triggered: [item], total
             "name": "forget",
             "description": """Soft-delete memories that are outdated, incorrect or no longer needed. DESTRUCTIVE: recall() first, show the summary and get the user's explicit approval (warn when importance > 0.8). To replace a fact instead, use remember(supersedes=...).
 Supply exactly ONE of memory_id (deletes that memory) or query (deletes its top-k matches; bulk cleanup only). Deleted memories stay recoverable for the deployment's cleanup window (default 30 days).
-Returns: {status, deleted_count, memory_ids, context_id, context_name}; a target you may not delete, or already gone, is skipped, so deleted_count can be 0.
+Returns: {status, deleted_count, memory_ids, session_id?, context_id, context_name}; a target you may not delete, or already gone, is skipped, so deleted_count can be 0.
 Manual: guide(["forget"]).""",
             "inputSchema": {
                 "type": "object",
@@ -1238,6 +1238,31 @@ Returns: {status, report_id, rollback_summary: {edges_deleted, merges_reversed, 
                         "type": "string",
                         "format": "uuid",
                         "description": "Sleep report UUID to roll back (from get_sleep_history).",
+                    },
+                },
+            },
+        },
+        {
+            "name": "rollback_session",
+            "description": """Undo what one session wrote in a context. DESTRUCTIVE — dry_run=true (the default) only lists the plan. Per memory: created → forgotten; updated → the values from before the session's first edit put back (a new version); forgotten → restored and re-embedded. A memory someone else changed since, Sleep merged, someone else forgot, or a resource row is skipped with a cause, never half-reverted. Your own sessions only (same user, same agent credential); a context owner may name any. Editor role required. At most 500 events (100 restores of forgotten memories) per call: status 'in_progress' with remaining > 0 means call again; failed items are retried by the next call. Once complete, a further call is refused (already_rolled_back) until the session writes again.
+Returns: {status: dry_run|rolled_back|in_progress, session_id, events, remaining, rollback_id?, plan? {forget, restore, unforget, skip}, items? [{memory_id, kind, action, cause?, fields?}], rollback_status?, summary? {forgotten, restored, updated_restored, skipped, failed, chunks_requeued, points_requeued, skipped_items, errors}, totals?, context_id, ...}. Errors: session_not_found (also for another principal's session), already_rolled_back, partial_rollback (summary lists what was reversed; call again to retry the failed items).""",
+            "inputSchema": {
+                "type": "object",
+                "required": ["context_id", "session_id"],
+                "properties": {
+                    "context_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Context UUID from list_contexts(). Do NOT guess or fabricate IDs.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "The session whose writes to undo — the session_id remember / update_memory / forget returned (your OTel baggage session, else the MCP session id).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "true (default): list the plan, change nothing. false: roll back.",
                     },
                 },
             },
@@ -1992,7 +2017,8 @@ Manual: guide(["list"]).""",
             "name": "changes_since",
             "readOnly": True,
             "description": """List what changed in a context since a time, oldest first: created, updated (an edit, a scope promotion or a Sleep maintenance change (importance re-evaluation, dedup tag merge, rollback); never the initial write or an embedding retry), superseded (a supersedes edge; superseded_by is the newer memory) and forgotten (soft-deleted, while the row still exists). Events of a forgotten memory omit summary: memory_id / kind / at only, plus superseded_by on a superseded event. Use it at session start for "what changed since I was last here?"; it is a deterministic log, not a search.
-Returns: {status, changes: [{memory_id, kind, at, summary?, superseded_by?}], count, has_more, next_cursor, since, until, truncated?, context_id, context_name, context_display_name, context_is_private, context_is_locked}. next_cursor is a keyset token: pages never shift when rows are written after the first read.
+With session_id: only that session's own writes (every edit, restored too) — your sessions, or any for a context owner.
+Returns: {status, changes: [{memory_id, kind, at, summary?, superseded_by?}], count, has_more, next_cursor, since, until, session_id?, truncated?, context_id, context_name, context_display_name, context_is_private, context_is_locked}. next_cursor is a keyset token: pages never shift when rows are written after the first read.
 Manual: guide(["changes_since"]).""",
             "inputSchema": {
                 "type": "object",
@@ -2014,9 +2040,14 @@ Manual: guide(["changes_since"]).""",
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["created", "updated", "superseded", "forgotten"],
+                            "enum": ["created", "updated", "superseded", "forgotten", "restored"],
                         },
-                        "description": "Which kinds to include (default all four).",
+                        "description": "Kinds to include (default all). restored needs session_id; superseded excludes it.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Only this session's writes (a session_id a write returned).",
                     },
                     "limit": {
                         "type": "integer",
