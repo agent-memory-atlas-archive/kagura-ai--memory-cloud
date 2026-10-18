@@ -89,7 +89,7 @@ from services.embedding_service import EmbeddingService
 from services.memory_service import build_memory_point
 from services.resource_indexer import ResourceIndexer, ResourceRebuildError, owns_resource_point
 from utils.content_chunks import CONTENT_CHUNK_MIN_CONTENT_CHARS, expected_chunk_count
-from utils.datetime import utcnow
+from utils.datetime import to_naive_utc, utcnow
 from utils.exceptions import NotFoundException, ValidationError
 from utils.logger import get_logger
 
@@ -651,6 +651,8 @@ async def rebuild_target_chunks(
     """
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
+    if requeue_since is not None:
+        requeue_since = to_naive_utc(requeue_since)
     out = ChunkRebuildResult()
     ids = sorted(set(memory_ids))
     if not ids:
@@ -968,7 +970,8 @@ async def switch_context_embedding(
     each under the point id the migration wrote it with
     (:func:`_migrated_point_id`, #1896), and never a point a live row of any
     context still names — together with their content chunk points (#2015).
-    With ``None`` this is a pure routing flip.
+    With ``None`` this is a pure routing flip. An aware ``requeue_since`` is
+    compared as naive UTC, the convention of the ``memories`` timestamps.
 
     A worker that claimed a row before the flip resolved the old routing;
     ``process_pending_embedding`` only marks ``success`` while it still owns
@@ -980,6 +983,8 @@ async def switch_context_embedding(
     expected_dimensions = EMBEDDING_MODEL_REGISTRY[model][0]
     if dimensions != expected_dimensions:
         raise ValidationError(f"{model!r} has {expected_dimensions} dimensions, not {dimensions}")
+    if requeue_since is not None:
+        requeue_since = to_naive_utc(requeue_since)
 
     previous_model, previous_dimensions = await resolve_context_embedding(db, context_id)
 
@@ -1089,7 +1094,10 @@ async def rollback_context_embedding(
     would make them unsearchable, stale, or resurrect them. This re-queues
     the delta since the switch — by default the ``updated_at`` of the
     ``ContextSearchConfig`` row, which the switch stamped — and refuses when
-    ``model``'s collection does not exist (nothing to serve from).
+    ``model``'s collection does not exist (nothing to serve from). Any later
+    search-config change stamps that row too, which moves the default past
+    the switch and leaves out what was written in between: pass the switch
+    time as ``requeue_since`` when the config was edited since.
 
     The re-queue and the removal of forgotten points are
     :func:`switch_context_embedding`'s, so resource-ingested rows are handled
@@ -1115,6 +1123,8 @@ async def rollback_context_embedding(
                 ContextSearchConfig.context_id == context_id
             )
         )
+        # An aware TIMESTAMP WITH TIME ZONE: switch_context_embedding takes it
+        # to the naive UTC of the ``memories`` timestamps (#1525).
         requeue_since = result.scalar_one_or_none()
         if requeue_since is None:
             raise ValidationError(

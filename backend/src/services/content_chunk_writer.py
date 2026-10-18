@@ -204,7 +204,31 @@ async def _superseded_before_write(
     return superseded
 
 
-async def _drop_chunks_after_failure(memory: Memory, collection_name: str) -> None:
+async def _claim_taken(db: AsyncSession, memory_id: Any, claim: EmbeddingClaim) -> bool:
+    """Whether a newer run has claimed the row: it still exists, but its
+    ``embedding_attempted_at`` is no longer this run's stamp.
+
+    Only the claim, unlike ``_superseded``: an edit, a re-queue or a soft
+    delete since this run started wrote no chunks, so the old ones are still
+    nobody else's. In a SAVEPOINT, as there.
+    """
+    async with claim.held() as stamp:
+        async with db.begin_nested():
+            result = await db.execute(
+                select(Memory.id).where(
+                    Memory.id == memory_id,
+                    Memory.embedding_attempted_at.is_distinct_from(stamp),
+                )
+            )
+    return result.scalar_one_or_none() is not None
+
+
+async def _drop_chunks_after_failure(
+    db: AsyncSession,
+    memory: Memory,
+    claim: EmbeddingClaim,
+    collection_name: str,
+) -> None:
     """Remove the chunk points of a memory whose embedding run failed to write them (#2061).
 
     An embedding run (``process_pending_embedding``) is what follows an edit,
@@ -212,7 +236,27 @@ async def _drop_chunks_after_failure(memory: Memory, collection_name: str) -> No
     row now waits for its retry — for good once its retry budget is spent.
     It must not stay searchable meanwhile: the retry writes the new chunks.
     Best effort (a failure is logged): the failure is raised either way.
+
+    Fenced on the claim: when a newer run (or a Sleep restore, which stamps
+    the same clock) has claimed the row since, the chunks may be its, so they
+    stay. An edit, a re-queue or a soft delete alone does not stop the drop:
+    nothing newer has written chunks then. A failed check does not stop it
+    either — the stale body text is what must not stay searchable. The fence
+    narrows the race, it cannot close it: Qdrant is not in the transaction.
     """
+    try:
+        taken = await _claim_taken(db, memory.id, claim)
+    except Exception as e:
+        logger.warning(
+            "content_chunks_superseded_check_failed",
+            memory_id=str(memory.id),
+            stage="cleanup",
+            error_class=type(e).__name__,
+        )
+        taken = False
+    if taken:
+        logger.info("content_chunks_cleanup_skipped_superseded", memory_id=str(memory.id))
+        return
     try:
         await delete_chunk_points([memory.id], collection_name)
     except Exception as e:
@@ -275,7 +319,8 @@ async def write_content_chunks(
     the old chunks as they were (the Sleep paths re-queue the memory, and the
     sweep rewrites them) — except in an embedding run (``claim``), which
     follows an edit: it removes them, so removed body text is not searchable
-    while the row waits for its retry.
+    while the row waits for its retry — unless a newer run has claimed the
+    row by then, whose chunks they are.
 
     Args:
         db: Session used for the flag lookups.
@@ -386,7 +431,7 @@ async def write_content_chunks(
     except Exception as e:
         _log_failure(memory, collection_name, e)
         if claim is not None and chunks:
-            await _drop_chunks_after_failure(memory, collection_name)
+            await _drop_chunks_after_failure(db, memory, claim, collection_name)
         if not fail_open:
             raise _without_text(e) from None
         return 0
