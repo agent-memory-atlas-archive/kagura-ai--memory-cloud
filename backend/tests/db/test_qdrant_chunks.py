@@ -18,12 +18,14 @@ import db.qdrant as qmod
 from db.qdrant import (
     KAGURA_MEMORIES_VECTOR_NAME,
     delete_chunk_points,
+    delete_chunk_points_from,
     delete_memory_from_qdrant,
     search_memories_qdrant,
     update_memory_payload_in_qdrant,
     upsert_chunk_points,
 )
 from utils.content_chunks import CHUNK_OF_FIELD
+from utils.exceptions import QdrantError
 
 pytestmark = pytest.mark.asyncio
 
@@ -124,12 +126,34 @@ async def test_delete_chunk_points_empty_is_noop(mock_client):
     mock_client.delete.assert_not_awaited()
 
 
+async def test_delete_chunk_points_from_trims_the_chunks_past_the_new_count(mock_client):
+    """#2061: the trim after an in-place rewrite deletes chunk_index >= start of
+    that memory only — by filter, so a chunk past the cap goes too."""
+    memory_id = uuid4()
+    await delete_chunk_points_from(memory_id, 3, "coll")
+    kwargs = mock_client.delete.await_args.kwargs
+    assert kwargs["collection_name"] == "coll"
+    selector = kwargs["points_selector"]
+    assert isinstance(selector, FilterSelector)
+    by_key = {cond.key: cond for cond in selector.filter.must}
+    assert by_key[CHUNK_OF_FIELD].match == MatchValue(value=str(memory_id))
+    assert by_key["chunk_index"].range.gte == 3
+    assert by_key["chunk_index"].range.lt is None
+
+
+async def test_delete_chunk_points_from_raises_a_qdrant_error(mock_client):
+    mock_client.delete.side_effect = RuntimeError("down")
+    with pytest.raises(QdrantError, match="trim content chunks"):
+        await delete_chunk_points_from(uuid4(), 0)
+
+
 async def test_chunk_helpers_are_noops_on_a_non_qdrant_store(monkeypatch):
     client = AsyncMock()
     monkeypatch.setattr(qmod, "get_qdrant_client", lambda: client)
     monkeypatch.setattr(qmod, "_active_store", lambda: object())
     await upsert_chunk_points([("i", [0.1], {})], user_id=UID, workspace_id=WS, context_id=CTX)
     await delete_chunk_points([uuid4()])
+    await delete_chunk_points_from(uuid4(), 0)
     client.upsert.assert_not_awaited()
     client.delete.assert_not_awaited()
 

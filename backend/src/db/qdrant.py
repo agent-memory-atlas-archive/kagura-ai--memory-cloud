@@ -1218,6 +1218,42 @@ async def delete_chunk_points(
         raise QdrantError(f"Failed to delete content chunks: {e}") from e
 
 
+async def delete_chunk_points_from(
+    memory_id: UUID | str,
+    start: int,
+    collection_name: str = KAGURA_MEMORIES_COLLECTION,
+) -> None:
+    """Delete a memory's content chunk points from ``chunk_index`` ``start`` on (#2061).
+
+    The trim after a chunk rewrite in place: chunk point ids are deterministic
+    per index (``chunk_point_id``), so the upsert has just replaced chunks
+    ``0..start-1`` and only the old ones past the new count are left.
+    Filter-based (``chunk_of`` and ``chunk_index >= start``), like
+    :func:`delete_chunk_points`, so it also removes a chunk past the current
+    per-memory cap. A no-op on a non-Qdrant store.
+
+    Raises:
+        QdrantError: If the delete fails.
+    """
+    if _active_store() is not None:
+        return
+    client = get_qdrant_client()
+    try:
+        await client.delete(
+            collection_name=collection_name,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(key=CHUNK_OF_FIELD, match=MatchValue(value=str(memory_id))),
+                        FieldCondition(key="chunk_index", range=Range(gte=max(start, 0))),
+                    ]
+                )
+            ),
+        )
+    except Exception as e:
+        raise QdrantError(f"Failed to trim content chunks: {e}") from e
+
+
 async def purge_context_chunk_points(
     workspace_id: str,
     context_id: str,
