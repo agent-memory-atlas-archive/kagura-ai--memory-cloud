@@ -341,12 +341,16 @@ class TestGetQdrantClient:
         import config.settings as settings_mod
 
         monkeypatch.setattr(
-            settings_mod, "get_settings", lambda: SimpleNamespace(qdrant_api_key=None)
+            settings_mod,
+            "get_settings",
+            lambda: SimpleNamespace(qdrant_api_key=None, qdrant_http_compression=False),
         )
 
         client = get_qdrant_client()
         assert client is sentinel
         assert "api_key" not in captured
+        # #2112: uncompressed responses (see QDRANT_REST_HEADERS).
+        assert captured["headers"] == {"accept-encoding": "identity"}
         assert get_qdrant_client() is sentinel
 
     def test_builds_with_api_key(self, monkeypatch):
@@ -363,11 +367,32 @@ class TestGetQdrantClient:
         monkeypatch.setattr(
             settings_mod,
             "get_settings",
-            lambda: SimpleNamespace(qdrant_api_key="secret-key"),
+            lambda: SimpleNamespace(qdrant_api_key="secret-key", qdrant_http_compression=False),
         )
 
         get_qdrant_client()
         assert captured["api_key"] == "secret-key"
+        assert captured["headers"] == {"accept-encoding": "identity"}
+
+    def test_compression_opt_in_keeps_default_encoding(self, monkeypatch):
+        """QDRANT_HTTP_COMPRESSION=true => no accept-encoding override (#2112)."""
+        captured = {}
+
+        def fake_ctor(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(qmod, "AsyncQdrantClient", fake_ctor)
+        import config.settings as settings_mod
+
+        monkeypatch.setattr(
+            settings_mod,
+            "get_settings",
+            lambda: SimpleNamespace(qdrant_api_key=None, qdrant_http_compression=True),
+        )
+
+        get_qdrant_client()
+        assert "headers" not in captured
 
     def test_connection_failure_wrapped_in_qdrant_error(self, monkeypatch):
         """A constructor exception is wrapped in QdrantError."""
