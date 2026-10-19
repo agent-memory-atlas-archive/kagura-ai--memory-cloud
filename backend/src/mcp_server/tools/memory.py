@@ -50,7 +50,13 @@ from utils.exceptions import (
     QuotaExceededError,
     VersionConflictError,
 )
-from utils.recall_projection import RECALL_VERBOSITIES, recall_result_item
+from utils.recall_projection import (
+    RECALL_CONTENT_KEYS,
+    RECALL_DEFAULT_FULL,
+    RECALL_MAX_FULL,
+    RECALL_VERBOSITIES,
+    recall_result_item,
+)
 from utils.response_budget import (
     DEFAULT_MAX_CHARS,
     BudgetArgumentError,
@@ -67,6 +73,9 @@ logger = logging.getLogger(__name__)
 # details_omitted + details_total_chars until the results fit this many
 # characters (read those with reference()).
 _DETAILS_RESULTS_BUDGET = DEFAULT_MAX_CHARS - 1_000
+
+
+_CONTEXT_SUMMARY_OMITTED_RESERVE = len('"context_summary_omitted":true,')
 
 
 def _bound_list_envelope(
@@ -86,7 +95,7 @@ def _bound_list_envelope(
         The bounded envelope and, per lane key, whether items were cut.
     """
     shell = {**envelope, **{lane: [] for lane in lanes}}
-    budget = max_chars - json_chars(shell) - len('"context_summary_omitted":true,')
+    budget = max_chars - json_chars(shell) - _CONTEXT_SUMMARY_OMITTED_RESERVE
     bounded, cut, dropped = fit_lanes(
         [envelope[lane] for lane in lanes], budget, droppable="context_summary"
     )
@@ -1104,6 +1113,46 @@ def _recall_envelope(result: Any, context: Any, verbosity: str = "full") -> dict
     return response_data
 
 
+# What _bound_recall_envelope keeps back before it counts a reply as fitting:
+# room for the omitted flag (_CONTEXT_SUMMARY_OMITTED_RESERVE, which
+# _bound_list_envelope subtracts) and one separator per item where the
+# serialized array has one fewer. A reply within this much of max_chars is
+# still cut there, so the content fit aims below it (#2124).
+_RECALL_BOUND_RESERVE = _CONTEXT_SUMMARY_OMITTED_RESERVE + 1
+
+
+def _fit_recall_content(envelope: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """Lower the number of results that carry content until the reply fits (#2124).
+
+    Content is the first thing to go over ``max_chars``: from the lowest-ranked
+    result that carries it upwards, a result loses its content keys (it keeps
+    its whole summary) until the reply fits or no content is left. When any was
+    removed, ``full_applied`` is the number of results still carrying content;
+    it is absent otherwise. Whatever still does not fit is then cut by
+    :func:`_bound_recall_envelope` as before.
+    """
+    limit = max_chars - _RECALL_BOUND_RESERVE
+    total = json_chars(envelope)
+    if total <= limit:
+        return envelope
+    results = envelope["results"]
+    with_content = [i for i, item in enumerate(results) if "content" in item]
+    if not with_content:
+        return envelope
+    # Room for the flag itself (its value is at most a three-digit count).
+    target = limit - json_chars({"full_applied": RECALL_MAX_FULL}) + 1
+    results = list(results)
+    while with_content and total > target:
+        index = with_content.pop()
+        item = dict(results[index])
+        for key in RECALL_CONTENT_KEYS:
+            if key in item:
+                # Never the first member (memory_id is), so it costs its comma.
+                total -= _member_chars(key, item.pop(key))
+        results[index] = item
+    return {**envelope, "results": results, "full_applied": len(with_content)}
+
+
 def _bound_recall_envelope(envelope: dict[str, Any], max_chars: int) -> dict[str, Any]:
     """Hold a recall reply to ``max_chars`` characters (#1743).
 
@@ -1152,9 +1201,27 @@ async def handle_recall(
             "validation_error", "verbosity must be 'compact' or 'full'", received=verbosity
         )
 
+    # #2124: how many of the top results carry content. ``type(x) is int`` so
+    # bool, which subclasses int, is refused. The tool's default (3) is applied
+    # here, not in the service, which ships no content unless asked.
+    full = args.get("full")
+    # #2124: a defaulted full inlines content on trusted rows only; an
+    # explicit one is the caller's deliberate request, every row eligible.
+    content_trusted_only = full is None
+    if full is None:
+        full = RECALL_DEFAULT_FULL
+    elif type(full) is not int or not 0 <= full <= RECALL_MAX_FULL:
+        return _error_response(
+            "invalid_argument",
+            f"full must be an integer between 0 and {RECALL_MAX_FULL} "
+            "(how many of the top results carry content; 0 for summaries only).",
+            received=full,
+        )
+
     request = RecallRequest(
         query=args["query"],
         k=args.get("k", 5),
+        full=full,
         # #1572: None when omitted → SearchService follows the context's config.
         use_rerank=args.get("use_rerank"),
         filters=args.get("filters"),
@@ -1274,6 +1341,7 @@ async def handle_recall(
                     # #708 Option A: source workspace pays for shared-context reads.
                     context_workspace_id=current_context.workspace_id,
                     context_ids=cross_context_ids,
+                    content_trusted_only=content_trusted_only,
                 ),
                 operation_name="recall",
             )
@@ -1281,7 +1349,10 @@ async def handle_recall(
             # Built before the usage row / commit, as the item projection always
             # was: a result that cannot be rendered fails the call as a whole.
             response_data = _bound_recall_envelope(
-                _recall_envelope(result, current_context, verbosity), max_chars
+                _fit_recall_content(
+                    _recall_envelope(result, current_context, verbosity), max_chars
+                ),
+                max_chars,
             )
 
             await _log_tool_usage(

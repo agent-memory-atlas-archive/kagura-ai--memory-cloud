@@ -121,6 +121,7 @@ from utils.exceptions import (
 )
 from utils.logger import get_logger
 from utils.query_log import query_log_fields
+from utils.recall_projection import content_slice, effective_full
 from utils.tag_normalize import TAG_GROUPS_FILTER_KEY, tag_filter_groups
 
 logger = get_logger(__name__)
@@ -387,6 +388,30 @@ class _PreparedRemember:
     context_id_str: str
     tag_hints: list[WriteLintHint]
     embedding_scheduled: bool = False
+
+
+def _recall_audit_metadata(
+    responses: list[MemoryResponse], binding_row_filtered: int
+) -> dict[str, Any] | None:
+    """``event_metadata`` of the recall success audit row (#1299, #2124).
+
+    #1299: the enforce-mode row-filter count. #2124: the ids of the results
+    that shipped their content — a Layer-3 read that reference() audits on its
+    own row, so a recall that carries content says which memories it read
+    (identifiers only, capped like every id list in the audit metadata).
+    """
+    from services.agent_binding_service import ROW_FILTER_KIND
+    from services.memory_access_event_writer import MAX_METADATA_MEMORY_IDS
+
+    metadata: dict[str, Any] = {}
+    if binding_row_filtered:
+        metadata["filter_kind"] = ROW_FILTER_KIND
+        metadata["binding_row_filtered_count"] = binding_row_filtered
+    content_ids = [str(r.memory_id) for r in responses if r.content is not None]
+    if content_ids:
+        metadata["content_memory_ids"] = content_ids[:MAX_METADATA_MEMORY_IDS]
+        metadata["content_count"] = len(content_ids)
+    return metadata or None
 
 
 class MemoryService:
@@ -4925,6 +4950,7 @@ class MemoryService:
         contradiction_map: dict[UUID, list[UUID]],
         user_id: str,
         fold_map: Mapping[UUID, list[UUID]] | None = None,
+        content_trusted_only: bool = False,
     ) -> list[MemoryResponse]:
         """Build the page that ships: supersede hints and response rows.
 
@@ -4939,6 +4965,8 @@ class MemoryService:
             contradiction_map: #1208 memory → contradicting opponents.
             user_id: Caller identity for the supersede-candidate lookup.
             fold_map: #2123 head id → folded older versions, newest first.
+            content_trusted_only: #2124 only trusted rows (a trusted context,
+                not connector-ingested) may carry content.
 
         Returns:
             Up to ``request.k`` MemoryResponse rows, skipping hits with no
@@ -4957,6 +4985,19 @@ class MemoryService:
             trusted_only=_is_trusted_recall(request),
         )
         fold_map = fold_map or {}
+        # #2124: the first ``full`` eligible shipped rows carry their content (a
+        # folded group's content is its head's — the head is the row that
+        # ships). With ``content_trusted_only`` (the MCP tool's defaulted full)
+        # only trusted rows are eligible: external content is not inlined into
+        # the agent's context without a deliberate request, and a row passed
+        # over leaves its slot to the next trusted one.
+        full = effective_full(request.full, request.k)
+        trusted_context_ids: set[UUID] | None = None
+        if full and content_trusted_only and not _is_trusted_recall(request):
+            trusted_context_ids = await self._recall_trusted_context_ids(
+                {m.context_id for m in page_memories.values()}
+            )
+        content_rows = 0
 
         responses: list[MemoryResponse] = []
         for search_result in page:
@@ -4964,6 +5005,16 @@ class MemoryService:
 
             if not memory:
                 continue
+
+            content: str | None = None
+            content_next_offset: int | None = None
+            eligible = trusted_context_ids is None or (
+                memory.source_type != SOURCE_TYPE_CONNECTOR
+                and memory.context_id in trusted_context_ids
+            )
+            if content_rows < full and eligible and memory.content:
+                content, content_next_offset = content_slice(memory.content)
+                content_rows += 1
 
             # Issue #1047: snapshot updated_at as read. #1317 removed the
             # column's onupdate and #1985 moved the access-stats write to a
@@ -5001,9 +5052,27 @@ class MemoryService:
                         else None
                     ),
                     version=memory.version,  # #2043
+                    content=content,
+                    content_truncated=True if content_next_offset is not None else None,
+                    content_next_offset=content_next_offset,
                 )
             )
         return responses
+
+    async def _recall_trusted_context_ids(self, context_ids: set[UUID]) -> set[UUID]:
+        """The ids among ``context_ids`` whose context is trusted (#2124).
+
+        The same server-side signal as the ``trust_tier="trusted"`` filter
+        (``Context.trust_tier``); one query over the page's contexts.
+        """
+        if not context_ids:
+            return set()
+        result = await self.db.execute(
+            select(Context.id).where(
+                Context.id.in_(context_ids), Context.trust_tier == CONTEXT_TRUST_TIER_TRUSTED
+            )
+        )
+        return set(result.scalars().all())
 
     def _isolated_session(self) -> AsyncSession:
         """A fresh session on the request session's engine (#1985).
@@ -5486,7 +5555,6 @@ class MemoryService:
         # #1299: enforce-mode row filtering is not a request deny — the count
         # rides this success row so the subtraction stays observable without
         # corrupting the deny metrics.
-        from services.agent_binding_service import ROW_FILTER_KIND
         from services.memory_access_event_writer import emit_memory_access_event
 
         await emit_memory_access_event(
@@ -5497,14 +5565,7 @@ class MemoryService:
             context_id=current_context_id,
             result_count=len(responses),
             query=request.query,
-            extra_metadata=(
-                {
-                    "filter_kind": ROW_FILTER_KIND,
-                    "binding_row_filtered_count": binding_row_filtered,
-                }
-                if binding_row_filtered
-                else None
-            ),
+            extra_metadata=_recall_audit_metadata(responses, binding_row_filtered),
         )
 
         return RecallResponse(
@@ -5634,6 +5695,7 @@ class MemoryService:
         selection_config: RecallSelectionConfig | None = None,
         *,
         capacity_gate: bool = True,
+        content_trusted_only: bool = False,
     ) -> RecallResponse:
         """Search memories with Hybrid Search + Neural Memory.
 
@@ -5669,6 +5731,8 @@ class MemoryService:
                 (#708 H1; otherwise a uniform NotFoundException is raised
                 to avoid leaking existence + configuration state via
                 CWE-639 / OWASP A01).
+            content_trusted_only: #2124 only trusted rows may carry content
+                (the MCP tool's defaulted ``full``).
 
         Returns:
             RecallResponse with search results
@@ -5949,6 +6013,7 @@ class MemoryService:
                 contradiction_map=contradiction_map,
                 user_id=user_id,
                 fold_map=fold_map,
+                content_trusted_only=content_trusted_only,
             )
 
         # Hebbian learning: build graph for explore() (best-effort, does not affect recall)
@@ -6824,6 +6889,7 @@ class MemoryService:
                 # make forget(query=...) silently skip them.
                 include_superseded=True,
                 search_mode="hybrid",
+                full=0,  # #2124: only the ids are used
             )
 
             # Issue #82: Pass project ID to recall

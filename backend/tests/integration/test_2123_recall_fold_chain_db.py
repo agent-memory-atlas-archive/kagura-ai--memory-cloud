@@ -200,7 +200,9 @@ async def test_three_versions_recall_as_the_newest_with_the_others_folded(
     # The read path: the cross-encoder ranks the oldest wording first; the
     # hybrid order has the newest first. Same page either way.
     pool = [v1, v2, other, v3] if use_rerank else [v3, other, v2, v1]
-    response, hybrid_search = await _recall(db_session, owner, ws, ctx, pool, use_rerank=use_rerank)
+    response, hybrid_search = await _recall(
+        db_session, owner, ws, ctx, pool, use_rerank=use_rerank, full=2
+    )
 
     assert hybrid_search.await_args.kwargs["use_rerank"] is use_rerank
     assert [r.memory_id for r in response.results] == [v3, other]
@@ -213,6 +215,9 @@ async def test_three_versions_recall_as_the_newest_with_the_others_folded(
     assert head.supersede_candidate.memory_id == v2
     assert head.supersede_candidate.verified is True
     assert response.results[1].folded is None
+    # #2124: content rides on the head (the newest version's), not a folded one.
+    assert head.content == VERSIONS[2]
+    assert response.results[1].content == "Falcon's QA lead is Mina"
 
 
 @pytest.mark.asyncio
