@@ -1961,6 +1961,17 @@ WHERE coalesce(plan_name, 'free') NOT IN ('basic', 'pro', 'promax')
    OR rn > CASE plan_name WHEN 'basic' THEN 1 WHEN 'pro' THEN 5 ELSE 20 END;
 ```
 
+## MCP recall defaults — Issues #2002, #2140
+
+Two settings change what an MCP `recall` returns when the caller leaves an argument out. An explicit argument always wins, and the REST `POST /api/v1/memory/recall` is not affected.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MCP_RECALL_DEFAULT_VERBOSITY` | `compact` | Result shape when the caller omits `verbosity` (`compact` or `full`). |
+| `MCP_RECALL_DEFAULT_FULL` | `3` | How many of the top results carry their `content` when the caller omits `full` (`0`-`100`; `0` returns summaries only). |
+
+`MCP_RECALL_DEFAULT_FULL` is still a default: as with the built-in 3, only trusted rows (trusted context, not connector-ingested) get content, and an explicit `full=N` from the caller makes every row eligible. Like a bad verbosity, a value outside `0`-`100`, or one that is not a number (`abc`, `3.5`), stops the backend at startup instead of being clamped; note that Pydantic reads `3.0` as 3 and `1_0` as 10. A high value makes every argument-less recall build content that the `max_chars` budget (default 20,000 characters) then drops again from the lowest-ranked rows, so keep it small. The REST default stays `0`.
+
 ## Reranking — Issue #1572
 
 Recall is hybrid (semantic + BM25); a **cross-encoder reranker** can re-score
