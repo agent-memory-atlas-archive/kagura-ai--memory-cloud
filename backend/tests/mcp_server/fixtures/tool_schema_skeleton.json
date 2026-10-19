@@ -1037,9 +1037,7 @@
     "name": "rollback_session",
     "inputSchema": {
       "type": "object",
-      "required": [
-        "session_id"
-      ],
+      "required": [],
       "properties": {
         "context_id": {
           "type": "string",
@@ -1048,6 +1046,12 @@
         "session_id": {
           "type": "string",
           "maxLength": 128
+        },
+        "since": {
+          "type": "string"
+        },
+        "until": {
+          "type": "string"
         },
         "dry_run": {
           "type": "boolean"
@@ -1756,6 +1760,9 @@
         "session_id": {
           "type": "string",
           "maxLength": 128
+        },
+        "by_me": {
+          "type": "boolean"
         },
         "limit": {
           "type": "integer",
