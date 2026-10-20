@@ -27,7 +27,10 @@ Steps (each is a flag; ``--run`` chains the first three):
                   after routing has moved on (the plan can no longer name the
                   old source by itself); refused while MODEL is still active
     --rollback-to MODEL   route back to MODEL and re-queue everything written
-                  since the switch (its collection must still exist)
+                  since the switch (its collection must still exist). The switch
+                  time is the one the switch recorded; the boundary is printed
+                  before the confirmation, with a WARNING when only the search
+                  config's last change is known (a switch before v0.116.0)
 
 Exit codes: 0 ok · 1 error · 2 verification found missing points (or, before a
 switch, memories whose content chunks could not be completed).
@@ -52,11 +55,13 @@ from services.embedding_migration_service import (  # noqa: E402
     MigrationPlan,
     SwitchResult,
     VerifyResult,
+    check_rollback_target,
     list_migratable_context_ids,
     plan_context_migration,
     purge_source_points,
     rebuild_target_chunks,
     reembed_context,
+    resolve_rollback_boundary,
     rollback_context_embedding,
     switch_context_embedding,
     verify_context_migration,
@@ -171,15 +176,37 @@ async def _one_context(db, context_id: UUID, args: argparse.Namespace) -> int:
     settings = get_settings()
 
     if args.rollback_to:
+        # #2098: refuse what cannot go ahead, then show the re-queue boundary
+        # before asking, so an operator can still abort when only the search
+        # config's last change is known.
+        await check_rollback_target(db, context_id, args.rollback_to)
+        boundary = await resolve_rollback_boundary(db, context_id, args.requeue_since)
+        # End the read transaction: the prompt below may wait for minutes, and
+        # an idle-in-transaction session holds its locks for as long.
+        await db.rollback()
+        if boundary.source == "config_updated_at":
+            print(
+                f"  WARNING: no recorded switch time for {context_id} (switched before the "
+                "switch time was stored, or never switched by this command); re-queueing "
+                f"since the search config's last change, {boundary.since.isoformat()}. If "
+                "the search settings were edited after the switch, abort and re-run with "
+                "--requeue-since <switch time>."
+            )
+        else:
+            label = (
+                "--requeue-since" if boundary.source == "explicit" else "the recorded switch time"
+            )
+            print(f"  re-queue since {boundary.since.isoformat()} ({label})")
         if not _confirm(f"Route {context_id} back to {args.rollback_to}?", args.yes):
             print("  skipped")
             return 0
         result = await rollback_context_embedding(
-            db, context_id, args.rollback_to, requeue_since=args.requeue_since
+            db, context_id, args.rollback_to, requeue_since=boundary.since
         )
+        since = result.requeue_since or boundary.since
         print(
             f"  rolled back {context_id}: {result.previous_model} -> {result.model} "
-            f"(requeued {result.requeued} for the sweep, "
+            f"(requeued {result.requeued} written since {since.isoformat()} for the sweep, "
             f"dropped {result.stale_removed} forgotten)"
         )
         _print_deferred_prune(result)
@@ -387,8 +414,9 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "ISO timestamp (UTC unless it has an offset); with a standalone --switch, "
             "re-queue memories written since; with --rollback-to, overrides the "
-            "recorded switch time (the search config's last change: pass this if "
-            "the config was edited after the switch)"
+            "recorded switch time (context_search_configs.embedding_switched_at; for "
+            "a context switched before v0.116.0, the search config's last change: "
+            "pass this if the config was edited after the switch)"
         ),
     )
     parser.add_argument("--yes", action="store_true", help="no confirmation prompts")
