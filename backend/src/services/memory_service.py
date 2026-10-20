@@ -288,6 +288,94 @@ def metadata_payload_patch(
     return payload_updates, delete_keys
 
 
+# Keys of a metadata patch an indexer point is not given (#2100). Its
+# ``updated_at`` is the document's event time, which recall's updated_after /
+# updated_before filters read, not the time the row was last edited. Its
+# importance is the indexer's and Sleep's business: the re-evaluation and its
+# undo leave the indexer point without one (#2065), so an edit that wrote one
+# would leave a value nothing else keeps current.
+RESOURCE_POINT_SKIPPED_KEYS = frozenset({"importance", "updated_at"})
+
+
+@dataclass(frozen=True)
+class MetadataPatchTarget:
+    """Where a metadata-only payload patch goes, and what it carries (#2100)."""
+
+    point_id: UUID
+    updates: dict[str, Any]
+    delete_keys: list[str]
+    own_point: bool  # the point is the memory's own id (it may have chunks)
+
+
+def resource_point_patch(
+    updates: dict[str, Any], delete_keys: list[str]
+) -> tuple[dict[str, Any], list[str]]:
+    """``(updates, delete_keys)`` without the keys an indexer point is not given."""
+    return (
+        {key: value for key, value in updates.items() if key not in RESOURCE_POINT_SKIPPED_KEYS},
+        [key for key in delete_keys if key not in RESOURCE_POINT_SKIPPED_KEYS],
+    )
+
+
+async def metadata_patch_target(
+    db: AsyncSession,
+    memory_id: UUID,
+    point_id: UUID,
+    updates: dict[str, Any],
+    delete_keys: list[str],
+) -> MetadataPatchTarget | None:
+    """The point a metadata-only edit of a memory is merged into, or ``None`` (#2100).
+
+    The point is ``Memory.point_id`` — a resource-indexer row's is the
+    document version's uuid5, not the row id — resolved by the rule
+    ``forget`` and the Sleep archive / merge use (#2065,
+    ``unshared_point_id``). A point another live row names too (the same
+    document indexed into two contexts that share a collection) is left as
+    it is: one row's edit must not rewrite the filters of the other row. The
+    edit stays in Postgres and a warning is logged. ``unshared_point_id`` is
+    not scoped by collection, so two contexts with separate collections that
+    index the same document version also count as sharing — the same
+    conservative answer ``forget`` gives.
+
+    The patch is applied with set-payload (a merge), never as a payload
+    overwrite, so an indexer point keeps its own fields (``content``,
+    ``facets``, ``sortable``, ``metadata``, ``updated_at``, ``indexed_at``,
+    ...). Of the edited keys it gains ``tags``, ``type``,
+    ``context_summary`` and ``location`` (set or cleared) — the keys
+    recall's payload filters read, so they agree with the row — and not
+    ``RESOURCE_POINT_SKIPPED_KEYS``. ``scope`` is not editable by update or
+    PATCH and is never in the patch. A point that is the memory's own id
+    gets the patch unchanged.
+
+    Args:
+        db: The session (the shared-point lookup runs in a SAVEPOINT).
+        memory_id: The edited memory.
+        point_id: Its ``Memory.point_id``.
+        updates / delete_keys: The metadata patch (``metadata_payload_patch``
+            plus ``updated_at``).
+
+    Returns:
+        The target, or ``None`` when the point is shared or nothing is left
+        to write to it.
+    """
+    from services.resource_indexer import unshared_point_id
+
+    target = await unshared_point_id(db, memory_id, point_id)
+    if target is None:
+        logger.warning(
+            "memory_metadata_sync_shared_point_skipped",
+            memory_id=str(memory_id),
+            point_id=str(point_id),
+        )
+        return None
+    if target == memory_id:
+        return MetadataPatchTarget(target, updates, list(delete_keys), own_point=True)
+    updates, delete_keys = resource_point_patch(updates, delete_keys)
+    if not (updates or delete_keys):
+        return None
+    return MetadataPatchTarget(target, updates, delete_keys, own_point=False)
+
+
 def location_payload_from_details(details: dict | None) -> dict | None:
     """Qdrant ``location`` geo payload value from a details dict (#1332).
 
@@ -2101,14 +2189,33 @@ class MemoryService:
 
         # Sync updated_at to Qdrant for date range filtering (Issue #78)
         payload_updates["updated_at"] = to_utc_iso(utcnow())
+        await self._sync_metadata_payload(memory, payload_updates, delete_keys)
+
+    async def _sync_metadata_payload(
+        self,
+        memory: Any,
+        payload_updates: dict[str, Any],
+        delete_keys: list[str],
+    ) -> None:
+        """Merge a metadata-only edit into ``memory``'s own point (#2100).
+
+        ``metadata_patch_target`` decides the point and the keys; a point
+        another live row names too is left as it is.
+        """
+        target = await metadata_patch_target(
+            self.db, memory.id, memory.point_id, payload_updates, delete_keys
+        )
+        if target is None:
+            return
         collection = await resolve_collection_name(self.db, memory.context_id)
         await update_memory_payload_in_qdrant(
-            memory_id=memory.id,
-            payload_updates=payload_updates,
+            memory_id=target.point_id,
+            payload_updates=target.updates,
             collection_name=collection,
-            delete_keys=delete_keys or None,
+            delete_keys=target.delete_keys or None,
             # #2015: a context that never opted in has no chunk points.
-            cascade_chunks=await chunk_cascade_needed(self.db, memory.context_id),
+            cascade_chunks=target.own_point
+            and await chunk_cascade_needed(self.db, memory.context_id),
         )
 
     async def _patch_load_authorized(self, memory_id: UUID, user_id: str) -> Any:
@@ -2353,15 +2460,7 @@ class MemoryService:
 
         payload_updates["updated_at"] = to_utc_iso(utcnow())
         try:
-            collection = await resolve_collection_name(self.db, memory.context_id)
-            await update_memory_payload_in_qdrant(
-                memory_id=memory.id,
-                payload_updates=payload_updates,
-                collection_name=collection,
-                delete_keys=delete_keys or None,
-                # #2015: a context that never opted in has no chunk points.
-                cascade_chunks=await chunk_cascade_needed(self.db, memory.context_id),
-            )
+            await self._sync_metadata_payload(memory, payload_updates, delete_keys)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "memory_patch_qdrant_payload_failed",
