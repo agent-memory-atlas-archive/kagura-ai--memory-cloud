@@ -6,7 +6,10 @@ point first and commit the row that owns it afterwards:
 
 * ``merge_contexts`` copies the source's points before the copied rows commit;
 * Sleep's rollback and undo-merge re-embed a memory before the UPDATE that
-  un-tombstones it commits.
+  un-tombstones it commits;
+* ``rollback_session`` un-forgets a row the same way (re-embed before the
+  UPDATE commits);
+* the admin context restore recreates rows for points that already exist.
 
 For as long as such a transaction is open, its points look orphaned to every
 other session. Each of those writers therefore holds this advisory lock
@@ -44,11 +47,6 @@ async def hold_point_writer_lock(db: AsyncSession) -> None:
     each other, only the sweep's delete pass (seconds, once a day).
     """
     await db.execute(_SHARED_SQL)
-
-
-async def hold_point_writer_lock_exclusive(db: AsyncSession) -> None:
-    """Wait for point writers and keep them out until this transaction ends."""
-    await db.execute(_EXCLUSIVE_SQL)
 
 
 async def wait_for_point_writers(db: AsyncSession, *, timeout_seconds: float) -> bool:
