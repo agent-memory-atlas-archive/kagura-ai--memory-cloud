@@ -29,6 +29,18 @@ import {
   MemberCredentials,
 } from "@/lib/api/member-credentials";
 import { getContexts } from "@/lib/api/contexts";
+import {
+  getAPIKeys,
+  updateAPIKeyDefaultContext,
+} from "@/lib/api/api-keys";
+import {
+  DefaultContextControl,
+  DefaultContextName,
+} from "@/components/credentials/DefaultContextControl";
+import {
+  defaultContextLabel,
+  useWorkspaceContextOptions,
+} from "@/hooks/useWorkspaceContextOptions";
 import type { Context } from "@/lib/types/context";
 import {
   EyeOff,
@@ -107,9 +119,36 @@ export function clampIsoToNow(iso: string): string {
   return new Date(iso).getTime() > Date.now() ? new Date().toISOString() : iso;
 }
 
+// #2129: a connector's shared key ("connector:<uuid>") never applies a
+// default context on MCP, and the API refuses to set one (422).
+const CONNECTOR_KEY_PREFIX = "connector:";
+
+/** The key's MCP default context, as `GET /config/api-keys` reports it. */
+export interface KeyDefaultContext {
+  id: string | null;
+  name: string | null;
+}
+
+/**
+ * Whether the inline default-context control is offered for a key (#2129).
+ *
+ * The API refuses a default on a revoked key (400) and on a public-bound or
+ * connector key (422); the control is hidden for those. An agent-bound key is
+ * refused too, but the member-credentials payload does not say which keys are
+ * agent-bound — that case surfaces as the API's error toast.
+ */
+export function canSetDefaultContext(apiKey: MemberAPIKey): boolean {
+  return (
+    !apiKey.revoked_at &&
+    !apiKey.bound_context_id &&
+    !apiKey.name.startsWith(CONNECTOR_KEY_PREFIX)
+  );
+}
+
 export function APIKeysTabPanel() {
   const t = useTranslations("apiKeys");
   const tCommon = useTranslations("common");
+  const tDefault = useTranslations("defaultContext");
   const locale = useLocale();
 
   const { currentWorkspaceId, currentWorkspace } = useWorkspace();
@@ -150,6 +189,15 @@ export function APIKeysTabPanel() {
   const [publicContextsError, setPublicContextsError] = useState<string | null>(
     null,
   );
+  // #2129: the create dialog's optional MCP default context ("" = none).
+  const [newKeyDefaultContextId, setNewKeyDefaultContextId] = useState("");
+  // #2129: per-key default contexts from GET /config/api-keys (the
+  // member-credentials payload does not carry them). null = not loaded.
+  const [keyDefaults, setKeyDefaults] = useState<Map<
+    string,
+    KeyDefaultContext
+  > | null>(null);
+  const workspaceContexts = useWorkspaceContextOptions();
   const [showHideApiKeyDialog, setShowHideApiKeyDialog] = useState(false);
   const [showRegenerateApiKeyDialog, setShowRegenerateApiKeyDialog] =
     useState(false);
@@ -175,13 +223,40 @@ export function APIKeysTabPanel() {
     };
   }, []);
 
+  // #2129: the default contexts come from the user's key list. A failure
+  // keeps what an earlier load showed (a failed 5-minute refresh must not
+  // read as "no default"); with nothing loaded yet the column says so.
+  const loadKeyDefaults = useCallback(async () => {
+    try {
+      const keys = await getAPIKeys();
+      if (isMountedRef.current) {
+        setKeyDefaults(
+          new Map(
+            keys.map((k) => [
+              k.id,
+              { id: k.default_context_id, name: k.default_context_name },
+            ]),
+          ),
+        );
+      }
+    } catch (err: unknown) {
+      if (process.env.NODE_ENV === "development") {
+        // eslint-disable-next-line no-console
+        console.error("Failed to load API key default contexts:", err);
+      }
+    }
+  }, []);
+
   const loadCredentials = useCallback(async () => {
     if (!currentWorkspaceId || !userId) return;
 
     try {
       setLoading(true);
       setError(null);
-      const data = await getMemberCredentials(currentWorkspaceId, userId);
+      const [data] = await Promise.all([
+        getMemberCredentials(currentWorkspaceId, userId),
+        loadKeyDefaults(),
+      ]);
       if (isMountedRef.current) {
         setCredentials(data);
       }
@@ -198,7 +273,7 @@ export function APIKeysTabPanel() {
         setLoading(false);
       }
     }
-  }, [currentWorkspaceId, userId]);
+  }, [currentWorkspaceId, userId, loadKeyDefaults]);
 
   useEffect(() => {
     if (currentWorkspaceId && userId) {
@@ -356,6 +431,39 @@ export function APIKeysTabPanel() {
     setBindToPublicContext(false);
     setBoundContextId("");
     setPublicContextsError(null);
+    setNewKeyDefaultContextId("");
+  };
+
+  // #2129: set or clear one key's MCP default context. Failures are a
+  // user-action error → toast; rethrown so the control keeps the choice.
+  const handleSaveKeyDefaultContext = async (
+    apiKey: MemberAPIKey,
+    contextId: string | null,
+  ) => {
+    try {
+      const updated = await updateAPIKeyDefaultContext(apiKey.id, contextId);
+      setKeyDefaults((prev) => {
+        const next = new Map(prev ?? []);
+        next.set(apiKey.id, {
+          id: updated.default_context_id,
+          name: updated.default_context_name,
+        });
+        return next;
+      });
+      toast({
+        title: tCommon("success"),
+        description: contextId
+          ? t("defaultContextSaved")
+          : t("defaultContextCleared"),
+      });
+    } catch (err: unknown) {
+      toast({
+        title: tCommon("error"),
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+      throw err;
+    }
   };
 
   const handleCreateAPIKey = async () => {
@@ -376,19 +484,44 @@ export function APIKeysTabPanel() {
         return;
       }
 
-      await createAPIKey(currentWorkspaceId, userId, {
+      const created = await createAPIKey(currentWorkspaceId, userId, {
         name: newKeyName,
         ...(bindToPublicContext && boundContextId
           ? { bound_context_id: boundContextId }
           : {}),
       });
+
+      // #2129: the member-credentials create route takes no default, so
+      // it is set on the new key right after. The key exists either way —
+      // a failure here is reported, never rolled back.
+      // null = nothing to report; "" = failed without a usable message.
+      let defaultError: string | null = null;
+      if (!bindToPublicContext && newKeyDefaultContextId) {
+        try {
+          await updateAPIKeyDefaultContext(created.id, newKeyDefaultContextId);
+        } catch (err: unknown) {
+          defaultError =
+            err instanceof Error && err.message.trim() ? err.message : "";
+        }
+      }
+
       await loadCredentials();
       resetCreateDialog();
 
-      toast({
-        title: tCommon("success"),
-        description: t("createSuccess"),
-      });
+      if (defaultError !== null) {
+        toast({
+          title: tCommon("error"),
+          description: defaultError
+            ? t("defaultContextCreateFailed", { error: defaultError })
+            : t("defaultContextCreateFailedGeneric"),
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: tCommon("success"),
+          description: t("createSuccess"),
+        });
+      }
     } catch (err: unknown) {
       // Use err.message when available; fall back to the i18n'd error
       // string for non-Error rejections OR when err.message is empty.
@@ -529,6 +662,44 @@ export function APIKeysTabPanel() {
         —
       </span>
     );
+
+  // #2129: the key's MCP default context — the inline control where the API
+  // accepts one, the name otherwise ("—" for none).
+  const renderDefaultContext = (apiKey: MemberAPIKey) => {
+    if (keyDefaults === null) {
+      return (
+        <span className="text-xs text-gray-400">
+          {t("defaultContextLoadFailed")}
+        </span>
+      );
+    }
+    const current = keyDefaults.get(apiKey.id);
+    // One context, one name: the select's label when it is offered.
+    const currentName = defaultContextLabel(
+      workspaceContexts,
+      current?.id ?? null,
+      current?.name ?? null,
+    );
+    if (current && canSetDefaultContext(apiKey)) {
+      return (
+        <DefaultContextControl
+          currentId={current.id}
+          currentName={currentName}
+          options={workspaceContexts}
+          onSave={(contextId) =>
+            handleSaveKeyDefaultContext(apiKey, contextId)
+          }
+          ariaLabel={t("defaultContextFor", { name: apiKey.name })}
+        />
+      );
+    }
+    return (
+      <DefaultContextName
+        currentId={current?.id ?? null}
+        currentName={currentName}
+      />
+    );
+  };
 
   const renderActions = (apiKey: MemberAPIKey) => (
     <div className="flex gap-2">
@@ -708,6 +879,7 @@ export function APIKeysTabPanel() {
                       <TableHead>{t("colName")}</TableHead>
                       <TableHead>{t("colKey")}</TableHead>
                       <TableHead>{t("colStatus")}</TableHead>
+                      <TableHead>{t("colDefaultContext")}</TableHead>
                       <TableHead>{t("colLastUsed")}</TableHead>
                       <TableHead>{t("colCreated")}</TableHead>
                       <TableHead className="text-right">
@@ -726,6 +898,9 @@ export function APIKeysTabPanel() {
                             </code>
                           </TableCell>
                           <TableCell>{renderStatusBadge(apiKey)}</TableCell>
+                          <TableCell className="text-sm">
+                            {renderDefaultContext(apiKey)}
+                          </TableCell>
                           <TableCell className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
                             {renderLastUsed(apiKey)}
                           </TableCell>
@@ -746,7 +921,7 @@ export function APIKeysTabPanel() {
                             the secret stays prominent (only chance to copy it). */}
                         {apiKey.is_visible && apiKey.plaintext_key && (
                           <TableRow className="even:bg-transparent hover:bg-transparent">
-                            <TableCell colSpan={6} className="pt-0">
+                            <TableCell colSpan={7} className="pt-0">
                               {renderPlaintextReveal(apiKey)}
                             </TableCell>
                           </TableRow>
@@ -778,6 +953,12 @@ export function APIKeysTabPanel() {
                         </code>
                       </div>
                     )}
+                    <div className="text-xs space-y-1">
+                      <p className="text-gray-500 dark:text-gray-400">
+                        {t("colDefaultContext")}
+                      </p>
+                      {renderDefaultContext(apiKey)}
+                    </div>
                     {renderActions(apiKey)}
                     <div className="text-xs text-gray-500 dark:text-gray-400 space-y-1">
                       <p>
@@ -918,6 +1099,35 @@ export function APIKeysTabPanel() {
                 </div>
               )}
             </div>
+
+            {/* #2129: optional MCP default context. Not offered for a
+                public-bound key — the API refuses one there. */}
+            {!bindToPublicContext && (
+              <div className="space-y-1">
+                <label
+                  htmlFor="create-api-key-default-context"
+                  className="block text-sm font-medium"
+                >
+                  {t("defaultContextLabel")}
+                </label>
+                <select
+                  id="create-api-key-default-context"
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={newKeyDefaultContextId}
+                  onChange={(e) => setNewKeyDefaultContextId(e.target.value)}
+                >
+                  <option value="">{tDefault("noDefault")}</option>
+                  {workspaceContexts.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {t("defaultContextHelp")}
+                </p>
+              </div>
+            )}
 
             {createKeyError && (
               <p className="text-sm text-red-600 dark:text-red-400">
