@@ -1,0 +1,145 @@
+"""``list`` with tags_match='all' + tags_normalize groups tags like recall (#2086).
+
+recall ANDs one group per requested tag (``tag_filter_groups``, #2071): a
+requested tag is satisfied by any one of its spellings, and two requested tags
+whose folds collide but whose numbers differ stay two required tags. ``list``
+used to AND one fold per tag, so one stored ``pr-123`` satisfied a filter on
+``pr-123`` AND ``pr-1-23`` (the lane's fold drops ``-``). The SQL-shape tests
+run without a database; the ``db_session`` ones skip when none is reachable.
+"""
+
+from __future__ import annotations
+
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.dialects import postgresql
+
+from services.memory_listing import compile_memory_filters, list_memories
+from tests.services.test_memory_listing import _row, _scope
+
+
+def _all(*tags: str) -> dict:
+    return {"tags": list(tags), "tags_match": "all", "tags_normalize": True}
+
+
+def _sql(filters: dict) -> list[str]:
+    return [
+        str(p.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        for p in compile_memory_filters(filters)
+    ]
+
+
+# ------------------------------------------------------------------ SQL shape
+
+
+def test_colliding_tags_with_other_numbers_stay_two_guarded_groups():
+    preds = _sql(_all("pr-123", "pr-1-23"))
+    assert len(preds) == 2
+    assert all("= 'pr123'" in p for p in preds)
+    assert "= '123'" in preds[0] and "= '1,23'" in preds[1]
+
+
+def test_one_tag_written_twice_is_one_group_without_a_number_guard():
+    preds = _sql(_all("Deploy", "deploy", "todo"))
+    assert len(preds) == 2
+    assert "= 'deploy'" in preds[0] and "= 'todo'" in preds[1]
+    assert not any("[^0-9]+" in p for p in preds)
+
+
+def test_plural_spellings_stay_two_requirements_in_this_lane():
+    # This lane does not fold plurals, so recall's log / logs group is not borrowed.
+    preds = _sql(_all("log", "logs"))
+    assert len(preds) == 2 and "= 'log'" in preds[0] and "= 'logs'" in preds[1]
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        ("pr-1-２３", "pr-1２３"),  # full-width: recall's numbers [1, 23] / [123]
+        ("pr-١٢٣", "pr-١-٢٣"),  # Arabic-Indic digits
+    ],
+)
+def test_colliding_tags_the_ascii_guard_cannot_split_match_exactly(tags):
+    preds = _sql(_all(*tags))
+    assert len(preds) == 2
+    assert f"t IN ('{tags[0]}')" in preds[0] and f"t IN ('{tags[1]}')" in preds[1]
+
+
+def test_variants_plus_a_colliding_identifier_make_two_requirements():
+    preds = _sql(_all("pr-123", "PR_123", "pr-1-23"))
+    assert len(preds) == 2
+    assert "= '123'" in preds[0] and "= '1,23'" in preds[1]
+
+
+def test_a_single_separator_only_tag_keeps_the_fold():
+    preds = _sql(_all("-"))
+    assert len(preds) == 1 and "= ''" in preds[0] and "t IN" not in preds[0]
+
+
+def test_tags_that_do_not_collide_get_no_number_guard():
+    # The lane's fold keeps ".", so these two never fold together here.
+    preds = _sql(_all("v0.11.0", "v0.1.10"))
+    assert len(preds) == 2
+    assert "= 'v0.11.0'" in preds[0] and "= 'v0.1.10'" in preds[1]
+    assert not any("[^0-9]+" in p for p in preds)
+
+
+def test_every_tag_stays_required_past_recalls_group_cap():
+    tags = [f"tag-{i}" for i in range(60)]
+    assert len(_sql(_all(*tags))) == 60
+
+
+def test_many_colliding_tags_compile_without_pairwise_work():
+    # 4,096 distinct splits of one digit string share the fold "pr" + digits.
+    digits = "1234567890123"
+    tags = []
+    for mask in range(1 << 12):
+        parts = [digits[0]]
+        for i, ch in enumerate(digits[1:]):
+            parts.append(("-" if mask >> i & 1 else "") + ch)
+        tags.append("pr-" + "".join(parts))
+    assert len(compile_memory_filters(_all(*tags))) == len(tags)
+
+
+def test_any_mode_is_unchanged():
+    preds = _sql({"tags": ["pr-123", "pr-1-23"], "tags_normalize": True})
+    assert len(preds) == 1 and " OR " in preds[0]
+    assert "[^0-9]+" not in preds[0]
+
+
+# ---------------------------------------------------------------- against PG
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filters", "expected"),
+    [
+        # recall's #2071 cases, on spellings this lane's fold collides.
+        (_all("pr-123", "pr-1-23"), {"both"}),
+        # Alone, a tag stays number-blind, as recall's widening is.
+        (_all("pr-123"), {"both", "one", "upper", "other"}),
+        (_all("PR-123", "pr-1-23"), {"both"}),
+        (_all("Deploy", "deploy"), {"deploy"}),
+        (_all("pr_123", "pr-123"), {"both", "one", "upper", "other"}),
+        (_all("pr-1-２３", "pr-1２３"), {"wide_both"}),
+        (_all("pr-123", "PR_123", "pr-1-23"), {"both"}),
+    ],
+)
+async def test_list_all_groups_match_recall(db_session, filters, expected):
+    owner = f"o-{uuid4().hex[:6]}"
+    ws, ctx = await _scope(db_session, owner, private=False)
+    rows = {
+        "both": await _row(db_session, owner, ws, ctx, summary="both", tags=["pr-123", "pr-1-23"]),
+        "one": await _row(db_session, owner, ws, ctx, summary="one", tags=["pr-123"]),
+        "upper": await _row(db_session, owner, ws, ctx, summary="upper", tags=["PR_123"]),
+        "other": await _row(db_session, owner, ws, ctx, summary="other", tags=["pr-1-23"]),
+        "deploy": await _row(db_session, owner, ws, ctx, summary="deploy", tags=["DEPLOY"]),
+        "wide_one": await _row(db_session, owner, ws, ctx, summary="wide_one", tags=["pr-1-２３"]),
+        "wide_both": await _row(
+            db_session, owner, ws, ctx, summary="wide_both", tags=["pr-1-２３", "pr-1２３"]
+        ),
+    }
+    await db_session.commit()
+    page = await list_memories(db_session, context_id=ctx, owner_user_id=None, filters=filters)
+    assert {m.summary for m in page.rows} == {rows[k].summary for k in expected}
