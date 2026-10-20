@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import hashlib
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -1837,11 +1838,17 @@ async def _consent_default_context_choices(
     except Exception as e:  # noqa: BLE001 - the picker is optional; consent is not
         logger.warning("oauth_consent_default_context_unavailable", error_type=type(e).__name__)
         return [], ""
+    # Grouped by workspace id, labelled by name: two workspaces sharing a
+    # display name stay two groups.
     groups: list[dict[str, Any]] = []
-    for option in options:
-        if not groups or groups[-1]["workspace"] != option.workspace_name:
-            groups.append({"workspace": option.workspace_name, "contexts": []})
-        groups[-1]["contexts"].append({"id": str(option.context_id), "name": option.name})
+    for _, members in itertools.groupby(options, key=lambda option: option.workspace_id):
+        group = list(members)
+        groups.append(
+            {
+                "workspace": group[0].workspace_name,
+                "contexts": [{"id": str(o.context_id), "name": o.name} for o in group],
+            }
+        )
     listed = {str(option.context_id) for option in options}
     if stored is None:
         return groups, ""
@@ -1854,21 +1861,23 @@ async def _consent_default_context_choices(
 
 
 async def _save_consent_default_context(
-    user_id: str | None, client_id: str | None, raw: str | None
+    user_id: str | None, client_id: str | None, raw: object
 ) -> None:
     """Store the default context chosen on the consent page (#2129).
 
     ``raw`` is the ``default_context`` form field. Empty clears an existing
     setting (and writes nothing when there is none); a UUID the user can read
     (viewer, no key scope) is stored; anything else — absent field, not a
-    UUID, unreadable — is ignored at debug level. Never interrupts the
-    authorization: a failure here is logged and the flow continues.
+    UUID, unreadable — is ignored at debug level. A non-string value (a
+    multipart file part named ``default_context``) counts as an absent field.
+    Never interrupts the authorization: a failure here is logged and the flow
+    continues.
     """
     if (
         not isinstance(user_id, str)
         or not user_id
         or not client_id
-        or raw is None
+        or not isinstance(raw, str)
         or raw.strip() == CONSENT_KEEP_DEFAULT
     ):
         return
@@ -2293,7 +2302,8 @@ async def oauth_authorize_post(
         # Use 303 See Other to convert POST to GET redirect
         # Claude.ai callback expects GET, not POST
         if hasattr(response, "location") and response.location:
-            if _grant_issued(response.location):
+            issued = _grant_issued(response.location)
+            if issued:
                 # #2129: the default context picked on the consent page, stored
                 # once the code is issued (a refused request changes nothing)
                 # and before the client is sent back, so its first MCP call
@@ -2301,7 +2311,7 @@ async def oauth_authorize_post(
                 await _save_consent_default_context(
                     user.user_id, client_id, request.state.form_data.get("default_context")
                 )
-            if new_authorization and user.user_id and _grant_issued(response.location):
+            if new_authorization and user.user_id and issued:
                 schedule_security_notification(
                     background_tasks,
                     user_id=user.user_id,
@@ -2312,11 +2322,7 @@ async def oauth_authorize_post(
             # #2155: a loopback client may sit behind NAT or SSH where the
             # browser cannot reach it, so the callback URL is shown on a page
             # instead of being lost in a failed redirect.
-            if (
-                redirect_uri
-                and is_loopback_redirect_uri(redirect_uri)
-                and _grant_issued(response.location)
-            ):
+            if redirect_uri and is_loopback_redirect_uri(redirect_uri) and issued:
                 interstitial = await _run_sync(
                     partial(
                         _render_loopback_interstitial,

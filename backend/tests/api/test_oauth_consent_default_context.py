@@ -124,12 +124,16 @@ def test_the_picker_strings_exist_in_both_locales():
 
 
 def _post(
-    form: dict[str, str], location: str = "https://app.example/cb?code=abc&state=s"
+    form: dict[str, str],
+    location: str = "https://app.example/cb?code=abc&state=s",
+    *,
+    files: dict | None = None,
+    save: AsyncMock | None = None,
 ) -> tuple[int, AsyncMock]:
     fake_user = MagicMock(email="test@example.com", user_id="user-1")
     fake_client = MagicMock(client_name="App", scope="memory:read")
     fake_client.check_redirect_uri = MagicMock(return_value=True)
-    save = AsyncMock()
+    save = save or AsyncMock()
     redirect = SimpleNamespace(location=location)
     with (
         patch("api.routes.oauth.get_current_user_from_session", return_value=fake_user),
@@ -146,9 +150,38 @@ def _post(
                 "/api/v1/oauth/authorize",
                 params={"client_id": "test", "redirect_uri": "https://app.example/cb"},
                 data=form,
+                files=files,
                 follow_redirects=False,
             )
     return response.status_code, save
+
+
+def test_a_file_part_named_default_context_never_interrupts_the_approve():
+    """A multipart *file* part named ``default_context`` reaches the helper as
+    an ``UploadFile``: the approve completes (303 to the client, not an
+    ``error=server_error`` redirect) and nothing is stored."""
+    from starlette.datastructures import UploadFile
+
+    real_save = oauth_routes._save_consent_default_context
+    returned: list[bool] = []
+
+    async def save_and_record(*args: object) -> None:
+        await real_save(*args)  # an exception here would end in error=server_error
+        returned.append(True)
+
+    save = AsyncMock(side_effect=save_and_record)
+    setter = AsyncMock()
+    with patch("services.credential_default_context.set_grant_default_context", new=setter):
+        status, _ = _post(
+            {"confirm": "yes"},
+            files={"default_context": ("ctx.txt", str(CTX_A).encode(), "text/plain")},
+            save=save,
+        )
+
+    assert status == 303
+    assert isinstance(save.await_args.args[2], UploadFile)
+    assert returned == [True]
+    setter.assert_not_awaited()
 
 
 def test_approve_stores_the_picked_context_once_the_code_is_issued():
@@ -244,8 +277,10 @@ async def test_an_empty_value_clears():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw", [None, "my-project", "keep"])
+@pytest.mark.parametrize("raw", [None, "my-project", "keep", object()])
 async def test_an_absent_malformed_or_keep_value_is_ignored(raw):
+    """A non-string value (an ``UploadFile`` from a multipart part) counts as
+    an absent field."""
     with _save_env(SimpleNamespace(name="alpha")) as env:
         await oauth_routes._save_consent_default_context("user-1", "client-1", raw)
 
@@ -275,10 +310,13 @@ async def test_a_failure_never_interrupts_the_authorization():
 async def test_the_choices_group_by_workspace_and_keep_a_listed_selection():
     from services.credential_default_context import ContextOption
 
+    team, personal, other_personal = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     options = [
-        ContextOption(CTX_A, "alpha", "Team"),
-        ContextOption(CTX_B, "beta", "Team"),
-        ContextOption(uuid.uuid4(), "gamma", "Personal"),
+        ContextOption(CTX_A, "alpha", "Team", team),
+        ContextOption(CTX_B, "beta", "Team", team),
+        ContextOption(uuid.uuid4(), "gamma", "Personal", personal),
+        # A second workspace with the same display name stays its own group.
+        ContextOption(uuid.uuid4(), "delta", "Personal", other_personal),
     ]
 
     async def get_db():
@@ -297,8 +335,9 @@ async def test_the_choices_group_by_workspace_and_keep_a_listed_selection():
     ):
         groups, selected = await oauth_routes._consent_default_context_choices("u", "c")
 
-    assert [g["workspace"] for g in groups] == ["Team", "Personal"]
+    assert [g["workspace"] for g in groups] == ["Team", "Personal", "Personal"]
     assert [c["name"] for c in groups[0]["contexts"]] == ["alpha", "beta"]
+    assert [c["name"] for c in groups[2]["contexts"]] == ["delta"]
     assert selected == str(CTX_B)
 
 
