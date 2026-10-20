@@ -166,6 +166,21 @@ describe("content chunk card — presence", () => {
     expect(screen.queryByText("contentChunks.title")).toBeNull();
   });
 
+  it.each([true, false])(
+    "is not rendered by a backend that sends the flag (%s) without can_change",
+    async (enabled) => {
+      mockGetConfig.mockResolvedValue({
+        ...BASE,
+        content_chunks_enabled: enabled,
+      });
+      render(<SearchSettingsSection contextId="ctx-1" />);
+      await waitFor(() =>
+        expect(screen.getByText("hybridSearchWeights")).toBeTruthy(),
+      );
+      expect(screen.queryByText("contentChunks.title")).toBeNull();
+    },
+  );
+
   it("shows the stored state with an enabled switch", async () => {
     await renderWith(CHUNKS_ON);
     expect(chunkSwitch().getAttribute("aria-checked")).toBe("true");
