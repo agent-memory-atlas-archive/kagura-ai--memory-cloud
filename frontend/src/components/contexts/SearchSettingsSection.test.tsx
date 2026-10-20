@@ -53,6 +53,9 @@ vi.mock("next-intl", () => ({
     t.rich = (k, values) => (values?.link ? values.link(k) : k);
     return t;
   },
+  useFormatter: () => ({
+    list: (items: Iterable<string>) => Array.from(items).join(", "),
+  }),
   useLocale: () => "en",
 }));
 
@@ -357,7 +360,9 @@ describe("SearchSettingsSection reranking off on this deployment (#1580)", () =>
       target: { value: "5" },
     });
 
-    expect(await screen.findByText("unsavedChangesBar")).toBeInTheDocument();
+    expect(
+      await screen.findByText("unsavedFields(fields=unsavedFieldFetchFactor)"),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("providerUnavailableCannotSave"),
     ).not.toBeInTheDocument();
@@ -384,9 +389,7 @@ describe("SearchSettingsSection free-tier upgrade CTA (#1643)", () => {
 
     // The notice and its whole explanation survive — only the CTA does not.
     expect(await screen.findByText(NOTICE_TITLE)).toBeInTheDocument();
-    expect(
-      screen.getByText(/^plan\.description\(plan=M,/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/^plan\.description\(plan=M,/)).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: NOTICE_CTA }),
     ).not.toBeInTheDocument();
@@ -458,12 +461,8 @@ describe("SearchSettingsSection free-tier upgrade CTA (#1643)", () => {
     setFree("owner");
     render(<SearchSettingsSection contextId="ctx-1" />);
 
-    expect(
-      await screen.findByText(/^plan\.titleNoTier\(/),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/^plan\.descriptionNoTier\(/),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/^plan\.titleNoTier\(/)).toBeInTheDocument();
+    expect(screen.getByText(/^plan\.descriptionNoTier\(/)).toBeInTheDocument();
     // No tier is named anywhere in the notice.
     expect(screen.queryByText(/[(,]plan=/)).toBeNull();
     expect(
@@ -606,9 +605,93 @@ describe("SearchSettingsSection reranker — the whole gate truth table (#1645)"
       // The notice only once both inputs have answered and the tier lacks it.
       expect(screen.queryByText(NOTICE_TITLE) !== null).toBe(refused);
       // Its CTA: the owner, on a deployment whose Plan page is known on.
-      expect(
-        screen.queryByRole("button", { name: NOTICE_CTA }) !== null,
-      ).toBe(refused && role === "owner" && i === "on, plan_page on");
+      expect(screen.queryByRole("button", { name: NOTICE_CTA }) !== null).toBe(
+        refused && role === "owner" && i === "on, plan_page on",
+      );
     },
   );
+});
+
+describe("SearchSettingsSection save bar (#2159)", () => {
+  function bar() {
+    return screen.queryByTestId("search-settings-save-bar");
+  }
+
+  it("names the unsaved fields, badges their cards, and sits in the flow", async () => {
+    // BYOK off: key presence unknown, so the reranker controls are usable.
+    mockFeatures = { byok: false };
+    render(<SearchSettingsSection contextId="ctx-1" />);
+    fireEvent.change(await screen.findByLabelText("semanticWeightLabel"), {
+      target: { value: "0.8" },
+    });
+    fireEvent.click(screen.getByRole("switch", { name: "enableReranking" }));
+
+    expect(
+      await screen.findByText(
+        "unsavedFields(fields=unsavedFieldSemanticWeight, unsavedFieldReranker)",
+      ),
+    ).toBeInTheDocument();
+    // One badge per dirty card, next to its title.
+    const badges = screen.getAllByText("unsavedBadge");
+    expect(badges).toHaveLength(2);
+    expect(screen.getByText("hybridSearchWeights").contains(badges[0])).toBe(
+      true,
+    );
+    expect(screen.getByText("rerankerConfig").contains(badges[1])).toBe(true);
+
+    // Sticky inside the section, not a viewport-fixed overlay.
+    const el = bar()!;
+    expect(el.className).toContain("sticky");
+    expect(el.className).toContain("bottom-0");
+    expect(el.className).not.toMatch(/\bfixed\b/);
+    expect(el.className).not.toContain("bottom-14");
+    // After the last card, so it is also last in the focus order.
+    expect(
+      screen.getByText("embeddingConfig").compareDocumentPosition(el) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("clears when a field is typed back to its saved value", async () => {
+    render(<SearchSettingsSection contextId="ctx-1" />);
+    const input = await screen.findByLabelText("fetchFactorLabel");
+    fireEvent.change(input, { target: { value: "5" } });
+    expect(bar()).not.toBeNull();
+    expect(screen.getByText("unsavedBadge")).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "3" } });
+    expect(bar()).toBeNull();
+    expect(screen.queryByText("unsavedBadge")).toBeNull();
+  });
+
+  it("a weight typed back to a stored value with three decimals is not unsaved", async () => {
+    mockGetConfig.mockResolvedValue({
+      context_id: "ctx-1",
+      semantic_weight: 0.333,
+      bm25_weight: 0.667,
+      fetch_factor: 3,
+      use_rerank: false,
+      reranker_provider: "voyage",
+      reranker_model: "rerank-2",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    });
+    render(<SearchSettingsSection contextId="ctx-1" />);
+    const input = await screen.findByLabelText("semanticWeightLabel");
+    fireEvent.change(input, { target: { value: "0.5" } });
+    expect(bar()).not.toBeNull();
+    fireEvent.change(input, { target: { value: "0.333" } });
+    expect(bar()).toBeNull();
+  });
+
+  it("discard re-reads the config and drops the staged edits", async () => {
+    render(<SearchSettingsSection contextId="ctx-1" />);
+    fireEvent.change(await screen.findByLabelText("fetchFactorLabel"), {
+      target: { value: "5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "discardChanges" }));
+    await waitFor(() => expect(bar()).toBeNull());
+    expect(
+      (screen.getByLabelText("fetchFactorLabel") as HTMLInputElement).value,
+    ).toBe("3");
+  });
 });
