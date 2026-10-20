@@ -16,6 +16,7 @@ from utils.tag_normalize import (
     mechanical_variant_key,
     normalize_tag,
     tag_filter_groups,
+    tag_filter_groups_any,
 )
 
 
@@ -640,5 +641,38 @@ class TestTagFilterGroups:
 
     def test_duplicates_are_dropped(self):
         assert tag_filter_groups(["Deploy", "Deploy"], ["Deploy", "deploy", "deploy"]) == [
+            ["Deploy", "deploy"]
+        ]
+
+
+class TestTagFilterGroupsAny:
+    """#2096: one group per requested tag of a widened tags_match='any' filter."""
+
+    def test_a_tag_groups_with_the_spellings_it_gained(self):
+        assert tag_filter_groups_any(["ログ", "デプロイ"], {"ログ": ["ろぐ"]}) == [
+            ["ログ", "ろぐ"],
+            ["デプロイ"],
+        ]
+
+    def test_the_groups_are_the_widenings_own(self):
+        """No re-fold: a spelling stays with the tag that gained it."""
+        added = {"v0.11.0": ["V0.11.0", "v0110"]}
+        assert tag_filter_groups_any(["v0.11.0", "v0.1.10"], added) == [
+            ["v0.11.0", "V0.11.0", "v0110"],
+            ["v0.1.10"],
+        ]
+
+    def test_groups_stop_at_the_store_cap(self):
+        tags = [f"tag{n}" for n in range(MAX_TAG_GROUPS + 10)]
+        assert tag_filter_groups_any(tags, {}) == [[t] for t in tags[:MAX_TAG_GROUPS]]
+
+    def test_a_tag_past_the_cap_joins_no_group(self):
+        tags = ["deploy", *(f"tag{n}" for n in range(MAX_TAG_GROUPS - 1)), "Deploy"]
+        groups = tag_filter_groups_any(tags, {"deploy": ["DEPLOY"]})
+        assert groups[0] == ["deploy", "DEPLOY"]
+        assert "Deploy" not in {t for g in groups for t in g}
+
+    def test_duplicates_are_dropped(self):
+        assert tag_filter_groups_any(["Deploy", "Deploy"], {"Deploy": ["deploy"]}) == [
             ["Deploy", "deploy"]
         ]

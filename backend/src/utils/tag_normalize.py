@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 # Separator characters an author might use interchangeably inside one tag.
 _SEPARATORS = re.compile(r"[\s_\-./]+")
@@ -99,10 +99,11 @@ def normalize_tag(tag: str) -> str:
     return _drop_long_vowel(_fold_before_long_vowel(tag))
 
 
-# Internal recall filter key carrying tag_filter_groups' result to the store
-# builders (``db.qdrant.tag_groups_for_all``); recall strips a caller's (#2071).
+# Internal recall filter key carrying tag_filter_groups' (tags_match='all') or
+# tag_filter_groups_any's (#2096) result to the store builders
+# (``db.qdrant.widened_tag_groups``); recall strips a caller's (#2071).
 TAG_GROUPS_FILTER_KEY = "_tag_groups"
-# The stores AND at most this many tags (db.qdrant._MAX_FILTER_TAGS), so later
+# The stores match at most this many tags (db.qdrant._MAX_FILTER_TAGS), so later
 # requested tags are not grouped: that also bounds the pairwise number check.
 MAX_TAG_GROUPS = 50
 
@@ -168,6 +169,39 @@ def tag_filter_groups(requested: Sequence[str], expanded: Sequence[str]) -> list
             emitted.add(key)
             groups.append(group)
     return groups
+
+
+def tag_filter_groups_any(
+    requested: Sequence[str], added_by_tag: Mapping[str, Sequence[str]]
+) -> list[list[str]]:
+    """One group per requested tag of a widened ``tags_match='any'`` filter (#2096).
+
+    The store builders cut a flat tag list to 50 entries, so the spellings the
+    widening interleaves pushed later requested tags out and tolerance matched
+    fewer tags than the exact filter. The builders OR the union of these groups
+    instead, capped by group: a kept requested tag keeps every spelling the
+    widening gave it.
+
+    The groups are the widening's own (``expand_tag_filter``'s
+    ``added_by_tag``), not a re-fold: a requested tag past the cap never joins
+    an earlier tag's group, and a group holds at most the tag plus its
+    ``MAX_EXPANSION_PER_TAG`` spellings.
+
+    Args:
+        requested: The tags the caller filtered on, in filter order.
+        added_by_tag: ``expand_tag_filter``'s map of requested tag to the
+            spellings it gained.
+
+    Returns:
+        One list per distinct requested tag (the first ``MAX_TAG_GROUPS``), in
+        filter order, each starting with that tag.
+
+    Example:
+        >>> tag_filter_groups_any(["ログ", "デプロイ"], {"ログ": ["ろぐ"]})
+        [['ログ', 'ろぐ'], ['デプロイ']]
+    """
+    listed = list(dict.fromkeys(requested))[:MAX_TAG_GROUPS]
+    return [[tag, *added_by_tag.get(tag, ())] for tag in listed]
 
 
 def _fold_before_long_vowel(tag: str) -> str:
