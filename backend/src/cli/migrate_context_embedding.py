@@ -52,6 +52,7 @@ from config.settings import get_settings  # noqa: E402
 from db.base import get_db  # noqa: E402
 from services.context_routing import resolve_context_embedding  # noqa: E402
 from services.embedding_migration_service import (  # noqa: E402
+    EmbeddingSwitchBusyError,
     MigrationPlan,
     SwitchResult,
     VerifyResult,
@@ -110,6 +111,26 @@ def _still_missing_remedy(requeue_since: datetime | None) -> str:
         f"Retry just these with --verify --switch{since} (no full re-embed); if the same "
         "memories stay listed, look for content_chunks_* errors in the log"
     )
+
+
+def _busy_remedy(requeue_since: datetime | None) -> str:
+    """How to retry a switch refused while another transaction was writing
+    (#2156). With a re-queue boundary the retry repeats it: a bare --switch
+    would re-queue nothing, and --run would re-embed the whole context again."""
+    if requeue_since is None:
+        return "Retry --switch once the current write finishes"
+    return (
+        f"Retry with --verify --switch --requeue-since {requeue_since.isoformat()} "
+        "once the current write finishes (no full re-embed)"
+    )
+
+
+def _busy_rollback_remedy(model: str, requeue_since: datetime | None) -> str:
+    """How to retry a refused ``--rollback-to`` (#2156). A bare retry re-queues
+    from the recorded switch time again (#2098); only a boundary the operator
+    gave is repeated."""
+    since = f" --requeue-since {requeue_since.isoformat()}" if requeue_since else ""
+    return f"Retry --rollback-to {model}{since} once the current write finishes"
 
 
 def _print_chunk_ids(label: str, ids: list[UUID], remedy: str) -> None:
@@ -200,9 +221,19 @@ async def _one_context(db, context_id: UUID, args: argparse.Namespace) -> int:
         if not _confirm(f"Route {context_id} back to {args.rollback_to}?", args.yes):
             print("  skipped")
             return 0
-        result = await rollback_context_embedding(
-            db, context_id, args.rollback_to, requeue_since=boundary.since
-        )
+        try:
+            result = await rollback_context_embedding(
+                db, context_id, args.rollback_to, requeue_since=boundary.since
+            )
+        except EmbeddingSwitchBusyError as exc:
+            remedy = _busy_rollback_remedy(args.rollback_to, args.requeue_since)
+            line = f"  NOT rolled back: {exc} {remedy}."
+            if args.context is None:
+                # Over --all / --workspace, the contexts already rolled back
+                # would each be refused as "already routes to" on a rerun.
+                line += f" Retry it for this context only (--context {context_id})."
+            print(line)
+            return 1
         since = result.requeue_since or boundary.since
         print(
             f"  rolled back {context_id}: {result.previous_model} -> {result.model} "
@@ -323,24 +354,35 @@ async def _one_context(db, context_id: UUID, args: argparse.Namespace) -> int:
 
     if args.switch or args.run:
         if requeue_since is None:
-            print(
-                "  note: --switch without --reembed in the same run re-queues nothing; "
-                "memories written since the re-embed will be embedded under the new "
-                "routing only if you pass --requeue-since"
-            )
+            if args.requeue_since is None:
+                print(
+                    "  note: --switch without --reembed in the same run re-queues nothing; "
+                    "memories written since the re-embed will be embedded under the new "
+                    "routing only if you pass --requeue-since"
+                )
             requeue_since = args.requeue_since
         if not switch_confirmed and not _confirm(
             f"Switch {context_id} to {plan.target_model}?", args.yes
         ):
             print("  skipped")
             return 0
-        switched = await switch_context_embedding(
-            db,
-            context_id,
-            plan.target_model,
-            plan.target_dimensions,
-            requeue_since=requeue_since,
-        )
+        try:
+            switched = await switch_context_embedding(
+                db,
+                context_id,
+                plan.target_model,
+                plan.target_dimensions,
+                requeue_since=requeue_since,
+            )
+        except EmbeddingSwitchBusyError as exc:
+            # #2156: the session is already rolled back; --all goes on.
+            line = f"  NOT switched: {exc} {_busy_remedy(requeue_since)}."
+            if requeue_since is not None and args.context is None:
+                # The time is this context's own re-embed start: a retry over
+                # --all / --workspace would apply it to every other context.
+                line += f" Retry it for this context only (--context {context_id})."
+            print(line)
+            return 1
         print(
             f"  switched: {switched.previous_model} -> {switched.model} "
             f"(requeued {switched.requeued} for the sweep, "
