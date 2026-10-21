@@ -709,19 +709,21 @@ _PROVIDER_HOSTNAMES: dict[str, tuple[str, ...]] = {
 # prefix followed by exactly one path segment (issue #2222). Kept apart from
 # ``_PROVIDER_HOSTNAMES`` on purpose: ``googleusercontent.com`` serves user
 # content on many subdomains, so a suffix match would let anyone register a
-# DCR client whose callback is content they control. Only Google's two OAuth
-# redirector hosts qualify, compared as written (no userinfo, port, trailing
-# dot or case variant), and only inside the custom-MCP binding namespace of
-# the redirector (``/r/user_bound_custom-mcp-<one segment>``). No params,
-# query or fragment. The URI is stored exactly as sent and compared exactly at
-# /authorize and /token — never as a ``/r/*`` wildcard, which would match
-# every other binding on the redirector.
+# DCR client whose callback is content they control. Only Google's OAuth
+# redirector hosts qualify (production, sandbox and, since #2232, test),
+# compared as written (no userinfo, port, trailing dot or case variant), and
+# only inside the custom-MCP binding namespace of the redirector
+# (``/r/user_bound_custom-mcp-<one segment>``). No params, query or fragment.
+# The URI is stored exactly as sent and compared exactly at /authorize and
+# /token — never as a ``/r/*`` wildcard, which would match every other
+# binding on the redirector.
 # Hosts are an ordered tuple (not a frozenset) so the match order is fixed.
 _PROVIDER_EXACT_REDIRECTS: dict[str, tuple[tuple[str, ...], str]] = {
     "gemini": (
         (
             "oauth-redirect.googleusercontent.com",
             "oauth-redirect-sandbox.googleusercontent.com",
+            "oauth-redirect-test.googleusercontent.com",
         ),
         "/r/user_bound_custom-mcp-",
     ),
@@ -732,6 +734,13 @@ _EXACT_REDIRECT_BASES: tuple[tuple[str, str], ...] = tuple(
     (f"https://{host}{prefix}", provider)
     for provider, (hosts, prefix) in _PROVIDER_EXACT_REDIRECTS.items()
     for host in hosts
+)
+
+# The Gemini redirector hosts as the registration rejection message names them
+# ("https://a, https://b or https://c").
+_GEMINI_REDIRECT_ORIGINS = tuple(f"https://{h}" for h in _PROVIDER_EXACT_REDIRECTS["gemini"][0])
+_GEMINI_REDIRECT_HOSTS_TEXT = (
+    f"{', '.join(_GEMINI_REDIRECT_ORIGINS[:-1])} or {_GEMINI_REDIRECT_ORIGINS[-1]}"
 )
 
 # Characters allowed in the trailing segment of an exact-redirect provider:
@@ -949,7 +958,10 @@ async def dynamic_client_registration(
       Cursor, Codex, Hermes Agent or OpenClaw (issue #1657); gemini by an
       exact https redirect on Google's OAuth redirector hosts under
       ``/r/user_bound_custom-mcp-`` (issue #2222). Every entry of
-      ``redirect_uris`` must pass on its own (#1686)
+      ``redirect_uris`` is checked on its own (#1686); entries that fail are
+      left out of the registration and only the rest are stored and echoed
+      (RFC 7591 §3.2.1). Refused with ``invalid_client_metadata`` only when
+      no entry passes (#2232)
     - IP-based rate limiting (5 registrations per minute per IP); addresses in
       ``OAUTH_DCR_RATE_LIMIT_EXEMPT_CIDRS`` are not limited (#1741)
     - Redirect URI pattern validation
@@ -1003,23 +1015,31 @@ async def dynamic_client_registration(
 
     # Detect the provider of every redirect_uri (hostname suffix match) with a
     # client_name keyword fallback for RFC 8252 loopback redirects. See
-    # ``detect_dcr_provider`` above for the rationale. Each redirect_uri must
-    # pass on its own (#1686); the client's provider is the first one's.
-    providers = [detect_dcr_provider(uri, data.client_name) for uri in data.redirect_uris]
-    refused = [
-        uri
-        for uri, provider in zip(data.redirect_uris, providers, strict=True)
-        if provider not in _DCR_ALLOWED_PROVIDERS
-    ]
-    detected_provider = providers[0]
+    # ``detect_dcr_provider`` above for the rationale. Each redirect_uri is
+    # judged on its own (#1686); the ones that fail are left out of the
+    # registration rather than refusing it (#2232, RFC 7591 §3.2.1 lets the
+    # server replace requested metadata). What #1686 protects is the stored
+    # list: a refused entry is never stored, so /authorize and /token never
+    # accept it, and the client is the one the caller could get by sending the
+    # passing entries alone. The registration is refused only when none
+    # passes. The client's provider is the first *passing* entry's.
+    accepted: list[tuple[str, str]] = []
+    refused: list[str] = []
+    for uri in data.redirect_uris:
+        provider = detect_dcr_provider(uri, data.client_name)
+        if provider in _DCR_ALLOWED_PROVIDERS:
+            accepted.append((uri, provider))
+        else:
+            refused.append(uri)
 
-    if refused:
+    if not accepted:
         logger.warning(
             "dcr_provider_rejected",
             ip=client_ip,
-            redirect_uri=_redact_redirect_uri_for_log(refused[0]),
+            redirect_uri=_redact_dcr_redirect_uri_for_log(refused[0]),
             refused_redirect_uris=len(refused),
             redirect_uris=len(data.redirect_uris),
+            refused=_redact_dcr_redirect_uris_for_log(refused),
         )
         return rfc6749_error_response(
             error="invalid_client_metadata",
@@ -1029,11 +1049,24 @@ async def dynamic_client_registration(
                 "Native CLIs (RFC 8252) must use http://localhost, "
                 "http://127.0.0.1, or http://[::1] with a recognized "
                 f"client_name ({' / '.join(_LOOPBACK_CLIENT_LABELS)}). "
-                "Gemini must use https://oauth-redirect.googleusercontent.com "
-                "or https://oauth-redirect-sandbox.googleusercontent.com with "
-                "the path /r/user_bound_custom-mcp-<one segment> and no query "
-                "or fragment."
+                f"Gemini must use {_GEMINI_REDIRECT_HOSTS_TEXT} with the path "
+                f"{_PROVIDER_EXACT_REDIRECTS['gemini'][1]}<one segment> and no "
+                "query or fragment."
             ),
+        )
+
+    # Request order is kept; nothing is deduplicated or reordered.
+    redirect_uris = [uri for uri, _ in accepted]
+    detected_provider = accepted[0][1]
+    if refused:
+        logger.warning(
+            "dcr_redirect_uris_dropped",
+            ip=client_ip,
+            provider=detected_provider,
+            dropped_redirect_uris=len(refused),
+            registered_redirect_uris=len(redirect_uris),
+            redirect_uris=len(data.redirect_uris),
+            dropped=_redact_dcr_redirect_uris_for_log(refused),
         )
 
     # #1831: sync session work runs off the event loop (see _run_sync).
@@ -1055,7 +1088,7 @@ async def dynamic_client_registration(
                 client_id=client_id,
                 client_secret_hash="",  # Public client sentinel (Issue #689)
                 client_name=data.client_name,
-                redirect_uris=data.redirect_uris,
+                redirect_uris=redirect_uris,
                 grant_types=data.grant_types,
                 response_types=data.response_types,
                 scope=scope,
@@ -1756,6 +1789,60 @@ def _redact_redirect_uri_for_log(redirect_uri: str | None) -> str:
     if len(redacted) > 256:
         redacted = redacted[:253] + "..."
     return redacted
+
+
+# At most this many redirect URIs are listed in one DCR warning; the count
+# fields carry the total. ``redirect_uris`` has no upper bound, so without the
+# cap one request could write an unbounded log line (#2232).
+_DCR_LOG_MAX_REDIRECT_URIS = 10
+
+# Replaces the per-user binding segment after an exact-redirect path prefix.
+_DCR_LOG_SEGMENT_MASK = "<segment>"
+
+# Replaces a whole path that holds an exact-redirect prefix only once
+# percent-decoded (``/r/user_bound_custom%2Dmcp-...``): the raw text has no
+# prefix to cut after, so nothing of it is logged.
+_DCR_LOG_ENCODED_PATH_MASK = "/<encoded binding path>"
+
+
+def _redact_dcr_redirect_uri_for_log(redirect_uri: str) -> str:
+    """``_redact_redirect_uri_for_log`` plus a masked exact-redirect segment.
+
+    The segment after an exact-redirect provider's path prefix (Gemini's
+    ``/r/user_bound_custom-mcp-<segment>``, #2222) identifies one Google user,
+    so it is replaced with ``<segment>`` before the URI is logged (#2232). The
+    prefix is looked for anywhere in the path, case-insensitively and on any
+    host, so a refused URI from a redirector host outside the table is masked
+    too; a path that holds the prefix only once percent-decoded is replaced
+    whole. Masking runs before the 256-char cap so a long path cannot push the
+    prefix past the cut unmasked. Userinfo is dropped from the authority: a
+    refused entry may carry credentials (``detect_dcr_provider`` refuses
+    userinfo), and the #218 form is scheme + host + path.
+    """
+    try:
+        parts = urlsplit(redirect_uri)
+    except ValueError:
+        return _redact_redirect_uri_for_log(redirect_uri)
+    path = parts.path
+    lowered = path.lower()
+    decoded = unquote(path).lower()
+    for _hosts, prefix in _PROVIDER_EXACT_REDIRECTS.values():
+        index = lowered.find(prefix.lower())
+        if index != -1:
+            path = path[: index + len(prefix)] + _DCR_LOG_SEGMENT_MASK
+            break
+        if prefix.lower() in decoded:
+            path = _DCR_LOG_ENCODED_PATH_MASK
+            break
+    netloc = parts.netloc.rpartition("@")[2]
+    return _redact_redirect_uri_for_log(urlunsplit(parts._replace(netloc=netloc, path=path)))
+
+
+def _redact_dcr_redirect_uris_for_log(redirect_uris: list[str]) -> list[str]:
+    """The first ``_DCR_LOG_MAX_REDIRECT_URIS`` entries, each redacted for the log."""
+    return [
+        _redact_dcr_redirect_uri_for_log(uri) for uri in redirect_uris[:_DCR_LOG_MAX_REDIRECT_URIS]
+    ]
 
 
 def _resolve_oauth_locale(request: Request, db_session, user_email: str | None) -> str:

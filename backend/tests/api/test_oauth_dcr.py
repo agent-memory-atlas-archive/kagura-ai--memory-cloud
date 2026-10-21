@@ -648,11 +648,20 @@ class TestOAuth2ClientResponseOwnerIdSerialization:
         assert response.model_dump()["owner_id"] is None
 
 
-# --- Issue #1686: every redirect_uri is checked -------------------------------
+# --- Issue #1686 / #2232: every redirect_uri is checked -----------------------
+
+
+def _warnings(fake_logger, event: str) -> list:
+    """The ``logger.warning`` calls of one event name."""
+    return [c for c in fake_logger.warning.call_args_list if c.args[0] == event]
 
 
 class TestDcrEveryRedirectUri:
-    """Each entry of ``redirect_uris`` must pass provider detection on its own."""
+    """Each entry of ``redirect_uris`` passes provider detection on its own (#1686).
+
+    Entries that fail are left out of the registration; a registration is
+    refused only when none passes (#2232).
+    """
 
     @pytest.fixture
     def client(self):
@@ -665,9 +674,10 @@ class TestDcrEveryRedirectUri:
             patch("api.routes.oauth.increment_counter", rate_limit),
             patch("api.routes.oauth.get_sync_session", return_value=fake_session),
             patch("utils.encryption.get_encryptor", return_value=fake_encryptor),
+            patch("api.routes.oauth.logger") as fake_logger,
         ):
             response = client.post("/api/v1/oauth/register", json=body)
-        return response, fake_session
+        return response, fake_session, fake_logger
 
     @pytest.mark.parametrize(
         ("client_name", "redirect_uris", "expected_provider"),
@@ -725,7 +735,7 @@ class TestDcrEveryRedirectUri:
     def test_every_entry_allowed_is_registered(
         self, client, client_name: str, redirect_uris: list[str], expected_provider: str
     ):
-        response, fake_session = self._register(
+        response, fake_session, fake_logger = self._register(
             client, {"client_name": client_name, "redirect_uris": redirect_uris}
         )
 
@@ -733,30 +743,151 @@ class TestDcrEveryRedirectUri:
         assert response.json()["provider"] == expected_provider
         assert response.json()["redirect_uris"] == redirect_uris
         fake_session.add.assert_called_once()
+        assert fake_session.add.call_args.args[0].redirect_uris == redirect_uris
+        assert _warnings(fake_logger, "dcr_redirect_uris_dropped") == []
 
     @pytest.mark.parametrize(
-        ("client_name", "redirect_uris"),
+        ("client_name", "redirect_uris", "kept", "expected_provider"),
         [
-            ("Claude", ["https://claude.ai/api/mcp/auth_callback", "https://attacker.example/cb"]),
-            ("Claude Code", ["http://localhost:53682/callback", "https://attacker.example/cb"]),
-            # The loopback entry needs a recognized client_name of its own.
-            ("Anthropic", ["https://claude.ai/api/mcp/auth_callback", "http://localhost:9/cb"]),
+            (
+                "Claude",
+                ["https://claude.ai/api/mcp/auth_callback", "https://attacker.example/cb"],
+                ["https://claude.ai/api/mcp/auth_callback"],
+                "claude",
+            ),
+            (
+                "Claude Code",
+                ["http://localhost:53682/callback", "https://attacker.example/cb"],
+                ["http://localhost:53682/callback"],
+                "claude",
+            ),
+            # The loopback entry needs a recognized client_name of its own, so it
+            # is the one dropped.
+            (
+                "Anthropic",
+                ["https://claude.ai/api/mcp/auth_callback", "http://localhost:9/cb"],
+                ["https://claude.ai/api/mcp/auth_callback"],
+                "claude",
+            ),
             (
                 "ChatGPT",
                 ["https://chatgpt.com/cb", "https://attacker.example/?fake=chatgpt.com"],
+                ["https://chatgpt.com/cb"],
+                "chatgpt",
+            ),
+            # The provider is the first passing entry's, not the first entry's.
+            (
+                "Claude",
+                ["https://attacker.example/cb", "https://claude.ai/api/mcp/auth_callback"],
+                ["https://claude.ai/api/mcp/auth_callback"],
+                "claude",
+            ),
+            # Two allowed providers around a refused entry: both kept, in order.
+            (
+                "Claude",
+                [
+                    "https://attacker.example/cb",
+                    "https://claude.ai/api/mcp/auth_callback",
+                    "https://chatgpt.com/connector_platform_oauth_redirect",
+                ],
+                [
+                    "https://claude.ai/api/mcp/auth_callback",
+                    "https://chatgpt.com/connector_platform_oauth_redirect",
+                ],
+                "claude",
             ),
         ],
     )
-    def test_any_refused_entry_rejects_the_registration(
-        self, client, client_name: str, redirect_uris: list[str]
+    def test_refused_entry_is_dropped(
+        self,
+        client,
+        client_name: str,
+        redirect_uris: list[str],
+        kept: list[str],
+        expected_provider: str,
     ):
-        response, fake_session = self._register(
+        response, fake_session, fake_logger = self._register(
+            client, {"client_name": client_name, "redirect_uris": redirect_uris}
+        )
+
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["provider"] == expected_provider
+        fake_session.add.assert_called_once()
+        stored = fake_session.add.call_args.args[0]
+        # RFC 7591 §3.2.1: the response carries the registered metadata, so it
+        # echoes exactly the stored list.
+        assert body["redirect_uris"] == stored.redirect_uris == kept
+        assert stored.provider == expected_provider
+
+        dropped_uris = [uri for uri in redirect_uris if uri not in kept]
+        dropped = _warnings(fake_logger, "dcr_redirect_uris_dropped")
+        assert len(dropped) == 1
+        assert dropped[0].kwargs["provider"] == expected_provider
+        assert dropped[0].kwargs["dropped_redirect_uris"] == len(dropped_uris)
+        assert dropped[0].kwargs["registered_redirect_uris"] == len(kept)
+        assert dropped[0].kwargs["redirect_uris"] == len(redirect_uris)
+        # Every dropped entry is logged, query stripped (#218).
+        assert dropped[0].kwargs["dropped"] == [uri.split("?")[0] for uri in dropped_uris]
+        assert _warnings(fake_logger, "dcr_provider_rejected") == []
+
+    @pytest.mark.parametrize(
+        ("client_name", "redirect_uris", "logged"),
+        [
+            ("Claude", ["https://attacker.example/cb"], ["https://attacker.example/cb"]),
+            (
+                "Claude",
+                ["https://attacker.example/cb", "https://attacker2.example/cb?x=1"],
+                ["https://attacker.example/cb", "https://attacker2.example/cb"],
+            ),
+            ("Anthropic", ["http://localhost:9/cb"], ["http://localhost:9/cb"]),
+        ],
+    )
+    def test_no_passing_entry_refuses_the_registration(
+        self, client, client_name: str, redirect_uris: list[str], logged: list[str]
+    ):
+        response, fake_session, fake_logger = self._register(
             client, {"client_name": client_name, "redirect_uris": redirect_uris}
         )
 
         assert response.status_code == 400, response.text
         assert response.json()["error"] == "invalid_client_metadata"
         fake_session.add.assert_not_called()
+        rejected = _warnings(fake_logger, "dcr_provider_rejected")
+        assert len(rejected) == 1
+        assert rejected[0].kwargs["refused_redirect_uris"] == len(redirect_uris)
+        assert rejected[0].kwargs["redirect_uris"] == len(redirect_uris)
+        assert rejected[0].kwargs["refused"] == logged
+        # The single-URI field kept from before #2232: the first refused entry.
+        assert rejected[0].kwargs["redirect_uri"] == logged[0]
+        assert _warnings(fake_logger, "dcr_redirect_uris_dropped") == []
+
+    def test_refused_list_in_the_log_is_capped(self, client):
+        refused = [f"https://attacker{i}.example/cb" for i in range(12)]
+        response, _, fake_logger = self._register(
+            client, {"client_name": "Claude", "redirect_uris": refused}
+        )
+
+        assert response.status_code == 400, response.text
+        rejected = _warnings(fake_logger, "dcr_provider_rejected")
+        assert rejected[0].kwargs["refused_redirect_uris"] == 12
+        assert rejected[0].kwargs["refused"] == refused[:10]
+
+    def test_dropped_list_in_the_log_is_capped(self, client):
+        refused = [f"https://attacker{i}.example/cb" for i in range(12)]
+        uris = [*refused, "https://claude.ai/api/mcp/auth_callback"]
+        response, fake_session, fake_logger = self._register(
+            client, {"client_name": "Claude", "redirect_uris": uris}
+        )
+
+        assert response.status_code == 201, response.text
+        assert fake_session.add.call_args.args[0].redirect_uris == [
+            "https://claude.ai/api/mcp/auth_callback"
+        ]
+        dropped = _warnings(fake_logger, "dcr_redirect_uris_dropped")
+        assert dropped[0].kwargs["dropped_redirect_uris"] == 12
+        assert dropped[0].kwargs["redirect_uris"] == 13
+        assert dropped[0].kwargs["dropped"] == refused[:10]
 
     @pytest.mark.parametrize(
         ("redirect_uri", "expected_provider"),
@@ -769,7 +900,7 @@ class TestDcrEveryRedirectUri:
     )
     def test_provider_hosts(self, client, redirect_uri: str, expected_provider: str):
         assert detect_dcr_provider(redirect_uri, "Any Client") == expected_provider
-        response, _ = self._register(
+        response, _, _ = self._register(
             client, {"client_name": "Any Client", "redirect_uris": [redirect_uri]}
         )
         assert response.status_code == 201, response.text
@@ -877,9 +1008,11 @@ class TestDcrRateLimitExemption:
 # per-user binding id Google appends; it is an example value, not a real id.
 _GEMINI_HOST = "oauth-redirect.googleusercontent.com"
 _GEMINI_SANDBOX_HOST = "oauth-redirect-sandbox.googleusercontent.com"
+_GEMINI_TEST_HOST = "oauth-redirect-test.googleusercontent.com"
 _GEMINI_PREFIX = "/r/user_bound_custom-mcp-"
 _GEMINI_URI = f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}123456789"
 _GEMINI_SANDBOX_URI = f"https://{_GEMINI_SANDBOX_HOST}{_GEMINI_PREFIX}123456789"
+_GEMINI_TEST_URI = f"https://{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}123456789"
 
 
 class TestDetectDcrProviderGemini:
@@ -890,8 +1023,10 @@ class TestDetectDcrProviderGemini:
         [
             _GEMINI_URI,
             _GEMINI_SANDBOX_URI,
+            _GEMINI_TEST_URI,
             f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}abc-123-slug",
             f"https://{_GEMINI_SANDBOX_HOST}{_GEMINI_PREFIX}abc-123-slug",
+            f"https://{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}abc-123-slug",
             f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}a",
             # Percent-encoded unreserved character ("-").
             f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}abc%2D1",
@@ -910,6 +1045,10 @@ class TestDetectDcrProviderGemini:
             f"https://OAUTH-REDIRECT.googleusercontent.com{_GEMINI_PREFIX}x",
             f"https://evil.googleusercontent.com{_GEMINI_PREFIX}x",
             f"https://googleusercontent.com{_GEMINI_PREFIX}x",
+            f"https://x.{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}x",
+            f"https://OAUTH-REDIRECT-TEST.googleusercontent.com{_GEMINI_PREFIX}x",
+            f"https://{_GEMINI_TEST_HOST}/r/*",
+            f"https://{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}x?next=1",
             f"https://x.{_GEMINI_HOST}{_GEMINI_PREFIX}x",
             f"https://{_GEMINI_HOST}.evil.com{_GEMINI_PREFIX}x",
             f"https://{_GEMINI_HOST}.{_GEMINI_PREFIX}x",
@@ -966,6 +1105,79 @@ class TestDetectDcrProviderGemini:
         assert detect_dcr_provider(redirect_uri, client_name) == "custom"
 
 
+class TestRedactDcrRedirectUrisForLog:
+    """Log form of DCR redirect URIs (#2232): #218 redaction plus a masked binding."""
+
+    @pytest.mark.parametrize(
+        ("redirect_uri", "expected"),
+        [
+            # Unknown shapes: scheme + host + path, query and fragment dropped (#218).
+            ("https://attacker.example/cb?code=x#f", "https://attacker.example/cb"),
+            ("http://localhost:9/cb", "http://localhost:9/cb"),
+            # The Gemini binding segment is masked on any host, known or not.
+            (_GEMINI_URI, f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}<segment>"),
+            (
+                f"https://oauth-redirect-example.googleusercontent.com{_GEMINI_PREFIX}x/y?z=1",
+                f"https://oauth-redirect-example.googleusercontent.com{_GEMINI_PREFIX}<segment>",
+            ),
+            (
+                f"https://{_GEMINI_HOST}/R/USER_BOUND_CUSTOM-MCP-example-1",
+                f"https://{_GEMINI_HOST}/R/USER_BOUND_CUSTOM-MCP-<segment>",
+            ),
+            (
+                f"https://attacker.example/prefix{_GEMINI_PREFIX}example-1",
+                f"https://attacker.example/prefix{_GEMINI_PREFIX}<segment>",
+            ),
+            # A path outside the binding namespace is logged as is.
+            (f"https://{_GEMINI_HOST}/r/other", f"https://{_GEMINI_HOST}/r/other"),
+            # The prefix with an empty segment still gets the mask.
+            (
+                f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}",
+                f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}<segment>",
+            ),
+            # Userinfo is never logged; host and port are.
+            ("https://user:s3cret@attacker.example/cb", "https://attacker.example/cb"),
+            ("https://user@attacker.example:8443/cb", "https://attacker.example:8443/cb"),
+            # A percent-encoded prefix: the whole path is masked, since the raw
+            # text has no prefix to cut after.
+            (
+                f"https://{_GEMINI_HOST}/r/user_bound_custom%2Dmcp-example-1",
+                f"https://{_GEMINI_HOST}/<encoded binding path>",
+            ),
+            (
+                f"https://{_GEMINI_HOST}/r/user%5Fbound_custom-mcp-example-1",
+                f"https://{_GEMINI_HOST}/<encoded binding path>",
+            ),
+        ],
+    )
+    def test_redacts_one_uri(self, redirect_uri: str, expected: str):
+        from api.routes.oauth import _redact_dcr_redirect_uri_for_log
+
+        assert _redact_dcr_redirect_uri_for_log(redirect_uri) == expected
+
+    def test_masks_before_the_length_cap(self):
+        # A long path must not push the prefix past the 256-char cut unmasked.
+        from api.routes.oauth import _redact_dcr_redirect_uri_for_log
+
+        uri = f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}{'x' * 400}"
+        assert _redact_dcr_redirect_uri_for_log(uri) == (
+            f"https://{_GEMINI_HOST}{_GEMINI_PREFIX}<segment>"
+        )
+
+    def test_list_is_capped(self):
+        from api.routes.oauth import (
+            _DCR_LOG_MAX_REDIRECT_URIS,
+            _redact_dcr_redirect_uris_for_log,
+        )
+
+        uris = [f"https://attacker{i}.example/cb?x=1" for i in range(12)]
+        assert _DCR_LOG_MAX_REDIRECT_URIS == 10
+        assert _redact_dcr_redirect_uris_for_log(uris) == [
+            f"https://attacker{i}.example/cb" for i in range(10)
+        ]
+        assert _redact_dcr_redirect_uris_for_log([]) == []
+
+
 class TestDcrEndpointGemini:
     """``POST /api/v1/oauth/register`` with Gemini callbacks (#2222)."""
 
@@ -1012,25 +1224,112 @@ class TestDcrEndpointGemini:
         assert stored.redirect_uris == uris
         assert stored.token_endpoint_auth_method == "none"
 
-    def test_one_foreign_uri_refuses_the_whole_list(self, client):
-        uris = [*self._six_uris(), f"https://{_GEMINI_HOST}/r/other"]
+    def test_one_foreign_uri_is_dropped(self, client):
+        six = self._six_uris()
+        uris = [*six, f"https://{_GEMINI_HOST}/r/other"]
         response, fake_session, fake_logger = self._register(
             client, {"client_name": "Gemini", "redirect_uris": uris}
         )
 
-        assert response.status_code == 400, response.text
+        assert response.status_code == 201, response.text
         body = response.json()
-        assert body["error"] == "invalid_client_metadata"
-        assert "gemini" in body["error_description"]
-        assert "Gemini" in body["error_description"]
-        assert _GEMINI_PREFIX in body["error_description"]
-        fake_session.add.assert_not_called()
-        rejected = [
-            c for c in fake_logger.warning.call_args_list if c.args[0] == "dcr_provider_rejected"
+        assert body["provider"] == "gemini"
+        assert body["redirect_uris"] == six
+        fake_session.add.assert_called_once()
+        stored = fake_session.add.call_args.args[0]
+        assert stored.provider == "gemini"
+        assert stored.redirect_uris == six
+        dropped = _warnings(fake_logger, "dcr_redirect_uris_dropped")
+        assert len(dropped) == 1
+        assert dropped[0].kwargs["dropped_redirect_uris"] == 1
+        assert dropped[0].kwargs["redirect_uris"] == 7
+        assert dropped[0].kwargs["registered_redirect_uris"] == 6
+        assert dropped[0].kwargs["dropped"] == [f"https://{_GEMINI_HOST}/r/other"]
+        assert _warnings(fake_logger, "dcr_provider_rejected") == []
+
+    def test_refused_first_then_gemini(self, client):
+        uris = ["https://attacker.example/cb", _GEMINI_URI]
+        response, fake_session, _ = self._register(
+            client, {"client_name": "Gemini", "redirect_uris": uris}
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["provider"] == "gemini"
+        assert response.json()["redirect_uris"] == [_GEMINI_URI]
+        assert fake_session.add.call_args.args[0].redirect_uris == [_GEMINI_URI]
+
+    def test_wildcard_next_to_gemini_is_dropped_not_stored(self, client):
+        # #2222 invariant: a ``/r/*`` wildcard is never stored for Gemini.
+        wildcard = f"https://{_GEMINI_HOST}/r/*"
+        response, fake_session, _ = self._register(
+            client, {"client_name": "Gemini", "redirect_uris": [_GEMINI_URI, wildcard]}
+        )
+
+        assert response.status_code == 201, response.text
+        stored = fake_session.add.call_args.args[0]
+        assert stored.redirect_uris == [_GEMINI_URI]
+        assert response.json()["redirect_uris"] == [_GEMINI_URI]
+
+    def test_dropped_gemini_shaped_uri_has_its_segment_masked(self, client):
+        # A Gemini-shaped callback on a host outside the table: dropped, and the
+        # per-user binding segment never reaches the log (#2232).
+        foreign = f"https://oauth-redirect-example.googleusercontent.com{_GEMINI_PREFIX}example-9"
+        response, _, fake_logger = self._register(
+            client, {"client_name": "Gemini", "redirect_uris": [_GEMINI_URI, f"{foreign}?q=1"]}
+        )
+
+        assert response.status_code == 201, response.text
+        dropped = _warnings(fake_logger, "dcr_redirect_uris_dropped")
+        assert dropped[0].kwargs["dropped"] == [
+            f"https://oauth-redirect-example.googleusercontent.com{_GEMINI_PREFIX}<segment>"
         ]
-        assert len(rejected) == 1
-        assert rejected[0].kwargs["refused_redirect_uris"] == 1
-        assert rejected[0].kwargs["redirect_uris"] == 7
+        assert "example-9" not in repr(fake_logger.mock_calls)
+
+    def test_refused_gemini_shaped_uri_has_its_segment_masked(self, client):
+        foreign = f"https://evil.googleusercontent.com{_GEMINI_PREFIX}example-9"
+        response, _, fake_logger = self._register(
+            client, {"client_name": "Gemini", "redirect_uris": [foreign]}
+        )
+
+        assert response.status_code == 400, response.text
+        rejected = _warnings(fake_logger, "dcr_provider_rejected")
+        assert rejected[0].kwargs["refused"] == [
+            f"https://evil.googleusercontent.com{_GEMINI_PREFIX}<segment>"
+        ]
+        assert "example-9" not in repr(fake_logger.mock_calls)
+
+    def test_test_host_registers_with_the_others(self, client):
+        # The list Gemini sends: production, sandbox and test redirector hosts.
+        uris = [
+            *self._six_uris(),
+            f"https://{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}example-1",
+            f"https://{_GEMINI_TEST_HOST}{_GEMINI_PREFIX}example-2",
+        ]
+        response, fake_session, fake_logger = self._register(
+            client, {"client_name": "Gemini", "redirect_uris": uris}
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["provider"] == "gemini"
+        assert response.json()["redirect_uris"] == uris
+        assert fake_session.add.call_args.args[0].redirect_uris == uris
+        assert _warnings(fake_logger, "dcr_redirect_uris_dropped") == []
+
+    def test_rejection_description_names_every_gemini_host(self, client):
+        from api.routes.oauth import _PROVIDER_EXACT_REDIRECTS
+
+        response, _, _ = self._register(
+            client,
+            {"client_name": "Gemini", "redirect_uris": ["https://attacker.example/cb"]},
+        )
+
+        assert response.status_code == 400, response.text
+        description = response.json()["error_description"]
+        hosts, prefix = _PROVIDER_EXACT_REDIRECTS["gemini"]
+        assert hosts == (_GEMINI_HOST, _GEMINI_SANDBOX_HOST, _GEMINI_TEST_HOST)
+        for host in hosts:
+            assert f"https://{host}" in description
+        assert prefix in description
 
     def test_gemini_with_claude_stores_the_first(self, client):
         uris = [_GEMINI_URI, "https://claude.ai/api/mcp/auth_callback"]
