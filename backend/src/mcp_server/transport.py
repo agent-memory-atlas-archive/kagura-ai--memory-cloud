@@ -1045,7 +1045,9 @@ async def _end_session(
     204 when the named session is the caller's; 404 when this server does not
     hold it (or it was already ended) or another user or workspace does; 400
     without a session id. An ended id is tombstoned for the idle timeout, so a
-    later request naming it is 404 rather than re-adopted (#1740).
+    later request naming it is 404 rather than re-adopted (#1740). A failed
+    session lookup is the JSON-RPC transport failure GET and POST send
+    (503 with ``Retry-After`` when retryable; #2074).
     """
     if not session_id:
         await _send_json_error(
@@ -1057,7 +1059,13 @@ async def _end_session(
             },
         )
         return
-    lookup, _session = await manager.get_owned_session(session_id, user_id, workspace_id)
+    try:
+        lookup, _session = await manager.get_owned_session(session_id, user_id, workspace_id)
+    except Exception as e:
+        # #1742/#2074: same answer as a failed session lookup on POST and GET.
+        logger.error(f"MCP DELETE /mcp session lookup failed: {e}", exc_info=True)
+        await _send_transport_failure(send, e, body=None, era="legacy")
+        return
     if lookup != "owned":
         logger.info(f"MCP DELETE /mcp: no session {session_id} for user={user_id} ({lookup})")
         await _send_session_not_found(send, session_id)
