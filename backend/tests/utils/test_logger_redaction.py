@@ -15,6 +15,7 @@ import uuid
 import pytest
 import structlog
 
+from tests.structlog_state import preserved_structlog_config
 from utils.logger import redact_pg_detail, setup_logger
 
 
@@ -23,9 +24,9 @@ def _structlog_reset():
     # Snapshot + restore (NOT reset_defaults): the suite-wide conftest
     # configures structlog for kwarg logging, and resetting to library
     # defaults would make later tests order-dependent. Copilot review.
-    saved = structlog.get_config()
-    yield
-    structlog.configure(**saved)
+    # Restored in place: setup_logger() edits the live list (#2167).
+    with preserved_structlog_config():
+        yield
 
 
 def _fresh_logger():
@@ -165,9 +166,9 @@ def test_json_path_orders_redaction_after_format_exc_info(monkeypatch):
     from unittest.mock import patch
 
     monkeypatch.setenv("LOG_COLORIZE", "false")
-    with patch.object(structlog, "configure") as configure:
+    with preserved_structlog_config(), patch.object(structlog, "configure") as configure:
         setup_logger(enable_colors=False)
-    processors = configure.call_args.kwargs["processors"]
+        processors = list(configure.call_args.kwargs["processors"])
     assert redact_pg_detail in processors
     assert processors.index(redact_pg_detail) > processors.index(
         structlog.processors.format_exc_info
