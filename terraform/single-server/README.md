@@ -206,8 +206,8 @@ Create `.env.prod`:
 
 ```bash
 cp .env.prod.example .env.prod
-# Generate the four server secrets (hex needs no quoting):
-for v in API_KEY_SECRET JWT_SECRET AUDIT_HMAC_KEY AUDIT_PSEUDO_SALT; do
+# Generate the three server secrets (hex needs no quoting):
+for v in API_KEY_SECRET AUDIT_HMAC_KEY AUDIT_PSEUDO_SALT; do
   sed -i "s|^$v=.*|$v=$(openssl rand -hex 32)|" .env.prod
 done
 vim .env.prod      # set KAGURA_DOMAIN, DB_PASSWORD, QDRANT_API_KEY,
@@ -215,11 +215,12 @@ vim .env.prod      # set KAGURA_DOMAIN, DB_PASSWORD, QDRANT_API_KEY,
 ```
 
 The API refuses to start under `ENVIRONMENT=production` (hard-coded in
-`docker-compose.prod.yml`) while `API_KEY_SECRET`, `JWT_SECRET`,
-`AUDIT_HMAC_KEY` or `AUDIT_PSEUDO_SALT` is still a shipped placeholder, or
-while one of the first three is shorter than 32 characters. The error in
+`docker-compose.prod.yml`) while `API_KEY_SECRET`, `AUDIT_HMAC_KEY` or
+`AUDIT_PSEUDO_SALT` is still a shipped placeholder, or while one of the first
+two is shorter than 32 characters. The error in
 `docker compose logs api` names the variables (never their values).
-`alembic upgrade` and the admin CLIs are not stopped by it, so set the secrets
+`alembic upgrade` and the admin CLIs (`create_admin`, `reset_password`, ...)
+are refused the same way before they touch the database, so set the secrets
 before the first deploy. Run the loop above only on a fresh `.env.prod`: on an
 existing install, change only the values that are refused — rotating a private
 `AUDIT_HMAC_KEY`, `AUDIT_PSEUDO_SALT` or `API_KEY_SECRET` has side effects (see

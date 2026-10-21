@@ -39,14 +39,30 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return env
 
 
-_PLACEHOLDER_VALUES = {"change-me-api-key-secret", "change-me-jwt-secret", ""}
+# The server secrets setup_env generates (#2239). Each is replaced while it
+# is missing or a placeholder; a private value is never touched.
+_GENERATED_SECRETS: tuple[str, ...] = ("API_KEY_SECRET", "AUDIT_HMAC_KEY", "AUDIT_PSEUDO_SALT")
+
+# The same placeholder rule as the production guard in ``config.settings``
+# (``_DEV_SECRET_PLACEHOLDERS`` / ``_DEV_SECRET_PREFIXES``), so every value
+# that guard refuses as a placeholder is replaced here. Duplicated because this
+# bootstrap script stays stdlib-only; ``tests/cli/test_setup_env.py`` keeps the
+# two in step.
+_PLACEHOLDER_VALUES: frozenset[str] = frozenset({"", "kagura-erasure-v1"})
+_PLACEHOLDER_PREFIXES: tuple[str, ...] = ("change-me", "dev-secret", "dev-audit")
+
+
+def _is_placeholder(value: str) -> bool:
+    """Whether ``value`` is a shipped placeholder (case-insensitive)."""
+    folded = value.strip().lower()
+    return folded in _PLACEHOLDER_VALUES or folded.startswith(_PLACEHOLDER_PREFIXES)
 
 
 def _set_env_value(key: str, value: str):
     """Set key=value in .env.local (append if missing, replace if placeholder)."""
     env = _read_env_file(_env_local)
     existing = env.get(key)
-    if existing and existing not in _PLACEHOLDER_VALUES:
+    if existing and not _is_placeholder(existing):
         return  # Already set with real value, don't duplicate
 
     if existing is not None:
@@ -76,7 +92,8 @@ def setup_env():
     print("=" * 50)
 
     # 1. Ensure .env.local exists (backup existing with timestamp)
-    if _env_local.exists():
+    existed = _env_local.exists()
+    if existed:
         import shutil
         from datetime import UTC, datetime
 
@@ -98,23 +115,23 @@ def setup_env():
 
     env = _read_env_file(_env_local)
 
-    # 2. API_KEY_SECRET
-    if env.get("API_KEY_SECRET") and env["API_KEY_SECRET"] != "change-me-api-key-secret":
-        print("\n✓ API_KEY_SECRET already set")
-    else:
-        secret = _generate_secret()
-        _set_env_value("API_KEY_SECRET", secret)
-        print("\n✓ API_KEY_SECRET generated and saved")
+    # 2. Server secrets: API_KEY_SECRET, AUDIT_HMAC_KEY, AUDIT_PSEUDO_SALT
+    print()
+    replaced = False
+    for key in _GENERATED_SECRETS:
+        if not _is_placeholder(env.get(key, "")):
+            print(f"✓ {key} already set")
+        else:
+            # Missing counts too: the API then ran on the built-in default.
+            replaced = True
+            _set_env_value(key, _generate_secret())
+            print(f"✓ {key} generated and saved")
+    if existed and replaced:
+        print("  ⚠ A missing or placeholder secret in the existing .env.local was generated.")
+        print("    If this install already holds data, read 'Production secrets' in")
+        print("    docs/deployment.md.")
 
-    # 3. JWT_SECRET
-    if env.get("JWT_SECRET") and env["JWT_SECRET"] != "change-me-jwt-secret":
-        print("✓ JWT_SECRET already set")
-    else:
-        secret = _generate_secret()
-        _set_env_value("JWT_SECRET", secret)
-        print("✓ JWT_SECRET generated and saved")
-
-    # 4. OPENAI_API_KEY (optional — check env var, .env.local, then prompt)
+    # 3. OPENAI_API_KEY (optional — check env var, .env.local, then prompt)
     import os
 
     existing_key = env.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -136,7 +153,7 @@ def setup_env():
         else:
             print("  → Skipped (self-hosted or manual setup later)")
 
-    # 5. Self-hosted backend detection — re-read env to pick up any changes.
+    # 4. Self-hosted backend detection — re-read env to pick up any changes.
     # Probes the OpenAI-compatible /v1/models endpoint (Ollama, vLLM).
     env = _read_env_file(_env_local)
     has_openai = bool(env.get("OPENAI_API_KEY"))

@@ -60,14 +60,13 @@ MANAGED_LLM_PLATFORM_KEY_ENV: dict[str, str] = {
 }
 
 
-# Issue #2225: the four server secrets whose shipped values are public. Under
+# Issue #2225: the server secrets whose shipped values are public. Under
 # ENVIRONMENT=production ``Settings`` refuses any of them while it is still a
 # placeholder: the defaults below, the ``change-me-...`` strings in
 # ``.env.example`` / ``terraform/single-server/.env.prod.example`` and the
 # ``cli/setup_env.py`` placeholders. Values are never echoed, only env names.
 _PRODUCTION_SECRET_FIELDS: dict[str, str] = {
     "api_key_secret": "API_KEY_SECRET",
-    "jwt_secret": "JWT_SECRET",
     "audit_hmac_key": "AUDIT_HMAC_KEY",
     "audit_pseudo_salt": "AUDIT_PSEUDO_SALT",
 }
@@ -80,6 +79,15 @@ _DEV_SECRET_PREFIXES: tuple[str, ...] = ("change-me", "dev-secret", "dev-audit")
 # before and after it (#2225 gate1).
 _PRODUCTION_SECRET_MIN_LEN = 32
 _PRODUCTION_SECRET_LENGTH_EXEMPT: frozenset[str] = frozenset({"audit_pseudo_salt"})
+
+
+def is_placeholder_secret(value: str) -> bool:
+    """Whether ``value`` is a shipped, public placeholder secret (#2225).
+
+    Case-insensitive, ignoring surrounding blanks; empty counts.
+    """
+    folded = value.strip().lower()
+    return folded in _DEV_SECRET_PLACEHOLDERS or folded.startswith(_DEV_SECRET_PREFIXES)
 
 
 def _validate_handoff_base_url(value: str) -> str:
@@ -519,11 +527,6 @@ class Settings(BaseSettings):
         ),
         description="Comma-separated Slack bot scopes requested at install",
     )
-    jwt_secret: str = Field(
-        default="dev-secret-change-in-production", description="JWT signing secret (32+ bytes)"
-    )
-    jwt_algorithm: str = Field(default="HS256", description="JWT algorithm")
-    jwt_expire_minutes: int = Field(default=60, description="JWT expiration (minutes)")
     audit_pseudo_salt: str = Field(
         default="kagura-erasure-v1",
         description="Per-deployment salt for audit_logs pseudonymization on account erasure (override in production)",
@@ -545,21 +548,19 @@ class Settings(BaseSettings):
 
         Runs wherever ``Settings()`` is built. The API builds it on import
         (``config.plan_tiers``), so a production container with a shipped
-        placeholder does not serve. alembic and the admin CLIs only reach it
-        on code paths that call ``get_settings()``. ``environment`` is
+        placeholder does not serve; ``alembic/env.py`` and the admin CLIs
+        (``cli/_env_guard.py``, #2239) build it before any database work.
+        ``environment`` is
         normalized like ``auth.oauth_endpoints._is_production``. Every refused
         variable is named in one error so a single restart fixes all of them;
         the values themselves are never included.
         """
-        if self.environment.strip().lower() != "production":
+        if not self.is_production:
             return self
         refused: list[str] = []
         for field, env in _PRODUCTION_SECRET_FIELDS.items():
             value = str(getattr(self, field)).strip()
-            folded = value.lower()
-            is_placeholder = folded in _DEV_SECRET_PLACEHOLDERS or folded.startswith(
-                _DEV_SECRET_PREFIXES
-            )
+            is_placeholder = is_placeholder_secret(value)
             too_short = (
                 field not in _PRODUCTION_SECRET_LENGTH_EXEMPT
                 and len(value) < _PRODUCTION_SECRET_MIN_LEN
@@ -1498,6 +1499,11 @@ class Settings(BaseSettings):
     environment: str = Field(
         default="development", description="Environment (development/staging/production)"
     )
+
+    @property
+    def is_production(self) -> bool:
+        """``ENVIRONMENT`` is production, ignoring case and surrounding blanks."""
+        return self.environment.strip().lower() == "production"
 
     # OAuth Provider Control (Issue #360)
     auth_providers: str = Field(
