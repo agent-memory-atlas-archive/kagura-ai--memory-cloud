@@ -8,6 +8,7 @@ their PG memory rows in co-owned/transferred workspaces intact — details
 trigger_from/until) since they derive from details.
 """
 
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -77,6 +78,24 @@ async def test_erase_memory_revisions_strips_details_and_pseudonymizes_the_actor
     assert "memory_revisions_1.actor_user_id =" in strip_sql
     assert "memory_revisions_1.version < memory_revisions.version" in strip_sql
     assert "NOT (EXISTS" in strip_sql
+    # #2235: both subqueries correlate to the UPDATE target — no FROM list
+    # names the bare table (an uncorrelated copy scans every memory's edits)
+    from_lists = [
+        " ".join(f.split()) for f in re.findall(r"\bFROM\s+(.+?)\s+WHERE\b", strip_sql, re.S)
+    ]
+    assert from_lists == [
+        "memories",
+        "memory_revisions AS memory_revisions_1",
+        "memory_revisions AS memory_revisions_2",
+    ]
+    assert "memory_revisions_2.memory_id = memory_revisions.memory_id" in strip_sql
+    assert "memory_revisions_2.version > memory_revisions_1.version" in strip_sql
+    # a details edit an earlier erasure already stripped still counts, both as
+    # the subject's edit and as an edit in between
+    strip_params = strip.compile(dialect=postgresql.dialect()).params
+    for alias in ("memory_revisions_1", "memory_revisions_2"):
+        assert re.search(rf"\b{alias}\.prior\[%\((\w+)\)s::TEXT\] \?", strip_sql)
+    assert sum(1 for v in strip_params.values() if v == "erased") == 2
     assert "memory_revisions.prior ? " in strip_sql  # only rows that carry details
     # PR2: the dropped key is recorded, so a rebuilt version says "unavailable"
     assert ") || " in strip_sql
