@@ -60,6 +60,28 @@ MANAGED_LLM_PLATFORM_KEY_ENV: dict[str, str] = {
 }
 
 
+# Issue #2225: the four server secrets whose shipped values are public. Under
+# ENVIRONMENT=production ``Settings`` refuses any of them while it is still a
+# placeholder: the defaults below, the ``change-me-...`` strings in
+# ``.env.example`` / ``terraform/single-server/.env.prod.example`` and the
+# ``cli/setup_env.py`` placeholders. Values are never echoed, only env names.
+_PRODUCTION_SECRET_FIELDS: dict[str, str] = {
+    "api_key_secret": "API_KEY_SECRET",
+    "jwt_secret": "JWT_SECRET",
+    "audit_hmac_key": "AUDIT_HMAC_KEY",
+    "audit_pseudo_salt": "AUDIT_PSEUDO_SALT",
+}
+# Compared case-insensitively. The prefixes cover the ``dev-…`` defaults and
+# every ``change-me-…`` placeholder; the exact set holds the rest.
+_DEV_SECRET_PLACEHOLDERS: frozenset[str] = frozenset({"", "kagura-erasure-v1"})
+_DEV_SECRET_PREFIXES: tuple[str, ...] = ("change-me", "dev-secret", "dev-audit")
+# The three keys only. No length rule on AUDIT_PSEUDO_SALT: forcing a rotation
+# of a short private salt would break correlation between rows pseudonymized
+# before and after it (#2225 gate1).
+_PRODUCTION_SECRET_MIN_LEN = 32
+_PRODUCTION_SECRET_LENGTH_EXEMPT: frozenset[str] = frozenset({"audit_pseudo_salt"})
+
+
 def _validate_handoff_base_url(value: str) -> str:
     """Validate/normalize the optional billing handoff base URL (#1118).
 
@@ -106,6 +128,10 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
         env_prefix="",  # No prefix
+        # Issue #2225: a ValidationError from a model validator would otherwise
+        # print a truncated repr of every merged setting (secrets included) as
+        # ``input_value``; the messages already name the offending variable.
+        hide_input_in_errors=True,
     )
 
     # OAuth2 - PKCE enforcement (Issue #513)
@@ -512,6 +538,45 @@ class Settings(BaseSettings):
             "Override in production via AUDIT_HMAC_KEY (use: openssl rand -hex 32)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _refuse_development_secrets_in_production(self) -> "Settings":
+        """Refuse public placeholder secrets under ENVIRONMENT=production (#2225).
+
+        Runs wherever ``Settings()`` is built. The API builds it on import
+        (``config.plan_tiers``), so a production container with a shipped
+        placeholder does not serve. alembic and the admin CLIs only reach it
+        on code paths that call ``get_settings()``. ``environment`` is
+        normalized like ``auth.oauth_endpoints._is_production``. Every refused
+        variable is named in one error so a single restart fixes all of them;
+        the values themselves are never included.
+        """
+        if self.environment.strip().lower() != "production":
+            return self
+        refused: list[str] = []
+        for field, env in _PRODUCTION_SECRET_FIELDS.items():
+            value = str(getattr(self, field)).strip()
+            folded = value.lower()
+            is_placeholder = folded in _DEV_SECRET_PLACEHOLDERS or folded.startswith(
+                _DEV_SECRET_PREFIXES
+            )
+            too_short = (
+                field not in _PRODUCTION_SECRET_LENGTH_EXEMPT
+                and len(value) < _PRODUCTION_SECRET_MIN_LEN
+            )
+            if is_placeholder or too_short:
+                refused.append(env)
+        if refused:
+            raise ValueError(
+                "ENVIRONMENT=production refuses development-default or short secrets: "
+                f"{', '.join(refused)}. Set each to a private value "
+                f"(openssl rand -hex 32; the keys need at least {_PRODUCTION_SECRET_MIN_LEN} "
+                "characters) and restart. Replacing a key that is already private "
+                "has side effects (stored provider keys, known devices, the "
+                "secret-store audit chain): read 'Production secrets' in "
+                "docs/deployment.md first."
+            )
+        return self
 
     # Session
     session_ttl_seconds: int = Field(
