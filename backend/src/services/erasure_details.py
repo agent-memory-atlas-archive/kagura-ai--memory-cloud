@@ -30,6 +30,9 @@ past erasures by pseudonym (#2243) share one definition:
   vector-store call happens while the subject's memories are locked.
 - ``erased_pseudonyms(db)`` (#2243, #2268) — every member whose erasure ran
   in Postgres, the restore's ``erased_actors``.
+- ``pseudonymize_audit_logs(db, user_id, emails)`` (#2287) — the subject's
+  own ``audit_logs`` rows: called inside the erasure's Postgres transaction,
+  and by the re-run for rows an erasure on v0.124.x or before left behind.
 
 Scope and locks (#2242): every statement reaches the log only through the
 subject's own rows (``subject_memory_ids``), never by scanning every
@@ -57,6 +60,8 @@ from sqlalchemy import (
     Select,
     any_,
     bindparam,
+    case,
+    exists,
     func,
     or_,
     select,
@@ -71,7 +76,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.orm.util import AliasedClass
 
 from db.qdrant import update_memory_payload_in_qdrant
-from models.auth import Context
+from models.auth import AuditLog, Context, User
 from models.erasure import (
     FAILURE_AFTER_POSTGRES_COMMIT,
     STATUS_COMPLETE,
@@ -123,6 +128,82 @@ def erasure_pseudonym(value: str) -> str:
     from services import account_erasure_service
 
     return sha256_hex(value, salt=account_erasure_service._audit_salt())
+
+
+async def pseudonymize_audit_logs(
+    db: AsyncSession,
+    user_id: str,
+    emails: Collection[str] = (),
+    *,
+    orphaned_only: bool = False,
+) -> int:
+    """Pseudonymize the ``audit_logs`` rows ``user_id`` acted in (#2287).
+
+    One UPDATE over ``audit_logs.user_id = user_id`` (the raw sub; never the
+    pseudonym, which would hash the hash). The rows are kept (legal
+    retention); the link to the account is broken:
+
+    - ``user_id`` → ``erasure_pseudonym(user_id)``, so the rows of one erased
+      member still correlate with each other and with their request row.
+    - ``user_email`` → its salted pseudonym only where it equals one of
+      ``emails`` (the subject's). In this codebase ``user_email`` is often
+      the *actor's* email on a row about someone else
+      (``RoleManager.assign_role``, ``SystemAdminService.promote``/``demote``);
+      a blind overwrite would misattribute it.
+    - ``resource`` (conventionally ``user:{email}``): every occurrence of
+      each email (first: longer, more specific), then of the raw sub, is
+      replaced by its pseudonym. The result is cut to the column's length:
+      a pseudonym is longer than most subs and emails, and a value that no
+      longer fits would fail the statement — and with it the erasure's
+      whole Postgres step, on every retry.
+
+    The live erasure passes the subject's one email. The re-run passes every
+    email it recovered for the account (one per request of it), or none:
+    then ``user_email`` and email occurrences in ``resource`` stay and only
+    the sub is replaced. ``orphaned_only`` (the re-run): rows whose
+    ``user_id`` belongs to a user row are never touched, even when that user
+    row appeared after the run read the audit subs (a re-registration).
+
+    Out of scope, here as before: rows where another actor (an admin) acted
+    on the subject — their ``user_id`` is the admin's, and a ``resource``
+    naming the subject's email stays. Rows of every other ``user_id`` are
+    never touched. The rows are locked in id order first (``locked_ids``).
+
+    Returns:
+        The rowcount.
+    """
+    from services import account_erasure_service
+
+    user_pseudonym = erasure_pseudonym(user_id)
+    values: dict[str, Any] = {"user_id": user_pseudonym}
+    resource: ColumnElement[str] = AuditLog.resource.expression
+    pseudonyms = {
+        email: sha256_hex(email, salt=account_erasure_service._audit_salt())
+        for email in sorted(set(emails), key=lambda e: (-len(e), e))
+    }
+    for email, email_pseudonym in pseudonyms.items():
+        resource = func.replace(resource, email, email_pseudonym)
+    if pseudonyms:
+        values["user_email"] = case(
+            *((AuditLog.user_email == e, p) for e, p in pseudonyms.items()),
+            else_=AuditLog.user_email,
+        )
+    values["resource"] = func.left(
+        func.replace(resource, user_id, user_pseudonym), AuditLog.resource.type.length
+    )
+
+    def own_rows(row: Any) -> tuple[ColumnElement[bool], ...]:
+        predicate: tuple[ColumnElement[bool], ...] = (row.user_id == user_id,)
+        if orphaned_only:
+            predicate += (~exists().where(User.user_id == row.user_id),)
+        return predicate
+
+    result = await db.execute(
+        update(AuditLog)
+        .where(AuditLog.id.in_(locked_ids(AuditLog, own_rows)), *own_rows(AuditLog))
+        .values(values)
+    )
+    return cast(CursorResult[Any], result).rowcount or 0
 
 
 def _ran_in_postgres() -> ColumnElement[bool]:
@@ -319,7 +400,7 @@ def scrub_mark_predicate(
 
 
 def locked_ids(
-    model: type[Memory] | type[Context] | type[MemoryRevision],
+    model: type[Memory] | type[Context] | type[MemoryRevision] | type[AuditLog],
     predicate_on: Callable[[Any], Sequence[ColumnElement[bool]]],
 ) -> Select[Any]:
     """Ids of the ``model`` rows ``predicate_on`` matches, locked in id order.
@@ -332,8 +413,8 @@ def locked_ids(
     skipped row would silently keep personal data, so never ``SKIP LOCKED`` /
     ``NOWAIT`` here. Row locks last until the transaction commits, so a later
     statement re-locking a row is free. Used for ``memory_revisions``
-    (``locked_revision_ids``, #2242) and for ``memories`` / ``contexts``
-    (#2263).
+    (``locked_revision_ids``, #2242), for ``memories`` / ``contexts``
+    (#2263) and for ``audit_logs`` (#2287).
     """
     row = aliased(model)
     return select(row.id).where(*predicate_on(row)).order_by(row.id).with_for_update()

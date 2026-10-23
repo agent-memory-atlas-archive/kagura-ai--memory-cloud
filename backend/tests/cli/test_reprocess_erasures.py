@@ -13,7 +13,7 @@ import asyncio
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -249,3 +249,85 @@ def test_a_legacy_failed_request_is_bounded_an_hour_after_its_start():
 def test_only_an_erasure_that_wrote_the_pseudonym_can_fail_the_probe(summary, wrote):
     """#2268 review: a subject with nothing left is repaired, not skipped."""
     assert cli._wrote_pseudonym(summary) is wrote
+
+
+@pytest.mark.parametrize("recovered", [True, False])
+def test_pseudonymized_audit_rows_are_reported_and_counted(capsys, recovered):
+    """#2287: the subject's audit rows are a change of their own, in the plan,
+    the applied report and the summary; an email that could not be
+    recovered is named. Never the account id or the email."""
+    kept = uuid4()
+
+    def result(dry_run: bool) -> cli.ReprocessResult:
+        r = cli.ReprocessResult(dry_run=dry_run, scanned=2)
+        r.changed.append(
+            cli.RequestChange(
+                request_id=REQUEST_ID,
+                completed_at=None,
+                details_restored=0,
+                details_restored_unavailable=0,
+                details_stripped=0,
+                scrub_marked=0,
+                audit_logs_pseudonymized=2,
+                audit_email_recovered=recovered,
+            )
+        )
+        r.audit_kept.append(kept)
+        return r
+
+    plan = result(True)
+    assert plan.changes == 2
+    cli._print_plan(plan)
+    cli._print_applied(result(False))
+    out = capsys.readouterr().out
+    suffix = "" if recovered else ", email not recovered"
+    assert f"would pseudonymize audit rows  {REQUEST_ID}  2 row(s){suffix}\n" in out
+    assert f"pseudonymized audit rows  {REQUEST_ID}  2 row(s){suffix}\n" in out
+    assert f"audit  {kept}  rows kept: the account id is in use again" in out
+    assert cli._summary(plan).endswith(", 2 audit row(s) pseudonymized")
+
+
+def test_no_audit_rows_add_nothing_to_the_report(capsys):
+    result = _result(dry_run=True)
+    cli._print_plan(result)
+    out = capsys.readouterr().out
+    assert "audit" not in out
+    assert "audit" not in cli._summary(result)
+
+
+def test_the_audit_subs_select_is_correlated_to_each_audit_row():
+    """#2287 review: ``in_use`` is an EXISTS over ``users`` alone, correlated
+    to the audit row's ``user_id`` — never a cross join, which would mark
+    every sub in use (or none)."""
+    from sqlalchemy.dialects import postgresql
+
+    db = MagicMock()
+    rows = MagicMock()
+    rows.all.return_value = []
+    db.execute = AsyncMock(return_value=rows)
+
+    asyncio.run(cli._audit_subs(db))
+
+    sql = str(db.execute.await_args.args[0].compile(dialect=postgresql.dialect()))
+    assert sql == (
+        "SELECT DISTINCT audit_logs.user_id, EXISTS (SELECT * \nFROM users \n"
+        "WHERE users.user_id = audit_logs.user_id) AS in_use \nFROM audit_logs"
+    )
+
+
+def test_the_dry_run_counts_what_the_apply_would_change():
+    """#2287 review: the plan's count uses the apply's ``orphaned_only``
+    predicate, correlated the same way."""
+    from sqlalchemy.dialects import postgresql
+
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one=MagicMock(return_value=2)))
+
+    assert asyncio.run(cli._count_audit_rows(db, "raw-sub")) == 2
+
+    compiled = db.execute.await_args.args[0].compile(dialect=postgresql.dialect())
+    assert str(compiled).endswith(
+        "WHERE audit_logs.user_id = %(user_id_1)s::VARCHAR AND NOT (EXISTS (SELECT * \n"
+        "FROM users \nWHERE users.user_id = audit_logs.user_id))"
+    )
+    assert compiled.params == {"user_id_1": "raw-sub"}
