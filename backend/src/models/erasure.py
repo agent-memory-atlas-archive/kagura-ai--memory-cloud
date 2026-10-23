@@ -61,6 +61,21 @@ VALID_STATUSES = frozenset(
 # erasure's erased-members set treat such a row as an erasure that ran.
 FAILURE_AFTER_POSTGRES_COMMIT = "after_postgres_commit: "
 
+# #2286: what the sweep writes on a stale ``in_progress`` request whose user
+# row is gone and whose summary carries ``postgres`` (written inside the
+# Postgres transaction since v0.125.0): the run was interrupted after that
+# commit (SIGTERM, OOM, a cancelled task) before any later step recorded it.
+# The ``<step>: <class>`` slots of the marker: step ``interrupted``, found by
+# the ``sweep``.
+INTERRUPTED_AFTER_POSTGRES_COMMIT = f"{FAILURE_AFTER_POSTGRES_COMMIT}interrupted: sweep"
+
+# The sweep's ``deleted_data_summary`` on a request whose user row was gone
+# and whose run never reached the Postgres commit: ``{"note": ...}``. Since
+# v0.125.0 (#2286) the row is pseudonymized too and says so with
+# ``NOTE_PSEUDONYMIZED_KEY: true``; a note row without it stores the raw sub.
+NOTE_USER_ROW_ABSENT = "user_row_already_absent"
+NOTE_PSEUDONYMIZED_KEY = "pseudonymized"
+
 # Reason codes — admin paths use the non-self_service values; the
 # self-service path is locked to ``self_service`` by the CHECK constraint.
 REASON_SELF_SERVICE = "self_service"

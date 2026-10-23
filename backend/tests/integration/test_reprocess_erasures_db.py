@@ -1106,11 +1106,16 @@ async def audit_case(async_engine: AsyncEngine) -> AsyncIterator[_AuditCase]:
 
 
 async def _add_request(
-    engine: AsyncEngine, case: _AuditCase, *, legacy: bool, email: str | None = None
+    engine: AsyncEngine,
+    case: _AuditCase,
+    *,
+    legacy: bool,
+    email: str | None = None,
+    reason: str | None = None,
 ) -> ErasureRequest:
     """A request that failed after its Postgres step: ``legacy`` before
     v0.124.0 (stores the account id), else v0.124.x (the pseudonym and the
-    marker naming the audit-log step)."""
+    marker naming the audit-log step, or ``reason``)."""
     from models.erasure import FAILURE_AFTER_POSTGRES_COMMIT
     from utils.hashing import sha256_hex
 
@@ -1119,7 +1124,9 @@ async def _add_request(
     )
     request.user_email_hash = sha256_hex(email or case.email)
     if not legacy:
-        request.failure_reason = f"{FAILURE_AFTER_POSTGRES_COMMIT}audit_logs: RuntimeError"
+        request.failure_reason = (
+            reason or f"{FAILURE_AFTER_POSTGRES_COMMIT}audit_logs: RuntimeError"
+        )
     async with _maker(engine)() as session:
         session.add(request)
         await session.commit()
@@ -1193,6 +1200,157 @@ async def test_audit_rows_left_by_a_failed_audit_step_are_pseudonymized(
     sync.assert_not_awaited()
     async with _maker(async_engine)() as session:
         assert await _snapshots(session, []) == before
+
+
+async def test_a_request_the_sweep_found_interrupted_is_processed_like_one_that_ran(
+    async_engine: AsyncEngine, audit_case: _AuditCase, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2286: the sweep's ``interrupted`` marker carries the #2268 prefix, so
+    the row is a finalized erasure: in scope, and the subject's audit rows
+    that still carry the account id are found through the orphan map. The
+    row itself is not rewritten (it stores the pseudonym and the marker); a
+    second run is a no-op."""
+    from models.erasure import INTERRUPTED_AFTER_POSTGRES_COMMIT
+
+    case = audit_case
+    request = await _add_request(
+        async_engine, case, legacy=False, reason=INTERRUPTED_AFTER_POSTGRES_COMMIT
+    )
+    async with _maker(async_engine)() as session:
+        others = await _audit(session, case.others)
+        row_before = await _snapshot(session, "erasure_requests", "t.id = :id", id=request.id)
+
+    code, _ = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"pseudonymized audit rows  {request.id}  2 row(s)\n" in out
+    assert f"repaired  {request.id}" not in out and f"skipped  {request.id}" not in out
+    assert case.sub not in out and case.email not in out
+    async with _maker(async_engine)() as session:
+        assert await _own_rows(session, case) == [
+            (case.p, case.email_p, f"user:{case.email_p}"),
+            (case.p, "admin@example.com", f"user:{case.email_p}|{case.p}"),
+        ]
+        assert await _audit(session, case.others) == others
+        assert (
+            await _snapshot(session, "erasure_requests", "t.id = :id", id=request.id) == row_before
+        )
+        before = await _snapshots(session, [])
+
+    code, _ = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+    assert code == 0
+    assert "1 completed erasure(s): would change 0, skipped 0" in capsys.readouterr().out
+    async with _maker(async_engine)() as session:
+        assert await _snapshots(session, []) == before
+
+
+async def _add_note_row(
+    engine: AsyncEngine, case: _AuditCase, *, pseudonymized: bool
+) -> ErasureRequest:
+    """A request the sweep marked complete with the note: since v0.125.0
+    pseudonymized and flagged, before that with the account id."""
+    from utils.hashing import sha256_hex
+
+    summary: dict[str, Any] = {"note": "user_row_already_absent"}
+    if pseudonymized:
+        summary["pseudonymized"] = True
+    request = _request(case.p if pseudonymized else case.sub, summary=summary)
+    request.user_email_hash = sha256_hex(case.email)
+    async with _maker(engine)() as session:
+        session.add(request)
+        await session.commit()
+    case.requests.append(request.id)
+    return request
+
+
+async def test_a_flagged_note_rows_audit_residue_is_pseudonymized(
+    async_engine: AsyncEngine, audit_case: _AuditCase, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2286: a run interrupted on v0.124.x after its Postgres commit and
+    before its audit-log step, swept on v0.125.0, is a flagged note row whose
+    subject's audit rows still carry the account id. Its ``user_id`` is a real
+    pseudonym, so the orphan lookup finds them: they are pseudonymized (and
+    only they), the request stays skipped as ``never ran`` and is not
+    rewritten, nothing is restored or stripped; a second run is a no-op."""
+    case = audit_case
+    request = await _add_note_row(async_engine, case, pseudonymized=True)
+    async with _maker(async_engine)() as session:
+        others = await _audit(session, case.others)
+        row_before = await _snapshot(session, "erasure_requests", "t.id = :id", id=request.id)
+        tables_before = {t: await _snapshot(session, t) for t in ("memories", "memory_revisions")}
+
+    code, _ = await _run(async_engine, ["--request", str(request.id)])
+    assert code == 0
+    plan = capsys.readouterr().out
+    assert f"would pseudonymize audit rows  {request.id}  2 row(s)\n" in plan
+    assert f"skipped  {request.id}  never ran" in plan
+
+    code, sync = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert f"pseudonymized audit rows  {request.id}  2 row(s)\n" in out
+    for text_ in (plan, out):
+        assert case.sub not in text_ and case.email not in text_
+    sync.assert_not_awaited()
+    async with _maker(async_engine)() as session:
+        assert await _own_rows(session, case) == [
+            (case.p, case.email_p, f"user:{case.email_p}"),
+            (case.p, "admin@example.com", f"user:{case.email_p}|{case.p}"),
+        ]
+        assert await _audit(session, case.others) == others
+        assert (
+            await _snapshot(session, "erasure_requests", "t.id = :id", id=request.id) == row_before
+        )
+        assert {
+            t: await _snapshot(session, t) for t in ("memories", "memory_revisions")
+        } == tables_before
+        (audit,) = await _reprocess_audit_rows(session, case.p)
+        assert audit.user_metadata["audit_logs_pseudonymized"] == 2
+        assert audit.user_metadata["details_restored"] == 0
+        before = await _snapshots(session, [])
+
+    code, _ = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "1 completed erasure(s): would change 0, skipped 1" in out
+    assert "audit rows" not in out
+    async with _maker(async_engine)() as session:
+        assert await _snapshots(session, []) == before
+
+
+async def test_a_legacy_note_rows_account_id_is_never_looked_up(
+    async_engine: AsyncEngine, audit_case: _AuditCase, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A note row written before v0.125.0 stores the raw sub (no flag): the
+    command never treats it as a pseudonym, so the audit rows stay as they
+    are and nothing is written."""
+    case = audit_case
+    request = await _add_note_row(async_engine, case, pseudonymized=False)
+    async with _maker(async_engine)() as session:
+        before = await _snapshots(session, [])
+
+    code, _ = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "1 completed erasure(s): would change 0, skipped 1" in out
+    assert case.sub not in out
+    async with _maker(async_engine)() as session:
+        assert await _snapshots(session, []) == before
+
+
+async def test_a_note_rows_derived_pseudonym_is_an_erased_member(
+    async_engine: AsyncEngine, world: dict[str, Any]
+) -> None:
+    """#2286: a row the sweep marked complete with the note gives the
+    pseudonym derived from its ``user_id``, never the stored value — on a
+    legacy row that is a raw sub, here one with the pseudonym's shape."""
+    from services.erasure_details import erased_pseudonyms, erasure_pseudonym
+
+    async with _maker(async_engine)() as session:
+        erased = await erased_pseudonyms(session)
+    assert erasure_pseudonym(world["absent"].user_id) in erased
+    assert world["absent"].user_id not in erased
+    assert world["p"] in erased  # a finalized row: as stored
 
 
 @pytest.mark.parametrize("legacy", [True, False])

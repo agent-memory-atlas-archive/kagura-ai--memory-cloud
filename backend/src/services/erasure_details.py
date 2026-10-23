@@ -79,6 +79,7 @@ from db.qdrant import update_memory_payload_in_qdrant
 from models.auth import AuditLog, Context, User
 from models.erasure import (
     FAILURE_AFTER_POSTGRES_COMMIT,
+    NOTE_PSEUDONYMIZED_KEY,
     STATUS_COMPLETE,
     STATUS_FAILED,
     ErasureRequest,
@@ -208,8 +209,22 @@ async def pseudonymize_audit_logs(
 
 def _ran_in_postgres() -> ColumnElement[bool]:
     """The request's Postgres step committed: only a run writes
-    ``deleted_data_summary.postgres`` (since #360), after that commit."""
+    ``deleted_data_summary.postgres`` (since #360) — after that commit
+    before v0.125.0, inside its transaction since (#2286)."""
     return func.coalesce(ErasureRequest.deleted_data_summary.has_key("postgres"), False)
+
+
+def _never_ran() -> ColumnElement[bool]:
+    """A ``complete`` request without ``postgres`` in its summary: the
+    sweep's ``user_row_already_absent`` rows, its only writer (#2286; the
+    table and the ``postgres`` summary both came with #360)."""
+    return (ErasureRequest.status == STATUS_COMPLETE) & ~_ran_in_postgres()
+
+
+def note_row_pseudonymized() -> ColumnElement[bool]:
+    """The sweep pseudonymized this note row (since v0.125.0, #2286): its
+    ``user_id`` is the pseudonym, not the raw sub."""
+    return func.coalesce(ErasureRequest.deleted_data_summary.has_key(NOTE_PSEUDONYMIZED_KEY), False)
 
 
 def _failed_after_commit_marked() -> ColumnElement[bool]:
@@ -224,11 +239,13 @@ def finalized_erasure() -> ColumnElement[bool]:
 
     ``status='complete'`` alone is not enough: the sweep marks a request
     whose user row is already gone ``complete`` without running it, and
-    that row keeps the raw account id (which an IdP may issue as 64 hex).
-    Only a run writes ``deleted_data_summary.postgres`` (since #360), and
-    only ``_finalize`` stores the pseudonym in ``user_id`` (since v0.58.1)
-    — or, since #2268, the failure handler of a request that failed after
-    its Postgres step committed (``FAILURE_AFTER_POSTGRES_COMMIT``).
+    before v0.125.0 that row kept the raw account id (which an IdP may issue
+    as 64 hex). Only a run writes ``deleted_data_summary.postgres`` (since
+    #360), and only ``_finalize`` stores the pseudonym in ``user_id`` (since
+    v0.58.1) — or, since #2268, the failure handler of a request that failed
+    after its Postgres step committed (``FAILURE_AFTER_POSTGRES_COMMIT``),
+    and since #2286 the sweep for a run interrupted after that commit
+    (``INTERRUPTED_AFTER_POSTGRES_COMMIT``, the same prefix).
     """
     return _ran_in_postgres() & (
         (ErasureRequest.status == STATUS_COMPLETE)
@@ -261,15 +278,27 @@ async def erased_pseudonyms(db: AsyncSession) -> frozenset[str]:
     v0.58.1 stores the raw sub, and that member's edits predate the revision
     log); a row ``unrepaired_erasure`` matches gives the pseudonym derived
     from its raw sub, which is what the subject's rows carry.
+
+    A row the sweep marked ``complete`` with the ``user_row_already_absent``
+    note (``_never_ran``, #2286) may stand for an erasure that did run:
+    interrupted after its Postgres commit on a version that wrote the
+    summary only after it. Such a row written before v0.125.0 keeps the raw
+    sub and gives the pseudonym derived from it, with no shape test (the
+    stored value can be a raw sub with the pseudonym's shape); one written
+    since stores the pseudonym (``pseudonymized`` in its summary) and gives
+    it as is. For a request that really never ran either value is one no row
+    carries: a no-op.
     """
+    never_ran = _never_ran()
     rows = await db.execute(
-        select(ErasureRequest.user_id, unrepaired_erasure().label("unrepaired")).where(
-            finalized_erasure() | unrepaired_erasure()
-        )
+        select(
+            ErasureRequest.user_id,
+            (unrepaired_erasure() | (never_ran & ~note_row_pseudonymized())).label("derive"),
+        ).where(finalized_erasure() | unrepaired_erasure() | never_ran)
     )
     pseudonyms: set[str] = set()
-    for user_id, unrepaired in rows.all():
-        if unrepaired:
+    for user_id, derive in rows.all():
+        if derive:
             pseudonyms.add(erasure_pseudonym(user_id))
         elif is_pseudonym(user_id):
             pseudonyms.add(user_id)
