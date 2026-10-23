@@ -47,6 +47,7 @@ def _key(**over) -> SimpleNamespace:
         "bound_context_id": None,
         "agent_id": None,
         "default_context_id": None,
+        "connector_id": None,  # #1952
         "created_at": utcnow(),
         "last_used_at": None,
         "revoked_at": None,
@@ -174,7 +175,10 @@ async def test_patch_refuses_a_bound_key_with_422(over):
 
 @pytest.mark.asyncio
 async def test_patch_refuses_a_connector_key_with_422():
-    key = _key(name=f"connector:{uuid.uuid4()}", workspace_id=WORKSPACE_ID)
+    connector_id = uuid.uuid4()
+    key = _key(
+        name=f"connector:{connector_id}", workspace_id=WORKSPACE_ID, connector_id=connector_id
+    )
     db = _db(key)
     with _readable("proj"), pytest.raises(MemoryCloudException) as exc:
         await update_api_key(
@@ -183,6 +187,21 @@ async def test_patch_refuses_a_connector_key_with_422():
 
     assert exc.value.status_code == 422
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_patch_lets_an_unlinked_key_with_the_prefix_take_a_default():
+    """#1952: the link decides, not the name — a legacy key named like a
+    connector key but without ``connector_id`` is an ordinary key."""
+    key = _key(name=f"connector:{uuid.uuid4()}", workspace_id=WORKSPACE_ID)
+    db = _db(key)
+    with _readable("proj"):
+        await update_api_key(
+            key_id=PID, data=APIKeyUpdate(default_context_id=CONTEXT_ID), user=USER, db=db
+        )
+
+    assert key.default_context_id == CONTEXT_ID
+    db.commit.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -349,6 +368,7 @@ async def test_member_regenerate_keeps_the_default_context():
         name="ws-key",
         revoked_at=None,
         default_context_id=CONTEXT_ID,
+        connector_id=None,  # #1952
     )
     new_key = SimpleNamespace(id=8, public_id="akey_" + "8" * 22, key_prefix="kagura_new")
     db = MagicMock()
@@ -374,6 +394,54 @@ async def test_member_regenerate_keeps_the_default_context():
         )
 
     assert mgr.create_key.await_args.kwargs["default_context_id"] == CONTEXT_ID
+
+
+@pytest.mark.asyncio
+async def test_member_regenerate_refuses_a_connector_key_with_422():
+    """#1952: the member's newest key can be a connector's key, whose secret the
+    connector holds — refused before anything is revoked; rotate through the
+    connector instead."""
+    from fastapi import HTTPException
+
+    from api.routes import member_credentials as mc
+
+    connector_id = uuid.uuid4()
+    old_key = SimpleNamespace(
+        id=7,
+        public_id="akey_" + "7" * 22,
+        name=f"connector:{connector_id}",
+        revoked_at=None,
+        default_context_id=None,
+        connector_id=connector_id,
+    )
+    db = MagicMock()
+    db.execute = AsyncMock(
+        return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=old_key))
+    )
+    db.commit = AsyncMock()
+    mgr = MagicMock()
+    mgr.create_key = AsyncMock()
+    with (
+        patch("api.routes.member_credentials.check_permission", new=AsyncMock()),
+        patch("api.routes.member_credentials.MemberCredentialsService"),
+        patch("api.routes.member_credentials.APIKeyManager", return_value=mgr),
+        patch("api.routes.member_credentials.schedule_security_notification"),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await mc.regenerate_api_key(
+            WORKSPACE_ID,
+            "member-1",
+            SimpleNamespace(client=None, headers={}),
+            BackgroundTasks(),
+            {"user_id": "member-1", "sub": "m"},
+            db,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "rotate-kmc-key" in exc_info.value.detail
+    assert old_key.revoked_at is None
+    mgr.create_key.assert_not_awaited()
+    db.commit.assert_not_awaited()
 
 
 # ------------------------------------------------- member self-mint (#2188)

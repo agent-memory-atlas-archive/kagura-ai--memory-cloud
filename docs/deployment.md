@@ -2608,7 +2608,7 @@ runs, so re-subscribing resumes everything with no further action.
 
 | Limit at `0` | Suspended | Kept |
 |---|---|---|
-| `max_connectors` | connector ingest (`FEAT-001`), worker dispatch (`GET /workers/config` answers the not-ready 404, so the worker skips the team), indexing, and the connector's own write key (the workspace API key named `connector:{id}`) — it fails verification (`401`) like a revoked key while the seats are `0` ([#1944](https://github.com/kagura-ai/memory-cloud/issues/1944)), so a worker still holding it cannot `remember` around the pause (a `401` together with the API log line `api_key_rejected_connectors_suspended` is this pause, not a revoked key; no re-issue is needed) | the connector, its token and its key |
+| `max_connectors` | connector ingest (`FEAT-001`), worker dispatch (`GET /workers/config` answers the not-ready 404, so the worker skips the team), indexing, and the connector's own write key (`api_keys.connector_id`, named `connector:{id}`) — it fails verification (`401`) like a revoked key while the seats are `0` ([#1944](https://github.com/kagura-ai/memory-cloud/issues/1944)), so a worker still holding it cannot `remember` around the pause (a `401` together with the API log line `api_key_rejected_connectors_suspended` is this pause, not a revoked key; no re-issue is needed) | the connector, its token and its key |
 | `max_resource_tokens` | ingest on ordinary resource tokens (REST and MCP `ingest_events`, `FEAT-001`), indexing | the tokens and resources |
 | `sleep_enabled_contexts_limit` | Sleep's LLM phases (nightly and admin-triggered); a `full` context still runs the non-LLM retention purges | each context's `sleep_mode` |
 | `public_calls_per_day` | anonymous public `search` / `info` answer `429` (`api_public_daily`), as bound keys and signed-in callers already did | `is_public` and bound keys |
@@ -2693,6 +2693,56 @@ from the `ALTER` to the commit — the backfill touches legacy rows only and the
 `lock_timeout` (10 s) for a reader to finish; past that the upgrade fails
 without changing anything and you rerun it, rather than every query on
 `memories` queueing behind the lock request.
+
+### Migration `f13_1952_api_keys_connector_id` (#1952)
+
+A connector's write key is linked to its connector by `api_keys.connector_id`
+(`ON DELETE CASCADE`) instead of by its name `connector:{id}`. The migration
+links every existing key of the same workspace whose name is exactly
+`connector:` + a connector id (revoked rows included) and leaves look-alikes as
+ordinary keys. From then on the link decides: the seat pause above, the MCP
+connector-credential handling, and deleting the connector — the key row is
+removed with it (it disappears from the key list rather than showing as
+revoked). A connector's key cannot be regenerated from the API keys page or the
+member credentials (`422`); rotate it through its connector
+(`POST /api/v1/workspace-connectors/{connector_id}/rotate-kmc-key`).
+
+**Re-run the backfill once after the traffic switch.** The migration runs from
+the new image before traffic moves, so the old image can still provision or
+rotate a connector in between (or again after a rollback) and mint a key with
+no link. Such a key is an ordinary workspace key: not paused with the seats.
+Rotating the connector, or deleting it, takes care of it, and so does this
+statement, which is idempotent and touches only unlinked rows:
+
+```sql
+UPDATE api_keys AS k
+   SET connector_id = c.id
+  FROM workspace_connectors AS c
+ WHERE k.connector_id IS NULL
+   AND k.workspace_id IS NOT NULL
+   AND k.agent_id IS NULL
+   AND k.bound_context_id IS NULL
+   AND k.default_context_id IS NULL
+   AND k.name LIKE 'connector:%'
+   AND substr(k.name, length('connector:') + 1) = c.id::text
+   AND c.workspace_id = k.workspace_id;
+```
+
+Keys still named like a connector key but linked to none — the connector was
+deleted before the migration, or the key carries an agent or a default context
+— stay ordinary workspace write keys. List them and revoke the ones nobody
+uses:
+
+```sql
+SELECT public_id, workspace_id, user_id, created_at
+  FROM api_keys
+ WHERE name LIKE 'connector:%' AND connector_id IS NULL
+   AND revoked_at IS NULL AND workspace_id IS NOT NULL;
+```
+
+A key whose link points at a connector outside its own workspace is refused at
+verification with the warning `api_key_rejected_connector_workspace_mismatch`;
+only a direct write to the table can produce one.
 
 ### Feature set override (`PLAN_<KEY>_FEATURES`)
 

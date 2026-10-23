@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -401,6 +401,7 @@ class ConnectorProvisioningService:
                     name=connector_key_name(connector.id),
                     user_id=user_id,
                     workspace_id=workspace_id,
+                    connector_id=connector.id,  # #1952: the FK is the link
                 )
                 kmc_api_key_name = kmc_key_row.name
                 connector.set_kmc_api_key(plaintext_kmc_api_key)
@@ -994,11 +995,15 @@ class ConnectorProvisioningService:
         return result.scalar_one_or_none()
 
     async def delete_connector(self, workspace_id: UUID, connector_id: UUID) -> bool:
-        """Delete a connector: revoke its KMC write key + drop its resource.
+        """Delete a connector: drop its resource, and with it its KMC write key.
 
-        Revokes the workspace-scoped ``connector:{id}`` API key so the worker's
-        next config fetch fails closed, then deletes the owning ``resources``
-        row (CASCADE removes the connector + its resource token). The
+        Deletes the owning ``resources`` row; CASCADE removes the connector,
+        its resource token and — through ``api_keys.connector_id`` (#1952) —
+        its KMC write key row, so the worker's next verify finds no key (401)
+        and its next config fetch finds no connector. A key named after the
+        connector but not linked to it — minted by the previous image while it
+        still served after the f13 backfill (blue-green or rollback window) —
+        cannot be reached by the cascade, so it is revoked by name first. The
         write-target context is intentionally preserved (it holds user data).
         Returns ``False`` if no matching connector exists in the workspace.
         """
@@ -1016,10 +1021,12 @@ class ConnectorProvisioningService:
         if connector is None:
             return False
 
+        # #1952: only unlinked rows — linked ones go with the cascade below.
         await self.db.execute(
             update(APIKey)
             .where(
                 APIKey.workspace_id == workspace_id,
+                APIKey.connector_id.is_(None),
                 APIKey.name == connector_key_name(connector_id),
                 APIKey.revoked_at.is_(None),
             )
@@ -1342,8 +1349,9 @@ class ConnectorProvisioningService:
     ) -> KmcKeyRotationResult:
         """Revoke the current KMC write key and mint a replacement.
 
-        Revokes the existing ``connector:{id}`` API key, mints a fresh
-        workspace-scoped key with the given expiry, Fernet-encrypts it on
+        Revokes the connector's current write key (the active
+        ``api_keys.connector_id`` row the stored key hashes to), mints a fresh
+        workspace-scoped key linked to the connector with the given expiry, Fernet-encrypts it on
         the connector row, and bumps ``config_version`` so the worker
         re-fetches on its next poll.
 
@@ -1384,9 +1392,15 @@ class ConnectorProvisioningService:
         # stale instead of silently minting a duplicate, and (b) preserve the
         # original owner's user_id on the replacement so rotation by a different
         # admin doesn't transfer key ownership.
+        # #1952: the row must be linked to THIS connector, or not linked at
+        # all — a key minted under the name convention after the f13 backfill
+        # ran (old code still serving during a rollout) is the connector's own
+        # stored key by its hash; rotating it revokes it and the replacement
+        # is linked, so rotation also heals that row.
         old_key_result = await self.db.execute(
             select(APIKey).where(
                 APIKey.workspace_id == workspace_id,
+                or_(APIKey.connector_id == connector_id, APIKey.connector_id.is_(None)),
                 APIKey.key_hash == sha256_hex(current_key),
                 APIKey.revoked_at.is_(None),
             )
@@ -1415,6 +1429,7 @@ class ConnectorProvisioningService:
             user_id=owner_user_id,
             workspace_id=workspace_id,
             expires_days=expires_days,
+            connector_id=connector_id,  # #1952
         )
         connector.set_kmc_api_key(plaintext_new_key)
         connector.kmc_api_key_expires_at = new_key_row.expires_at

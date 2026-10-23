@@ -9,12 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.routes.resource_ingest import ingest_event, verify_resource_token
+from auth.api_keys import APIKeyManager
 from auth.workspace_roles import WorkspaceRole
 from models.auth import Workspace, WorkspaceMember
 from models.resource import Resource, ResourceEvent, ResourceToken, WorkspaceConnector
 from models.schemas import ResourceEventRequest
 from services.connector_provisioning import ConnectorProvisioningService
-from utils.exceptions import NotFoundException
+from utils.exceptions import NotFoundException, ValidationError
 
 
 @pytest.fixture(autouse=True)
@@ -256,6 +257,9 @@ async def test_registration_path_creates_context_and_mints_kmc_key(
     # row exactly (as rotate_kmc_key already does), not stay NULL.
     assert kmc_key.expires_at is not None
     assert result.connector.kmc_api_key_expires_at == kmc_key.expires_at
+    # #1952: linked to its connector by the FK, still named after it.
+    assert kmc_key.connector_id == result.connector.id
+    assert kmc_key.name == f"connector:{result.connector.id}"
 
 
 @pytest.mark.asyncio
@@ -321,13 +325,14 @@ async def test_ensure_chat_schema_is_idempotent(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_delete_connector_revokes_kmc_key_and_removes_connector(
+async def test_delete_connector_removes_kmc_key_and_connector(
     db_session: AsyncSession,
 ):
-    """Spec 2026-06-02: delete revokes the KMC key + drops the connector row.
+    """Spec 2026-06-02: delete drops the connector row and its KMC key.
 
-    The write-target context is preserved (user data); the KMC API key is
-    revoked (revoked_at set) so the worker fails closed on next config fetch.
+    The write-target context is preserved (user data); the KMC API key row goes
+    with the connector through ``api_keys.connector_id`` ON DELETE CASCADE
+    (#1952), so the worker's next verify finds no key.
     """
     from models.auth import APIKey, Context
 
@@ -357,22 +362,194 @@ async def test_delete_connector_revokes_kmc_key_and_removes_connector(
     ).scalar_one()
     assert remaining == 0
 
-    # KMC key revoked (not hard-deleted).
-    key = (
-        await db_session.execute(
-            select(APIKey).where(
-                APIKey.workspace_id == workspace.id,
-                APIKey.name == f"connector:{connector_id}",
-            )
-        )
-    ).scalar_one()
-    assert key.revoked_at is not None
+    # KMC key row gone with the connector (#1952 CASCADE).
+    keys = (
+        await db_session.execute(select(APIKey).where(APIKey.workspace_id == workspace.id))
+    ).all()
+    assert keys == []
+    assert await APIKeyManager(db_session).verify_key(result.plaintext_kmc_api_key) is None
 
     # Context preserved.
     ctx_count = (
         await db_session.execute(select(func.count(Context.id)).where(Context.id == context_id))
     ).scalar_one()
     assert ctx_count == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_connector_revokes_an_unlinked_key_of_its_name(db_session: AsyncSession):
+    """#1952: a ``connector:{id}`` key the previous image minted after the f13
+    backfill (blue-green / rollback window) has no link, so the cascade cannot
+    reach it — ``delete_connector`` revokes it by name, in the connector's
+    workspace only, and leaves every other row alone."""
+    from models.auth import APIKey
+
+    user_id, workspace = await _seed_workspace(db_session, plan_name="promax")
+    _other_user, other_workspace = await _seed_workspace(db_session, plan_name="promax")
+    service = ConnectorProvisioningService(db_session)
+    result = await service.provision_connector(
+        workspace_id=workspace.id,
+        user_id=user_id,
+        connector_type="slack",
+        resource_id=f"slack_{uuid4().hex[:8]}",
+        auto_create_context_name=f"slack-{uuid4().hex[:8]}",
+    )
+    await db_session.flush()
+    connector_id = result.connector.id
+    name = f"connector:{connector_id}"
+    manager = APIKeyManager(db_session)
+    # The old image's mint: same name, same workspace, no link (another
+    # minter, since the name is unique per active user + workspace).
+    unlinked_plain, unlinked = await manager.create_key(
+        name=name, user_id=f"user-{uuid4().hex}", workspace_id=workspace.id
+    )
+    # Same name in another workspace: not this connector's key.
+    elsewhere_plain, elsewhere = await manager.create_key(
+        name=name, user_id=user_id, workspace_id=other_workspace.id
+    )
+    # Another key of the workspace.
+    laptop_plain, laptop = await manager.create_key(
+        name="laptop", user_id=user_id, workspace_id=workspace.id
+    )
+    unlinked_id, elsewhere_id, laptop_id = unlinked.id, elsewhere.id, laptop.id
+
+    assert await service.delete_connector(workspace.id, connector_id) is True
+    await db_session.flush()
+
+    rows = {
+        row.id: row
+        for row in (
+            await db_session.execute(
+                select(APIKey)
+                .where(APIKey.workspace_id.in_([workspace.id, other_workspace.id]))
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    }
+    # The linked key went with the cascade; the unlinked one is revoked.
+    assert set(rows) == {unlinked_id, elsewhere_id, laptop_id}
+    assert rows[unlinked_id].revoked_at is not None
+    assert rows[elsewhere_id].revoked_at is None
+    assert rows[laptop_id].revoked_at is None
+    assert await manager.verify_key(unlinked_plain) is None
+    assert await manager.verify_key(elsewhere_plain) is not None
+    assert await manager.verify_key(laptop_plain) is not None
+
+
+@pytest.mark.asyncio
+async def test_rotate_kmc_key_links_the_replacement_and_revokes_the_old_row(
+    db_session: AsyncSession,
+):
+    """#1952: the replacement key carries ``connector_id``; the old row stays,
+    revoked, and keeps its link (history)."""
+    from models.auth import APIKey
+
+    user_id, workspace = await _seed_workspace(db_session, plan_name="promax")
+    service = ConnectorProvisioningService(db_session)
+    result = await service.provision_connector(
+        workspace_id=workspace.id,
+        user_id=user_id,
+        connector_type="slack",
+        resource_id=f"slack_{uuid4().hex[:8]}",
+        auto_create_context_name=f"slack-{uuid4().hex[:8]}",
+    )
+    await db_session.flush()
+    connector_id = result.connector.id
+
+    rotated = await service.rotate_kmc_key(
+        workspace_id=workspace.id, connector_id=connector_id, user_id=user_id
+    )
+    await db_session.flush()
+
+    rows = (
+        (
+            await db_session.execute(
+                select(APIKey).where(APIKey.workspace_id == workspace.id).order_by(APIKey.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    old, new = rows
+    assert old.connector_id == connector_id and old.revoked_at is not None
+    assert new.connector_id == connector_id and new.revoked_at is None
+    assert new.name == f"connector:{connector_id}"
+    verified = await APIKeyManager(db_session).verify_key(rotated.plaintext_kmc_api_key)
+    assert verified is not None and verified.is_connector_key is True
+
+
+@pytest.mark.asyncio
+async def test_rotate_kmc_key_heals_an_unlinked_backing_row(db_session: AsyncSession):
+    """#1952: a stored key whose row has no link (minted by the name-only code
+    after the f13 backfill ran) still rotates — matched by its hash — and the
+    replacement is linked."""
+    from sqlalchemy import update
+
+    from models.auth import APIKey
+
+    user_id, workspace = await _seed_workspace(db_session, plan_name="promax")
+    service = ConnectorProvisioningService(db_session)
+    result = await service.provision_connector(
+        workspace_id=workspace.id,
+        user_id=user_id,
+        connector_type="slack",
+        resource_id=f"slack_{uuid4().hex[:8]}",
+        auto_create_context_name=f"slack-{uuid4().hex[:8]}",
+    )
+    await db_session.flush()
+    connector_id = result.connector.id
+    await db_session.execute(
+        update(APIKey)
+        .where(APIKey.connector_id == connector_id)
+        .values(connector_id=None)
+        .execution_options(synchronize_session="fetch")
+    )
+
+    rotated = await service.rotate_kmc_key(
+        workspace_id=workspace.id, connector_id=connector_id, user_id=user_id
+    )
+    await db_session.flush()
+
+    rows = (
+        (
+            await db_session.execute(
+                select(APIKey).where(APIKey.workspace_id == workspace.id).order_by(APIKey.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    old, new = rows
+    assert old.connector_id is None and old.revoked_at is not None
+    assert new.connector_id == connector_id and new.revoked_at is None
+    assert rotated.key_name == f"connector:{connector_id}"
+
+
+@pytest.mark.asyncio
+async def test_rotate_kmc_key_fails_when_the_backing_row_is_gone(db_session: AsyncSession):
+    """#1952: the backing row is matched by ``key_hash`` AND ``connector_id``;
+    a row deleted outside the service is the existing ``ValidationError``."""
+    from sqlalchemy import delete
+
+    from models.auth import APIKey
+
+    user_id, workspace = await _seed_workspace(db_session, plan_name="promax")
+    service = ConnectorProvisioningService(db_session)
+    result = await service.provision_connector(
+        workspace_id=workspace.id,
+        user_id=user_id,
+        connector_type="slack",
+        resource_id=f"slack_{uuid4().hex[:8]}",
+        auto_create_context_name=f"slack-{uuid4().hex[:8]}",
+    )
+    await db_session.flush()
+    await db_session.execute(delete(APIKey).where(APIKey.connector_id == result.connector.id))
+
+    with pytest.raises(ValidationError, match="matches no active API key"):
+        await service.rotate_kmc_key(
+            workspace_id=workspace.id, connector_id=result.connector.id, user_id=user_id
+        )
 
 
 @pytest.mark.asyncio

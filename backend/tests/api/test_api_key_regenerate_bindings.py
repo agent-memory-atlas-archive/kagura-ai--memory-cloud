@@ -48,6 +48,7 @@ def _old_key(**over) -> SimpleNamespace:
         "agent_id": None,
         "bound_context_id": None,
         "default_context_id": None,  # #2129
+        "connector_id": None,  # #1952
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -108,6 +109,34 @@ async def test_regenerate_carries_agent_binding_forward():
     # because agent_id is present (not the longer workspace default).
     assert kwargs["expires_days"] is None
     assert old.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_regenerate_refuses_a_connector_key_with_422():
+    """#1952: the connector holds this key's secret (Fernet, on its row), so a
+    plain regenerate would revoke the key the connector uses and mint one it
+    never receives. Refused before anything is revoked; rotate through the
+    connector instead."""
+    connector_id = uuid.uuid4()
+    old = _old_key(name=f"connector:{connector_id}", connector_id=connector_id)
+    manager = _manager()
+    db = _db(old)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await regenerate_api_key(
+            key_id=OLD_PID,
+            request=REQUEST,
+            background_tasks=BackgroundTasks(),
+            user=USER,
+            manager=manager,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "rotate-kmc-key" in exc_info.value.detail
+    assert old.revoked_at is None
+    manager.create_key.assert_not_awaited()
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
