@@ -127,6 +127,17 @@ class TestReprocessErasuresCommand:
 
         assert "is not a completed request" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("argv", [["--all", "--yes"], ["--all", "--plan", "--yes"]])
+    def test_yes_without_apply_is_a_usage_error(self, argv, capsys):
+        """#2268: the plan never writes, so ``--yes`` without ``--apply`` is
+        refused (exit 2) instead of silently running the plan only."""
+        worker = AsyncMock(return_value=_result(dry_run=True))
+
+        assert _run(argv, worker) == 2
+
+        worker.assert_not_awaited()
+        assert "--yes needs --apply" in capsys.readouterr().err
+
     @pytest.mark.parametrize(
         "argv",
         [
@@ -166,3 +177,75 @@ def test_the_applied_report_names_already_queued_and_failed_requeues(capsys):
     cli._print_applied(result)
     out = capsys.readouterr().out
     assert "re-queued for embedding 1, already queued 1, NOT re-queued 1" in out
+
+
+def test_a_repaired_request_is_listed_without_a_completion_time(capsys):
+    """#2268: a request that failed after its Postgres step has no completion
+    time (``-``) and is named as repaired; the account id is never printed."""
+    result = cli.ReprocessResult(dry_run=True, scanned=1)
+    result.changed.append(
+        cli.RequestChange(
+            request_id=REQUEST_ID,
+            completed_at=None,
+            details_restored=0,
+            details_restored_unavailable=0,
+            details_stripped=0,
+            scrub_marked=0,
+            repaired=True,
+        )
+    )
+    assert result.changes == 1  # the repair alone is a change
+    cli._print_plan(result)
+    out = capsys.readouterr().out
+    row = next(line for line in out.splitlines() if line.startswith(str(REQUEST_ID)))
+    assert row.split()[1:] == ["-", "0", "0", "0", "0"]
+    assert f"would repair  {REQUEST_ID}  failed after its Postgres step" in out
+    assert cli._summary(result).endswith(", 1 request row(s) repaired")
+
+
+@pytest.mark.parametrize(
+    ("summary", "completed_at", "expected"),
+    [
+        (
+            {"postgres": {"memory_scrub_at": "2026-09-01T12:00:00Z"}},
+            datetime(2026, 9, 1, 13, 0, tzinfo=UTC),
+            datetime(2026, 9, 1, 12, 0),
+        ),
+        (
+            {"postgres": {"users": 1}},
+            datetime(2026, 9, 1, 13, 0, tzinfo=UTC),
+            datetime(2026, 9, 1, 13, 0),
+        ),
+        ({"postgres": {"users": 1}}, None, None),
+        (None, None, None),
+    ],
+)
+def test_the_rerun_bound_prefers_the_scrub_time(summary, completed_at, expected):
+    """#2268: ``memory_scrub_at`` when stored, else the completion time, else
+    no bound (a legacy request that failed after its Postgres step)."""
+    assert cli._existed_at(summary, completed_at) == expected
+
+
+def test_a_legacy_failed_request_is_bounded_an_hour_after_its_start():
+    """#2268 review: no scrub or completion time, but ``started_at``: the
+    sweep's crash cutoff after it bounds the strip. Ahead of it, the stored
+    times win."""
+    started = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    assert cli._existed_at({"postgres": {"users": 1}}, None, started) == datetime(2026, 9, 1, 13, 0)
+    completed = datetime(2026, 9, 1, 12, 5, tzinfo=UTC)
+    assert cli._existed_at({"postgres": {}}, completed, started) == datetime(2026, 9, 1, 12, 5)
+
+
+@pytest.mark.parametrize(
+    ("summary", "wrote"),
+    [
+        ({"postgres": {"memories_scrubbed": 2}}, True),
+        ({"postgres": {"memories_scrubbed": 0, "memory_revisions_pseudonymized": 3}}, True),
+        ({"postgres": {"memories_scrubbed": 0, "memory_revisions_pseudonymized": 0}}, False),
+        ({"postgres": {"users": 1}}, False),
+        (None, False),
+    ],
+)
+def test_only_an_erasure_that_wrote_the_pseudonym_can_fail_the_probe(summary, wrote):
+    """#2268 review: a subject with nothing left is repaired, not skipped."""
+    assert cli._wrote_pseudonym(summary) is wrote

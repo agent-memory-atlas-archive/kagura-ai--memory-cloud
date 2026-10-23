@@ -342,6 +342,7 @@ async def test_apply_restores_and_strips_only_the_erased_members_values(
             "scrub_marked": 0,
             # #2266: the payload outcome is known only after the commit
             "details_embedding_requeued": 0,
+            "request_repaired": False,
             "tool": "cli.reprocess_erasures",
         }
     sync.assert_awaited_once()
@@ -446,7 +447,7 @@ async def test_request_narrows_and_an_unknown_request_is_an_error(
 
     code, _ = await _run(async_engine, ["--request", str(uuid.uuid4())])
     assert code == 1
-    assert "is not a completed erasure request" in capsys.readouterr().err
+    assert "is not an erasure request that ran in Postgres" in capsys.readouterr().err
 
 
 async def test_a_vector_store_failure_requeues_and_the_request_commits(
@@ -474,18 +475,24 @@ async def test_a_vector_store_failure_requeues_and_the_request_commits(
         assert len(await _reprocess_audit_rows(session, p)) == 1
 
 
-async def test_a_value_another_erased_member_wrote_never_comes_back(
-    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("first_is_newest", [True, False])
+async def test_a_double_erasure_chain_ends_with_the_authors_value_in_either_order(
+    async_engine: AsyncEngine,
+    world: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    first_is_newest: bool,
 ) -> None:
-    """Review finding: S2 wrote over the author's value, S1 over S2's; both
-    erased before the #2235 fix, so S1's own row still holds S2's value in its
-    prior. Re-processing S1 alone must not make S2's
-    value live (it becomes NULL); S2's re-run then puts the author's back and
-    strips S2's value from the log."""
+    """#2268 (owner decision): S2 wrote over the author's value, S1 over S2's;
+    both erased before the #2235 fix, so S1's own row still holds S2's value
+    in its prior. Whichever request is processed first, the walk goes past
+    both erased members to the author's value: one ``erasure`` row, S2's
+    value stripped from the log, the second request restores nothing. The
+    author's own memory and every other row are untouched."""
     p1, p2 = _pseudonym(), _pseudonym()
     memory = _memory(world["ws"], world["ctx"], world["author"], SUBJECTS, 3)
     s2_value = {"by": "s2", "location": {"lat": 1.0, "lon": 2.0}}
-    first, second = _request(p1, minutes=3), _request(p2, minutes=4)
+    s1_request, s2_request = _request(p1, minutes=3), _request(p2, minutes=4)
+    order = [s1_request, s2_request] if first_is_newest else [s2_request, s1_request]
     async with _maker(async_engine)() as session:
         session.add(memory)
         await session.flush()
@@ -493,42 +500,49 @@ async def test_a_value_another_erased_member_wrote_never_comes_back(
             [
                 _edit(memory, 2, p2, {"details": AUTHORS}),
                 _edit(memory, 3, p1, {"details": s2_value}),
-                first,
-                second,
+                s1_request,
+                s2_request,
             ]
         )
         await session.commit()
     try:
-        sync = AsyncMock()
-        code, _ = await _run(async_engine, ["--request", str(first.id), "--apply", "--yes"], sync)
-        assert code == 0
         async with _maker(async_engine)() as session:
-            assert await _details(session, memory.id) is None
-            assert (await _log(session, memory.id))[-1] == (
-                4,
-                "erasure",
-                p1,
-                {"erased": ["details"], "restored_from": 3},
+            before = await _snapshots(session, [memory.id])
+        reports = []
+        for request in order:
+            sync = AsyncMock()
+            code, _ = await _run(
+                async_engine, ["--request", str(request.id), "--apply", "--yes"], sync
             )
-        # the cleared location went to the payload, S2's never did
-        assert sync.await_args.kwargs["delete_keys"] == ["location"]
+            assert code == 0
+            reports.append((capsys.readouterr().out, sync))
 
-        code, _ = await _run(async_engine, ["--request", str(second.id), "--apply", "--yes"])
-        assert code == 0
         async with _maker(async_engine)() as session:
             assert await _details(session, memory.id) == AUTHORS
-            assert await _log(session, memory.id) == [
-                (2, "api", p2, {"details": AUTHORS}),
-                (3, "api", p1, STRIPPED),
-                (4, "erasure", p1, {"erased": ["details"], "restored_from": 3}),
-                (5, "erasure", p2, {"erased": ["details"], "restored_from": 2}),
+            log = await _log(session, memory.id)
+            assert log[:2] == [(2, "api", p2, {"details": AUTHORS}), (3, "api", p1, STRIPPED)]
+            # exactly one erasure row, by the request that restored, naming
+            # the whole run of erased members' edits
+            assert [row for row in log if row[1] == "erasure"] == [
+                (4, "erasure", p1, {"erased": ["details"], "restored_from": 2})
             ]
-        capsys.readouterr()
+            assert len(log) == 3
+            after = await _snapshots(session, [memory.id])
+        for snapshot in (before, after):
+            snapshot.pop("audit_logs")
+        assert after == before  # the author's own memory and every other row
+        restored = [
+            "1 memory details restored" in out for out, _ in reports
+        ]  # only the request whose subject made the newest edit restores
+        assert restored == ([True, False] if first_is_newest else [False, True])
+        # the author's location went to the payload, S2's never did
+        (sync,) = [sync for out, sync in reports if sync.await_count]
+        assert sync.await_args.kwargs["payload_updates"]["location"] == AUTHORS["location"]
     finally:
         async with _maker(async_engine)() as session:
             await session.execute(delete(AuditLog).where(AuditLog.user_id.in_([p1, p2])))
             await session.execute(
-                delete(ErasureRequest).where(ErasureRequest.id.in_([first.id, second.id]))
+                delete(ErasureRequest).where(ErasureRequest.id.in_([s1_request.id, s2_request.id]))
             )
             await session.commit()
 
@@ -578,4 +592,429 @@ async def test_a_time_memory_with_an_unnormalized_authors_trigger_is_restored(
         async with _maker(async_engine)() as session:
             await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
             await session.execute(delete(ErasureRequest).where(ErasureRequest.id == request.id))
+            await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# #2268: requests that failed after the Postgres step, the scrub bound, and
+# the same pseudonym in two requests
+# ---------------------------------------------------------------------------
+
+_SALT = "salt-2268"
+
+
+def _salted(value: str) -> str:
+    from utils.hashing import sha256_hex
+
+    return sha256_hex(value, salt=_SALT)
+
+
+async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
+    return (
+        await session.execute(
+            select(
+                ErasureRequest.status,
+                ErasureRequest.user_id,
+                ErasureRequest.initiated_by,
+                ErasureRequest.ip_address,
+                ErasureRequest.user_agent,
+                ErasureRequest.failure_reason,
+            ).where(ErasureRequest.id == request_id)
+        )
+    ).one()
+
+
+async def test_a_legacy_failed_after_commit_request_is_repaired_and_reprocessed(
+    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A request that failed after its Postgres step before v0.124.0 stores the
+    raw sub while the subject's rows carry the pseudonym. ``--apply`` stores
+    the derived pseudonym (request metadata cleared, the marker added), then
+    restores and strips by it; one audit row; the account id is never
+    printed. A ``failed`` request without a Postgres step is not listed and
+    stays byte-identical. A second run changes nothing."""
+    from models.erasure import FAILURE_AFTER_POSTGRES_COMMIT
+    from services.erasure_details import erased_pseudonyms
+
+    tag = uuid.uuid4().hex[:8]
+    raw, untouched_raw = f"google-oauth2|legacy-{tag}", f"google-oauth2|early-{tag}"
+    p = _salted(raw)
+    live = _memory(world["ws"], world["ctx"], world["author"], SUBJECTS, 3)
+    leftover = _memory(world["ws"], world["ctx"], world["author"], {"by": "fourth"}, 3)
+    legacy = _request(raw, status="failed", summary={"postgres": {"users": 1}})
+    legacy.initiated_by, legacy.is_self_service, legacy.reason_code = raw, True, "self_service"
+    legacy.ip_address, legacy.user_agent, legacy.failure_reason = "203.0.113.5", "ua", "redis down"
+    early = _request(untouched_raw, status="failed", summary={"qdrant": {"kagura_memories": 0}})
+    early.failure_reason = "vector store down"
+    async with _maker(async_engine)() as session:
+        session.add_all([live, leftover])
+        await session.flush()
+        session.add_all(
+            [
+                _edit(live, 2, world["author"], {"details": CREATION}),
+                _edit(live, 3, p, {"details": AUTHORS}),
+                _edit(leftover, 2, p, {"details": AUTHORS}),
+                _edit(leftover, 3, world["fourth"], {"details": SUBJECTS}),
+                legacy,
+                early,
+            ]
+        )
+        await session.commit()
+    try:
+        with patch("services.account_erasure_service._audit_salt", return_value=_SALT):
+            async with _maker(async_engine)() as session:
+                # the live erasure of another member walks past this subject
+                assert p in await erased_pseudonyms(session)
+                assert _salted(untouched_raw) not in await erased_pseudonyms(session)
+                before = await _snapshots(session, [live.id, leftover.id])
+
+            code, _ = await _run(async_engine, ["--all"])
+            assert code == 0
+            plan = capsys.readouterr().out
+            assert f"would repair  {legacy.id}" in plan
+            assert str(early.id) not in plan
+            assert raw not in plan and untouched_raw not in plan
+
+            code, sync = await _run(async_engine, ["--request", str(legacy.id), "--apply", "--yes"])
+            assert code == 0
+            out = capsys.readouterr().out
+            assert f"repaired  {legacy.id}" in out and raw not in out
+            assert "1 request row(s) repaired" in out
+
+            async with _maker(async_engine)() as session:
+                row = await _request_row(session, legacy.id)
+                assert (row.status, row.user_id, row.initiated_by) == ("failed", p, p)
+                assert (row.ip_address, row.user_agent) == (None, None)
+                # the old reason is replaced: an exception text can name the account
+                assert row.failure_reason == FAILURE_AFTER_POSTGRES_COMMIT + cli.REPAIRED_REASON
+                assert await _details(session, live.id) == AUTHORS
+                assert (await _log(session, leftover.id))[1] == (
+                    3,
+                    "api",
+                    world["fourth"],
+                    STRIPPED,
+                )
+                (audit,) = await _reprocess_audit_rows(session, p)
+                assert audit.user_metadata["request_repaired"] is True
+                assert audit.user_metadata["details_restored"] == 1
+                assert raw not in repr(audit.user_metadata)
+                after = await _snapshots(session, [live.id, leftover.id])
+            sync.assert_awaited_once()
+            # every other row, the early failed request included, byte-identical
+            before.pop("audit_logs"), after.pop("audit_logs")
+            repaired_before = before["erasure_requests"].pop(legacy.id)
+            repaired_after = after["erasure_requests"].pop(legacy.id)
+            assert repaired_before != repaired_after
+            assert after == before
+
+            code, sync = await _run(async_engine, ["--request", str(legacy.id), "--apply", "--yes"])
+            assert code == 0
+            out = capsys.readouterr().out
+            assert "1 completed erasure(s): would change 0, skipped 0" in out
+            sync.assert_not_awaited()
+            async with _maker(async_engine)() as session:
+                assert len(await _reprocess_audit_rows(session, p)) == 1
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
+            await session.execute(
+                delete(ErasureRequest).where(ErasureRequest.id.in_([legacy.id, early.id]))
+            )
+            await session.execute(delete(Memory).where(Memory.id.in_([live.id, leftover.id])))
+            await session.commit()
+
+
+@pytest.mark.parametrize("with_scrub_time", [True, False])
+async def test_the_scrub_time_bounds_the_rerun_on_authored_memories(
+    async_engine: AsyncEngine,
+    world: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    with_scrub_time: bool,
+) -> None:
+    """A surviving member edited the subject's (scrubbed) memory between the
+    erasure's memory lock and its completion. With ``memory_scrub_at`` in the
+    summary that row is left alone; without it (a request from before
+    v0.124.0) the completion time is the bound and the row is stripped and
+    marked."""
+    scrubbed_at = datetime(2026, 9, 1, 12, 0, 0)  # naive UTC
+    p = _pseudonym()
+    own = _memory(world["ws"], world["ctx"], p, {"by": "third"}, 2)
+    summary: dict[str, Any] = {"postgres": {"users": 1}}
+    if with_scrub_time:
+        summary["postgres"]["memory_scrub_at"] = scrubbed_at.isoformat() + "Z"
+    request = _request(p, summary=summary)
+    request.completed_at = (scrubbed_at + timedelta(hours=1)).replace(tzinfo=UTC)
+    async with _maker(async_engine)() as session:
+        session.add(own)
+        await session.flush()
+        session.add_all(
+            [
+                _edit(
+                    own, 2, world["third"], {"details": None}, scrubbed_at + timedelta(minutes=30)
+                ),
+                request,
+            ]
+        )
+        await session.commit()
+    try:
+        async with _maker(async_engine)() as session:
+            before = await _snapshots(session, [own.id])
+        code, _ = await _run(async_engine, ["--request", str(request.id), "--apply", "--yes"])
+        assert code == 0
+        capsys.readouterr()
+        async with _maker(async_engine)() as session:
+            (row,) = await _log(session, own.id)
+            after = await _snapshots(session, [own.id])
+        if with_scrub_time:
+            assert row[3] == {"details": None}  # written after the lock: kept
+        else:
+            assert row[3] == SCRUBBED  # within the completion bound
+        before.pop("audit_logs"), after.pop("audit_logs")
+        assert after == before
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
+            await session.execute(delete(ErasureRequest).where(ErasureRequest.id == request.id))
+            await session.execute(delete(Memory).where(Memory.id == own.id))
+            await session.commit()
+
+
+async def test_the_same_pseudonym_in_two_requests_is_handled_once(
+    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The account was erased, re-created with the same sub, and erased
+    again: both requests store the same pseudonym. Request 1 (older) reaches
+    only rows of the subject's memories written by its bound, request 2 the
+    rows up to its own; a row written after both is left alone. The restore
+    runs under request 1, request 2 restores nothing. Two audit rows; a
+    second run changes nothing; neither request sees its subject as another
+    erased member."""
+    from services import erasure_details
+
+    p = _pseudonym()
+    t1 = datetime(2026, 7, 10, 12, 0, 0)
+    t2 = datetime(2026, 9, 10, 12, 0, 0)
+    own = _memory(world["ws"], world["ctx"], p, None, 4)
+    live = _memory(world["ws"], world["ctx"], world["author"], SUBJECTS, 2)
+    first = _request(p, summary={"postgres": {"memory_scrub_at": t1.isoformat() + "Z"}})
+    second = _request(p, summary={"postgres": {"memory_scrub_at": t2.isoformat() + "Z"}})
+    first.completed_at = t1.replace(tzinfo=UTC) + timedelta(minutes=1)
+    second.completed_at = t2.replace(tzinfo=UTC) + timedelta(minutes=1)
+    async with _maker(async_engine)() as session:
+        session.add_all([own, live])
+        await session.flush()
+        session.add_all(
+            [
+                # period 1: a leftover prior holding the subject's value
+                _edit(own, 2, world["third"], {"details": SUBJECTS}, t1 - timedelta(days=1)),
+                # period 2
+                _edit(own, 3, world["third"], {"details": THIRDS}, t1 + timedelta(days=1)),
+                # after both erasures: a surviving member's own history
+                _edit(own, 4, world["fourth"], {"details": THIRDS}, t2 + timedelta(days=1)),
+                _edit(live, 2, p, {"details": AUTHORS}, t1 - timedelta(days=2)),
+                first,
+                second,
+            ]
+        )
+        await session.commit()
+    try:
+        async with _maker(async_engine)() as session:
+            # the world's own request changes its two memories in an --all run
+            changed = [own.id, live.id, world["live"].id, world["leftover"].id]
+            before = await _snapshots(session, changed)
+        calls = []
+        real = erasure_details.erase_subject_details
+
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append((args[1], kwargs["erased_actors"]))
+            return await real(*args, **kwargs)
+
+        with patch.object(cli, "erase_subject_details", spy):
+            code, _ = await _run(async_engine, ["--all", "--apply", "--yes"])
+        assert code == 0
+        capsys.readouterr()
+        async with _maker(async_engine)() as session:
+            applied = {
+                audit.user_metadata["request_id"]: [
+                    audit.user_metadata[key]
+                    for key in (
+                        "details_restored",
+                        "details_restored_unavailable",
+                        "details_stripped",
+                        "scrub_marked",
+                    )
+                ]
+                for audit in await _reprocess_audit_rows(session, p)
+            }
+        # what each request changed when applied (oldest first): request 1
+        # restores and handles the period-1 row, request 2 the period-2 row
+        assert applied == {str(first.id): [1, 0, 1, 1], str(second.id): [0, 0, 1, 1]}
+        mine = [erased for subject, erased in calls if subject == p]
+        assert len(mine) == 4 and all(p not in erased for erased in mine)  # plan + apply
+        async with _maker(async_engine)() as session:
+            assert await _details(session, live.id) == AUTHORS
+            assert [row[3] for row in await _log(session, own.id)] == [
+                SCRUBBED,
+                SCRUBBED,
+                {"details": THIRDS},
+            ]
+            assert len(await _reprocess_audit_rows(session, p)) == 2
+            after = await _snapshots(session, changed)
+        before.pop("audit_logs"), after.pop("audit_logs")
+        assert after == before
+
+        code, sync = await _run(async_engine, ["--all", "--apply", "--yes"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert str(first.id) not in out and str(second.id) not in out
+        sync.assert_not_awaited()
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
+            await session.execute(
+                delete(ErasureRequest).where(ErasureRequest.id.in_([first.id, second.id]))
+            )
+            await session.execute(delete(Memory).where(Memory.id.in_([own.id, live.id])))
+            await session.commit()
+
+
+async def test_a_legacy_row_whose_pseudonym_no_row_carries_is_left_alone(
+    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2268 review: with another salt than the erasure's (or no surviving
+    row) the derived pseudonym matches nothing; the account id is not
+    overwritten with it. A reason that only looks like the marker under LIKE
+    (``_`` is a wildcard) does not make the row count as marked."""
+    from services.erasure_details import erased_pseudonyms
+
+    raw = f"google-oauth2|nosalt-{uuid.uuid4().hex[:8]}"
+    # the erasure says it pseudonymized rows, yet none carries the pseudonym
+    legacy = _request(raw, status="failed", summary={"postgres": {"memories_scrubbed": 2}})
+    legacy.failure_reason = "afterXpostgresXcommit: lookalike"
+    async with _maker(async_engine)() as session:
+        session.add(legacy)
+        await session.commit()
+    try:
+        with patch("services.account_erasure_service._audit_salt", return_value=_SALT):
+            async with _maker(async_engine)() as session:
+                before = await _snapshots(session, [])
+                assert _salted(raw) in await erased_pseudonyms(session)  # unrepaired
+            code, sync = await _run(async_engine, ["--request", str(legacy.id), "--apply", "--yes"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert f"skipped  {legacy.id}  {cli.SKIPPED_NO_ROWS}" in out
+        assert raw not in out
+        sync.assert_not_awaited()
+        async with _maker(async_engine)() as session:
+            assert await _snapshots(session, []) == before
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(ErasureRequest).where(ErasureRequest.id == legacy.id))
+            await session.commit()
+
+
+async def test_a_repair_another_run_already_made_writes_nothing(
+    async_engine: AsyncEngine, world: dict[str, Any]
+) -> None:
+    """#2268 review: two runs race on one legacy row; the second one's repair
+    matches no row (``user_id`` changed), so it is not counted, and with
+    nothing else to do no audit row is written."""
+    raw = f"google-oauth2|race-{uuid.uuid4().hex[:8]}"
+    p = _salted(raw)
+    done = _request(p, status="failed", summary={"postgres": {"users": 1}})
+    async with _maker(async_engine)() as session:
+        session.add(done)
+        await session.commit()
+    try:
+        async with _maker(async_engine)() as session:
+            change = await cli._reprocess_one(
+                session, done.id, p, None, None, False, frozenset(), account_id=raw
+            )
+        assert (change.repaired, change.changes) == (False, 0)
+        async with _maker(async_engine)() as session:
+            assert await _reprocess_audit_rows(session, p) == []
+            assert (await _request_row(session, done.id)).user_id == p
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(ErasureRequest).where(ErasureRequest.id == done.id))
+            await session.commit()
+
+
+async def test_a_legacy_row_whose_erasure_wrote_no_pseudonym_is_still_repaired(
+    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2268 review: nothing of the subject survived (the summary counts no
+    pseudonymized memory or revision row), so no row can carry the pseudonym.
+    The account id must not stay on the row: it is repaired anyway."""
+    raw = f"google-oauth2|empty-{uuid.uuid4().hex[:8]}"
+    p = _salted(raw)
+    legacy = _request(
+        raw,
+        status="failed",
+        summary={"postgres": {"memories_scrubbed": 0, "memory_revisions_pseudonymized": 0}},
+    )
+    async with _maker(async_engine)() as session:
+        session.add(legacy)
+        await session.commit()
+    try:
+        with patch("services.account_erasure_service._audit_salt", return_value=_SALT):
+            code, _ = await _run(async_engine, ["--request", str(legacy.id), "--apply", "--yes"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert f"repaired  {legacy.id}" in out and raw not in out
+        async with _maker(async_engine)() as session:
+            assert (await _request_row(session, legacy.id)).user_id == p
+            assert len(await _reprocess_audit_rows(session, p)) == 1
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
+            await session.execute(delete(ErasureRequest).where(ErasureRequest.id == legacy.id))
+            await session.commit()
+
+
+async def test_a_legacy_row_is_bounded_an_hour_after_its_start(
+    async_engine: AsyncEngine, world: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#2268 review: no scrub or completion time on a legacy failed request;
+    ``started_at`` + 1h (the sweep's crash cutoff) bounds the strip on the
+    subject's memories, so a surviving member's later history stays."""
+    raw = f"google-oauth2|bound-{uuid.uuid4().hex[:8]}"
+    p = _salted(raw)
+    started = datetime(2026, 9, 1, 12, 0, 0)  # naive UTC
+    own = _memory(world["ws"], world["ctx"], p, None, 3)
+    legacy = _request(raw, status="failed", summary={"postgres": {"memories_scrubbed": 1}})
+    legacy.started_at = started.replace(tzinfo=UTC)
+    async with _maker(async_engine)() as session:
+        session.add(own)
+        await session.flush()
+        session.add_all(
+            [
+                _edit(own, 2, world["third"], {"details": SUBJECTS}, started - timedelta(days=1)),
+                _edit(own, 3, world["fourth"], {"details": THIRDS}, started + timedelta(hours=2)),
+                legacy,
+            ]
+        )
+        await session.commit()
+    try:
+        async with _maker(async_engine)() as session:
+            before = await _snapshots(session, [own.id])
+        with patch("services.account_erasure_service._audit_salt", return_value=_SALT):
+            code, _ = await _run(async_engine, ["--request", str(legacy.id), "--apply", "--yes"])
+        assert code == 0
+        capsys.readouterr()
+        async with _maker(async_engine)() as session:
+            assert [row[3] for row in await _log(session, own.id)] == [
+                SCRUBBED,  # before the erasure: the subject's value, stripped
+                {"details": THIRDS},  # after the bound: left alone
+            ]
+            after = await _snapshots(session, [own.id])
+        for snapshot in (before, after):
+            snapshot.pop("audit_logs")
+            snapshot["erasure_requests"].pop(legacy.id)
+        assert after == before
+    finally:
+        async with _maker(async_engine)() as session:
+            await session.execute(delete(AuditLog).where(AuditLog.user_id == p))
+            await session.execute(delete(ErasureRequest).where(ErasureRequest.id == legacy.id))
+            await session.execute(delete(Memory).where(Memory.id == own.id))
             await session.commit()
