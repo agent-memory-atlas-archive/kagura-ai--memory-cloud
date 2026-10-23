@@ -44,9 +44,10 @@ PRIOR_ERASED_KEY = "erased"
 # from the live row) reports ``details`` as unavailable below them. Unlike
 # ``erased`` it does not mean the event changed the field.
 PRIOR_SCRUBBED_KEY = "scrubbed"
-# Account erasure's details revert (#2244, ``writer='erasure'``) records the
-# lowest version of the block of edits it reverted, so a later erasure can
-# tell whose value it put back. Not a versioned field and not a marker:
+# Account erasure's details revert (#2244, ``writer='erasure'``) and a session
+# rollback's restore of values (#2266, ``writer='rollback'``) record the lowest
+# version of the block of edits they reverted, so a later erasure can tell
+# whose value was put back. Not a versioned field and not a marker:
 # ``prior_values`` and the marker readers ignore it.
 PRIOR_RESTORED_FROM_KEY = "restored_from"
 
@@ -239,6 +240,7 @@ def record_edit(
     actor_user_id: str,
     writer: str = REVISION_WRITER_API,
     provenance: WriteProvenance | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> bool:
     """Bump the version and log the edit when it changed a versioned field.
 
@@ -249,6 +251,9 @@ def record_edit(
         actor_user_id: The caller who made the edit.
         writer: ``rollback`` when ``rollback_session`` restores (#2044).
         provenance: The writer's agent and session (default: the request's).
+        extra: Non-versioned keys merged into ``prior`` when the version
+            moves (a rollback's ``restored_from``, #2266). ``prior_values``,
+            ``changed_fields`` and the version rebuild ignore them.
 
     A legacy row without a context still moves its version (so a PATCH's
     ``expected_version`` keeps refusing a stale edit) but logs nothing:
@@ -261,6 +266,10 @@ def record_edit(
     prior = changed_prior(before, memory)
     if not prior:
         return False
+    # a None value names nothing: never a ``null`` key in ``prior``
+    extra = {key: value for key, value in (extra or {}).items() if value is not None}
+    if extra:
+        prior = {**prior, **extra}
     memory.version = memory.version + 1
     record_revision(
         db,

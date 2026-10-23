@@ -40,8 +40,9 @@ def _result(*, dry_run: bool, changed: bool = True) -> cli.ReprocessResult:
                 details_restored_unavailable=1,
                 details_stripped=3,
                 scrub_marked=4,
-                payload_synced=0 if dry_run else 2,
-                payload_skipped=0 if dry_run else 1,
+                payload={}
+                if dry_run
+                else {"details_payload_synced": 2, "details_payload_skipped_shared": 1},
             )
         )
     return result
@@ -86,7 +87,10 @@ class TestReprocessErasuresCommand:
             "changed 1 erasure request(s): 2 memory details restored, 1 cleared (unavailable), "
             "3 revision prior(s) stripped, 4 marked scrubbed"
         ) in out
-        assert f"payload  {REQUEST_ID}  synced 2, skipped 1, re-queued for embedding 0" in out
+        assert (
+            f"payload  {REQUEST_ID}  synced 2, skipped 1 (tombstone 0, shared 1, edited since 0), "
+            "re-queued for embedding 0"
+        ) in out
 
     def test_the_confirmation_is_honoured(self, capsys):
         worker = AsyncMock(return_value=_result(dry_run=True))
@@ -137,3 +141,28 @@ class TestReprocessErasuresCommand:
         with pytest.raises(SystemExit) as exc:
             cli._parse(argv)
         assert exc.value.code == 2
+
+
+def test_the_applied_report_names_already_queued_and_failed_requeues(capsys):
+    """#2266: failed patches on rows already queued, and re-queues that failed,
+    are printed (the latter points at the warnings that carry the ids)."""
+    result = cli.ReprocessResult(dry_run=False, scanned=1)
+    result.changed.append(
+        cli.RequestChange(
+            request_id=REQUEST_ID,
+            completed_at=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
+            details_restored=3,
+            details_restored_unavailable=0,
+            details_stripped=0,
+            scrub_marked=0,
+            embedding_requeued=1,
+            payload={
+                "details_payload_synced": 1,
+                "details_payload_skipped_requeued": 1,
+                "details_payload_requeue_failed": 1,
+            },
+        )
+    )
+    cli._print_applied(result)
+    out = capsys.readouterr().out
+    assert "re-queued for embedding 1, already queued 1, NOT re-queued 1" in out

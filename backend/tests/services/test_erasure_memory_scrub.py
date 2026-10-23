@@ -5,7 +5,8 @@ their PG memory rows in co-owned/transferred workspaces intact — details
 (coordinates included) plus the raw user_id. The scrub pass pseudonymizes
 ``user_id`` (salted SHA256, the plan_changes/agents convention) and NULLs
 ``details`` — which also NULLs the generated columns (location_lat/lon,
-trigger_from/until) since they derive from details.
+trigger_from/until) since they derive from details — except a time memory's
+``trigger`` (#2266).
 """
 
 import re
@@ -59,7 +60,19 @@ async def test_scrub_surviving_memories_pseudonymizes_and_nulls_details() -> Non
     # 1) Survivors: user_id pseudonymized + details NULLed in one UPDATE,
     #    over the subject's authored rows (raw sub), locked in id order.
     assert str(scrub).startswith("UPDATE memories SET ")
-    assert scrub.params["details"] is None
+    # #2266: a time memory keeps ``{"trigger": ...}`` (its CHECK needs the
+    # window); every other row gets NULL
+    scrub_sql = " ".join(str(scrub).split())
+    assert "details=CAST(CASE WHEN (memories.type = %(type_1)s::VARCHAR" in scrub_sql
+    assert "THEN json_build_object(%(json_build_object_1)s::VARCHAR, json_build_object(" in (
+        scrub_sql
+    )
+    assert scrub_sql.count("ELSE NULL END AS JSON)") == 1
+    assert scrub.params["type_1"] == "time"
+    assert scrub.params["json_build_object_1"] == "trigger"
+    # the window keys only, never the trigger's ``text``
+    keys = {v for k, v in scrub.params.items() if k.startswith("json_build_object_")}
+    assert keys == {"trigger", "year", "month", "day", "hour", "minute", "from", "until"}
     assert scrub.params["user_id"] == pseudonym != "google-oauth2|erased"
     assert _memories_locked_in_id_order("memories", str(scrub)) == (
         "memories_1.user_id = %(user_id_1)s::VARCHAR"
@@ -143,8 +156,11 @@ async def test_lock_subject_memories_with_deleted_by_is_one_ordered_statement() 
     from services.erasure_details import lock_subject_memories
 
     db = MagicMock()
-    db.execute = AsyncMock()
-    await lock_subject_memories(db, "raw", deleted_by=True)
+    result = MagicMock()
+    result.all.return_value = [("a",), ("b",)]
+    db.execute = AsyncMock(return_value=result)
+    # #2266: how many rows were locked (the restore logs it)
+    assert await lock_subject_memories(db, "raw", deleted_by=True) == 2
     await lock_subject_memories(db, "raw")
 
     with_deleted_by, plain = (
@@ -258,7 +274,7 @@ async def test_erase_memory_revisions_strips_details_and_pseudonymizes_the_actor
     ]
     with (
         patch("services.account_erasure_service._audit_salt", return_value="salt"),
-        patch("services.erasure_details._details_edits", new=AsyncMock(return_value=edits)),
+        patch("services.erasure_details._updated_rows", new=AsyncMock(return_value=edits)),
     ):
         counts = await service._erase_memory_revisions("google-oauth2|erased")
 
@@ -385,7 +401,7 @@ async def test_strip_subject_details_takes_one_subject_string() -> None:
     db = MagicMock()
     db.execute = AsyncMock(side_effect=[MagicMock(), MagicMock(rowcount=4), MagicMock(rowcount=1)])
 
-    with patch("services.erasure_details._details_edits", new=AsyncMock(return_value=[])) as read:
+    with patch("services.erasure_details._updated_rows", new=AsyncMock(return_value=[])) as read:
         assert await strip_subject_details(db, "pseudo") == StripCounts(4, 1)
     assert read.await_args.args[1] == "pseudo"
 
@@ -413,7 +429,7 @@ async def test_a_re_run_bounds_the_authored_arm_to_rows_the_erasure_saw() -> Non
     db = MagicMock()
     db.execute = AsyncMock(side_effect=[MagicMock(), MagicMock(rowcount=2), MagicMock(rowcount=3)])
 
-    with patch("services.erasure_details._details_edits", new=AsyncMock(return_value=[])):
+    with patch("services.erasure_details._updated_rows", new=AsyncMock(return_value=[])):
         assert await strip_subject_details(db, "p", existed_at=existed_at) == StripCounts(2, 3)
 
     _, strip, scrub = (c.args[0] for c in db.execute.await_args_list)
@@ -446,7 +462,7 @@ async def test_a_dry_run_strip_counts_and_writes_nothing() -> None:
     db = MagicMock()
     db.execute = AsyncMock(side_effect=[scalar(5), scalar(2)])
 
-    with patch("services.erasure_details._details_edits", new=AsyncMock(return_value=[])):
+    with patch("services.erasure_details._updated_rows", new=AsyncMock(return_value=[])):
         assert await strip_subject_details(db, "p", dry_run=True) == StripCounts(5, 2)
 
     sqls = [

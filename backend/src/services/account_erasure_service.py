@@ -33,11 +33,12 @@ from __future__ import annotations
 import asyncio
 import hmac
 import secrets
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import case, delete, select, tuple_, update
+from sqlalchemy import JSON, and_, case, delete, func, null, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,7 +75,7 @@ from models.erasure import (
     VALID_REASON_CODES,
     ErasureRequest,
 )
-from models.memory import Memory, MemoryRevision
+from models.memory import MEMORY_TYPE_TIME, Memory, MemoryRevision
 from services.billing_contract import (
     ensure_no_billing_contract,
     owned_workspaces_under_contract,
@@ -82,12 +83,15 @@ from services.billing_contract import (
 )
 from services.email_service import EmailService, get_email_service
 from services.erasure_details import (
+    RestoreReport,
     completed_pseudonyms,
     lock_subject_memories,
     locked_ids,
+    payload_counts,
     pseudonymize_revision_actor,
     restore_editor_details,
     strip_subject_details,
+    sync_restored_payloads,
 )
 from services.oauth_grant_revocation import revoke_oauth_grants
 from services.system_admin_service import SystemAdminService
@@ -107,6 +111,7 @@ from utils.exceptions import (
 )
 from utils.hashing import sha256_hex
 from utils.logger import get_logger
+from utils.time_trigger import TRIGGER_WINDOW_KEYS
 from utils.utf8 import is_utf8_encodable
 
 logger = get_logger(__name__)
@@ -140,6 +145,42 @@ _EMAIL_LINK_SUFFIX = ":email-link"
 # (rollback + Redis cleanup + ``EmailDispatchError``). Future: expose
 # via ``Settings`` if traffic patterns demand tuning.
 CONFIRMATION_EMAIL_TIMEOUT_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class PostgresErasure:
+    """What ``_delete_postgres`` did (#2266).
+
+    Attributes:
+        counts: The ``postgres`` section of the erasure summary.
+        restore: The details restore; its ``to_sync`` are the payloads
+            ``sync_restored_payloads`` patches after the commit.
+    """
+
+    counts: dict[str, int]
+    restore: RestoreReport
+
+
+def _trigger_only_details() -> Any:
+    """What the memory scrub leaves in ``details`` (#2266).
+
+    ``{"trigger": <its window>}`` on a ``type='time'`` row that has a trigger
+    — the window keys only (``TRIGGER_WINDOW_KEYS``): the trigger's ``text``
+    and any key the author passed through are personal payload like the
+    rest — and NULL on every other row. ``details`` is ``json`` (not
+    ``jsonb``), so the object is built with ``json_build_object``.
+    """
+    trigger = Memory.details["trigger"]
+    window = func.json_build_object(
+        *(part for key in TRIGGER_WINDOW_KEYS for part in (key, trigger[key]))
+    )
+    return case(
+        (
+            and_(Memory.type == MEMORY_TYPE_TIME, trigger.is_not(None)),
+            func.json_build_object("trigger", window),
+        ),
+        else_=null(),
+    ).cast(JSON)
 
 
 # Salt used when pseudonymizing audit_log rows for an erased user. A
@@ -741,47 +782,59 @@ class AccountErasureService:
 
         # Mark all as in_progress immediately (under the same FOR UPDATE
         # lock) so a second sweeper waking up between iterations cannot
-        # also see them as cooling_off.
+        # also see them as cooling_off. The ids are read first, while the
+        # rows are fresh: a failed ``_execute`` rolls the session back, which
+        # expires every loaded instance, and an async session cannot
+        # lazy-load an expired attribute (MissingGreenlet, #2266).
+        due = [(req.id, req.user_id) for req in due_requests]
         for req in due_requests:
             req.status = STATUS_IN_PROGRESS
             req.started_at = now
         await self.db.commit()
 
-        # Bulk-load every target user up-front rather than one SELECT per
-        # request — collapses up to `batch_size` round-trips into one.
-        user_ids = [req.user_id for req in due_requests]
-        users_result = await self.db.execute(select(User).where(User.user_id.in_(user_ids)))
-        users_by_id: dict[str, User] = {u.user_id: u for u in users_result.scalars().all()}
-
         executed = 0
-        for req in due_requests:
-            target = users_by_id.get(req.user_id)
+        for request_id, user_id in due:
+            # One SELECT each (≤ batch_size rows per sweep): both rows are
+            # read after any earlier request's rollback, never from an
+            # expired instance. Handlers below log the locals only.
+            request = (
+                await self.db.execute(select(ErasureRequest).where(ErasureRequest.id == request_id))
+            ).scalar_one_or_none()
+            if request is None:
+                continue  # removed since it was claimed; nothing to run
+            target = await self._load_user_or_none(user_id)
             if target is None:
                 # User row already gone (race / manual cleanup). Mark complete
                 # with empty summary; nothing to delete.
-                req.status = STATUS_COMPLETE
-                req.completed_at = utcnow()
-                req.deleted_data_summary = {"note": "user_row_already_absent"}
+                await self.db.execute(
+                    update(ErasureRequest)
+                    .where(ErasureRequest.id == request_id)
+                    .values(
+                        status=STATUS_COMPLETE,
+                        completed_at=utcnow(),
+                        deleted_data_summary={"note": "user_row_already_absent"},
+                    )
+                )
                 await self.db.commit()
                 continue
             try:
-                await self._execute(req, target)
+                await self._execute(request, target)
                 executed += 1
             except BillingContractActiveError as exc:
                 # Expected refusal (#1940), not a fault: `_execute` already
                 # marked the row failed with the reason. No stack trace/alert.
                 logger.warning(
                     "erasure_sweep_blocked_by_billing_contract",
-                    request_id=str(req.id),
-                    user_id=req.user_id,
+                    request_id=str(request_id),
+                    user_id=user_id,
                     workspace_ids=exc.details.get("workspace_ids"),
                 )
                 continue
             except Exception as exc:
                 logger.error(
                     "erasure_sweep_execute_failed",
-                    request_id=str(req.id),
-                    user_id=req.user_id,
+                    request_id=str(request_id),
+                    user_id=user_id,
                     error=str(exc),
                     exc_info=True,
                 )
@@ -836,7 +889,14 @@ class AccountErasureService:
             )
 
             # Step 3: Postgres deletes (FK-safe order)
-            summary["postgres"] = await self._delete_postgres(target)
+            erased = await self._delete_postgres(target)
+            summary["postgres"] = erased.counts
+
+            # Step 3b (#2266): the restored memories' vector payloads, after
+            # the commit — no vector-store call while the subject's memories
+            # are locked. A failed patch re-queues the memory for embedding.
+            await sync_restored_payloads(self.db, erased.restore.to_sync, erased.restore)
+            erased.counts.update(payload_counts(erased.restore))
 
             # Step 4: pseudonymize existing audit_logs referencing this user
             summary["audit_logs_pseudonymized"] = await self._pseudonymize_audit_logs(
@@ -1080,13 +1140,17 @@ class AccountErasureService:
 
         return {"transferred": transfers, "sole_owner_workspaces": sole_owner_count}
 
-    async def _delete_postgres(self, target: User) -> dict[str, int]:
-        """Delete every Postgres row that references the user.
+    async def _delete_postgres(self, target: User) -> PostgresErasure:
+        """Delete every Postgres row that references the user, and commit.
 
         Order matters because not every column is FK-cascaded — most
         cross-table user references are plain VARCHAR (OAuth2 sub) with
         no cascade. The full sweep here is the application-layer
         equivalent of `ON DELETE CASCADE` for all per-user data.
+
+        Returns:
+            The counts, and the details restore whose payloads the caller
+            syncs after this commit (``sync_restored_payloads``).
         """
         # Optional model imports so the service doesn't crash if a model
         # is renamed/removed in a future refactor.
@@ -1294,8 +1358,8 @@ class AccountErasureService:
         # already wiped the rest). Their Qdrant points were deleted in step 1
         # but the PG rows kept details (coordinates included) and the raw
         # user_id. Pseudonymize the subject link and NULL the details column (PostgreSQL json) —
-        # which also NULLs the generated columns (location_lat/lon,
-        # trigger_from/until) derived from it. Runs AFTER the workspace
+        # which also NULLs the generated columns (location_lat/lon) derived
+        # from it; a time memory keeps only its trigger (#2266). Runs AFTER the workspace
         # cascade so the count reflects only survivors.
         # #2043: the revision log of surviving memories. BEFORE the memory
         # scrub: it still finds the subject's memories by their raw user_id.
@@ -1322,8 +1386,8 @@ class AccountErasureService:
         # among the memory steps: it finds the subject's edits by the raw
         # actor (pseudonymized below) and writes its own revision row under
         # the pseudonym, which the strip and the pseudonymize step never
-        # match. Patches the vector payload before the commit; a failure
-        # fails the erasure with Postgres rolled back.
+        # match. No vector-store call here (#2266): ``_execute`` patches the
+        # payloads after the commit below.
         # #2243: a value a member erased earlier wrote is never put back, even
         # where an erasure from before the #2235 fix left it in a prior.
         restore = await restore_editor_details(
@@ -1334,7 +1398,6 @@ class AccountErasureService:
         )
         counts["details_restored"] = restore.restored
         counts["details_restored_unavailable"] = restore.unavailable
-        counts["details_payload_skipped"] = restore.payload_skipped
         counts["details_embedding_requeued"] = restore.embedding_requeued
         counts.update(await self._erase_session_provenance(user_id))
         counts.update(await self._erase_memory_revisions(user_id))
@@ -1381,7 +1444,7 @@ class AccountErasureService:
         await self.db.commit()
         counts["users"] = 1
 
-        return counts
+        return PostgresErasure(counts, restore)
 
     def _pseudonym(self, value: str) -> str:
         """Salted-SHA256 pseudonym — the single derivation every sweep uses.
@@ -1627,9 +1690,13 @@ class AccountErasureService:
         legal-retention convention: same-user correlation stays possible for
         compliance, the sub is unrecoverable) and ``details`` is NULLed —
         the memory text remains workspace content, but structured personal
-        payload (coordinates, triggers, arbitrary detail keys) is removed
-        at rest. The subject's tombstones are gone already
-        (``_delete_subject_tombstones``).
+        payload (coordinates, arbitrary detail keys) is removed at rest. The
+        subject's tombstones are gone already (``_delete_subject_tombstones``).
+
+        A ``type='time'`` memory keeps ``{"trigger": ...}`` and nothing else
+        (#2266): ``valid_trigger_window_format`` requires its trigger window,
+        which is scheduling metadata of the memory kept like its text. A NULL
+        there failed the whole erasure on the CHECK.
 
         Every statement locks its rows in id order (#2263); all of them are
         held since the erasure's first memory step (the authored and the
@@ -1643,7 +1710,7 @@ class AccountErasureService:
             await self.db.execute(
                 update(Memory)
                 .where(Memory.id.in_(locked_ids(Memory, lambda m: (m.user_id == user_id,))))
-                .values(user_id=self._pseudonym(user_id), details=None)
+                .values(user_id=self._pseudonym(user_id), details=_trigger_only_details())
                 .execution_options(synchronize_session=False)
             ),
         )

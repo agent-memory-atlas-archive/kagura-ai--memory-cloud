@@ -1678,8 +1678,9 @@ erasures on v0.113.0 through v0.120.x) and as the memory's live value where
 they made the newest `details` edit (#2244, fixed in v0.123.0). Erasures
 before v0.113.0 had no revision log, and erasures from v0.123.0 on do all of
 this as they run. Run `--apply` off-peak: each request holds the erased
-member's memories locked while it patches the vector store one memory at a
-time. Plan first, then apply:
+member's memories locked until its commit, and patches the vector store after
+each request's commit; a patch that fails re-queues the memory for embedding.
+Plan first, then apply:
 
 ```bash
 # inside the API container / venv, from backend/
@@ -1699,8 +1700,8 @@ instead. For each request, in one transaction:
 
 1. where the erased member wrote the live `details` of a memory someone else
    authored, the last value someone else wrote is put back — a new version
-   with one revision row (`writer: erasure`, details unavailable), and the
-   memory's vector payload (`location`) is patched before the commit;
+   with one revision row (`writer: erasure`, details unavailable); the
+   memory's vector payload (`location`) is patched right after the commit;
 2. their `details` are removed from every revision prior that still holds
    them. On memories they authored (scrubbed by the erasure), only revision
    rows that existed when the erasure completed are touched — what other
@@ -1713,12 +1714,16 @@ report prints request ids and counts, never values. It previews each request
 on its own: where two erased members edited the same memory, applying the
 first can uncover a restore for the second that the plan did not count — the
 apply report and the audit rows list it, and a plan afterwards shows 0. A
-second `--apply` changes nothing. The vector store must be reachable: a
-payload failure rolls that request back and stops the run with exit code 1;
-the requests before it stay done (each is logged to stderr as
-`erasure_reprocessed` and has its audit row) and a re-run picks up the rest.
-A restored memory whose embedding had not succeeded is re-queued instead of
-patched, and the sweep re-embeds it.
+second `--apply` changes nothing. A payload patch that fails does not fail the
+run: the memory is re-queued for embedding, and the embedding sweep rewrites
+its payload from the restored row within about a minute — until then its
+point may still carry the erased member's `location`. A restored memory whose
+embedding had not succeeded is re-queued in the transaction and its point, if
+it has one, patched too. The apply report prints, per request, the patches
+done, skipped (tombstone, a point another memory shares, a memory edited
+since) and re-queued. An error stops the run with exit code 1; the requests
+before it stay done (each is logged to stderr as `erasure_reprocessed` and has
+its audit row) and a re-run picks up the rest.
 
 Two changes reach erasures that run from v0.123.0 on, too:
 
@@ -1734,6 +1739,33 @@ Two changes reach erasures that run from v0.123.0 on, too:
   the earlier member strips it. Run the command soon after the upgrade, before
   relying on the revision history of memories that members erased on
   v0.113.0 through v0.120.x had edited.
+
+Time memories (`type: time`) and erasure — Issue #2266:
+
+- **Erasures of a member who authored a time memory failed before v0.124.0.**
+  The erasure emptied the memory's `details`, which a time memory must not
+  have (its trigger window is required), so the request ended `failed` with
+  `valid_trigger_window_format` in its `failure_reason` — after the member's
+  vectors had been deleted. To find them, list the erasure requests with
+  `status = 'failed'` whose `failure_reason` contains
+  `valid_trigger_window_format`. After the upgrade, create a new erasure
+  request for each such account (the member's self-service request, or an
+  admin force-erase): it completes, and its first step finds no vectors left.
+- **What a time memory keeps.** On a time memory the erased member authored,
+  `details` keeps only the trigger's window (`year` / `month` / `day` /
+  `hour` / `minute` / `from` / `until`); the trigger's `text`, the location
+  and every other key are removed. On a time memory another member authored
+  whose `details` go back to an earlier value, that value keeps its own
+  trigger (normalized if it was written before the memory became a time
+  memory); where it has none, or is unavailable, the memory's current window
+  is merged in, without its `text`.
+- **Vector payloads after the commit.** The erasure patches restored
+  memories' payloads after its Postgres commit. A patch that fails re-queues
+  the memory for embedding; the erasure summary counts it under
+  `details_payload_requeued_after_error`. A memory whose re-queue failed too
+  is counted under `details_payload_requeue_failed` and logged
+  (`erasure_details_payload_requeue_failed`, with its memory id): re-queue it
+  by hand (set its `embedding_status` to `pending`).
 
 ### Restoring a deleted context — Issue #1804
 

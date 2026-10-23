@@ -360,8 +360,18 @@ class TestEditorDetailsRestore:
         postgres = request.deleted_data_summary["postgres"]
         assert postgres["details_restored"] == 1
         assert postgres["details_restored_unavailable"] == 0
-        assert postgres["details_payload_skipped"] == 0
-        assert postgres["details_embedding_requeued"] == 0
+        # #2266: the payload outcome, split, after the commit
+        assert postgres["details_payload_synced"] == 1
+        assert "details_payload_skipped" not in postgres
+        for key in (
+            "details_payload_skipped_tombstone",
+            "details_payload_skipped_shared",
+            "details_payload_skipped_moved",
+            "details_payload_skipped_requeued",
+            "details_payload_requeued_after_error",
+            "details_embedding_requeued",
+        ):
+            assert postgres[key] == 0, key
         assert postgres["revision_details_stripped"] == 0
         assert await self._state(db_session, edited_by_target) == (
             {"by": "author"},
@@ -372,49 +382,278 @@ class TestEditorDetailsRestore:
         assert sync.await_args.kwargs["delete_keys"] == ["location"]
 
     @pytest.mark.asyncio
-    async def test_payload_failure_fails_the_erasure_and_changes_nothing(
+    async def test_a_payload_failure_requeues_and_the_erasure_completes(
         self, db_session: AsyncSession, erasure_scenario, edited_by_target, patched_external_stores
     ):
-        from models.erasure import STATUS_FAILED
+        """#2266: the payload is patched after the Postgres commit; a failure
+        there re-queues the memory for embedding instead of failing the
+        erasure (before, the request failed and stayed failed)."""
+        from models.memory import Memory
         from utils.exceptions import QdrantError
 
-        before = await self._state(db_session, edited_by_target)
-        with (
-            patch(
-                "services.erasure_details.update_memory_payload_in_qdrant",
-                AsyncMock(side_effect=QdrantError("vector store down")),
-            ),
-            pytest.raises(QdrantError),
+        with patch(
+            "services.erasure_details.update_memory_payload_in_qdrant",
+            AsyncMock(side_effect=QdrantError("vector store down")),
         ):
-            await AccountErasureService(db_session).admin_force_erase(
+            request = await AccountErasureService(db_session).admin_force_erase(
                 target_user_id=erasure_scenario["target_user_id"],
                 initiator_user_id="admin-runner",
                 reason_code=REASON_USER_REQUEST_VIA_SUPPORT,
-                reason_detail="integration test (#2244)",
+                reason_detail="integration test (#2266)",
             )
 
-        request = (
+        assert request.status == STATUS_COMPLETE
+        postgres = request.deleted_data_summary["postgres"]
+        assert (
+            postgres["details_payload_synced"],
+            postgres["details_payload_requeued_after_error"],
+        ) == (
+            0,
+            1,
+        )
+        assert await self._state(db_session, edited_by_target) == (
+            {"by": "author"},
+            3,
+            ["api", "erasure"],
+        )
+        status = (
             await db_session.execute(
-                select(ErasureRequest)
-                .where(ErasureRequest.user_id == erasure_scenario["target_user_id"])
+                select(Memory.embedding_status)
+                .where(Memory.id == edited_by_target)
                 .execution_options(populate_existing=True)
             )
         ).scalar_one()
-        assert request.status == STATUS_FAILED
-        # the user and their edit are still there; the author's memory still
-        # holds the target's value, with no erasure row
-        assert before == (
-            {"by": "target", "location": {"lat": 35.0, "lon": 139.0}},
-            2,
-            ["api"],
-        )
-        assert await self._state(db_session, edited_by_target) == before
-        user = (
-            await db_session.execute(
-                select(User).where(User.user_id == erasure_scenario["target_user_id"])
+        assert status == "pending"
+
+
+class TestPayloadStepNeverFailsTheRequest:
+    """#2266 review S1: after the Postgres commit, an error that is not the
+    vector store's (here a read in the payload step) re-queues the memory and
+    the erasure still completes — the request cannot be retried by then."""
+
+    @pytest.mark.asyncio
+    async def test_a_non_vector_store_error_requeues_and_completes(
+        self, db_session: AsyncSession, erasure_scenario, edited_by_target, patched_external_stores
+    ):
+        from models.memory import Memory
+
+        with (
+            patch("services.erasure_details.update_memory_payload_in_qdrant", AsyncMock()) as sync,
+            patch(
+                "services.context_routing.resolve_collection_name",
+                new=AsyncMock(side_effect=RuntimeError("context read failed")),
+            ),
+        ):
+            request = await AccountErasureService(db_session).admin_force_erase(
+                target_user_id=erasure_scenario["target_user_id"],
+                initiator_user_id="admin-runner",
+                reason_code=REASON_USER_REQUEST_VIA_SUPPORT,
+                reason_detail="integration test (#2266)",
             )
-        ).scalar_one_or_none()
-        assert user is not None
+
+        assert request.status == STATUS_COMPLETE
+        postgres = request.deleted_data_summary["postgres"]
+        assert postgres["details_payload_requeued_after_error"] == 1
+        assert postgres["details_payload_requeue_failed"] == 0
+        sync.assert_not_awaited()
+        status = (
+            await db_session.execute(
+                select(Memory.embedding_status)
+                .where(Memory.id == edited_by_target)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        assert status == "pending"
+
+
+class TestSweepAfterAFailure:
+    """#2266: one request failing in ``_execute`` (which rolls the session
+    back and so expires every loaded instance) must not stop the sweep: the
+    next due request still runs, and nothing escapes."""
+
+    @pytest.mark.asyncio
+    async def test_the_next_request_runs(self, db_session: AsyncSession, patched_external_stores):
+        from datetime import timedelta
+
+        from sqlalchemy import delete
+
+        from models.erasure import STATUS_COOLING_OFF, STATUS_FAILED
+
+        users = [
+            User(
+                email=f"sweep-{uuid4().hex[:8]}@example.com",
+                user_id=f"sweep_{uuid4().hex[:8]}",
+                name="Sweep",
+                role="user",
+                is_initial_admin=False,
+                auth_method="oauth",
+                auth_provider="google",
+            )
+            for _ in range(2)
+        ]
+        db_session.add_all(users)
+        await db_session.flush()
+        failing, passing = (u.user_id for u in users)
+        requests = [
+            ErasureRequest(
+                user_id=user.user_id,
+                user_email_hash=sha256_hex(user.email),
+                initiated_by=user.user_id,
+                is_self_service=True,
+                reason_code="self_service",
+                status=STATUS_COOLING_OFF,
+                # the failing one first: the sweep orders by scheduled_for
+                scheduled_for=utcnow() - timedelta(minutes=10 - i),
+            )
+            for i, user in enumerate(users)
+        ]
+        db_session.add_all(requests)
+        await db_session.commit()
+        request_ids = [r.id for r in requests]
+
+        async def points(user_id: str) -> dict[str, int]:
+            if user_id == failing:
+                raise RuntimeError("vector store down")
+            return {"kagura_memories": 0}
+
+        try:
+            with patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=points),
+            ):
+                executed = await AccountErasureService(db_session).sweep_pending_erasures()
+
+            assert executed == 1
+            statuses = dict(
+                (
+                    await db_session.execute(
+                        select(ErasureRequest.id, ErasureRequest.status).where(
+                            ErasureRequest.id.in_(request_ids)
+                        )
+                    )
+                ).all()
+            )
+            assert statuses == {request_ids[0]: STATUS_FAILED, request_ids[1]: STATUS_COMPLETE}
+            remaining = (
+                await db_session.execute(
+                    select(User.user_id).where(User.user_id.in_([failing, passing]))
+                )
+            ).scalars()
+            assert set(remaining) == {failing}
+        finally:
+            await db_session.execute(
+                delete(ErasureRequest).where(ErasureRequest.id.in_(request_ids))
+            )
+            await db_session.execute(delete(User).where(User.user_id == failing))
+            await db_session.commit()
+
+
+class TestTimeMemories:
+    """#2266: ``type='time'`` rows must keep a trigger window
+    (``valid_trigger_window_format``), so neither the scrub nor the restore
+    may NULL their ``details``. Before the fix the erasure of a member who
+    authored a time memory in a surviving workspace failed on the CHECK."""
+
+    @pytest.mark.asyncio
+    async def test_the_erasure_completes_and_keeps_only_the_trigger(
+        self, db_session: AsyncSession, erasure_scenario, patched_external_stores
+    ):
+        from sqlalchemy import text
+
+        from models.auth import Context
+        from models.memory import Memory, MemoryRevision
+        from utils.time_trigger import normalize_trigger, trigger_window
+
+        other = erasure_scenario["other_user_id"]
+        target = erasure_scenario["target_user_id"]
+        ws_id = erasure_scenario["workspace_id"]
+        trigger = normalize_trigger({"year": 2027, "month": 1, "day": 1, "text": "launch"})
+        other_trigger = normalize_trigger({"year": 2028, "month": 2})
+        location = {"lat": 35.0, "lon": 139.0}
+        context = Context(
+            id=uuid4(), workspace_id=ws_id, name=f"ctx-{uuid4().hex[:8]}", created_by=other
+        )
+        db_session.add(context)
+        await db_session.flush()
+
+        def memory(owner: str, kind: str, details: dict, version: int = 1) -> Memory:
+            return Memory(
+                id=uuid4(),
+                user_id=owner,
+                workspace_id=ws_id,
+                context_id=context.id,
+                summary="a memory",
+                content="body",
+                type=kind,
+                client="test",
+                details=details,
+                version=version,
+                embedding_status="success",
+            )
+
+        own_time = memory(target, "time", {"trigger": trigger, "location": location, "k": 1})
+        own_note = memory(target, "note", {"location": location})
+        # another author's time memory nobody else touched
+        others_time = memory(other, "time", {"trigger": other_trigger, "location": location})
+        # another author's time memory whose newest details edit is the target's
+        edited_time = memory(other, "time", {"trigger": trigger, "by": "target"}, version=2)
+        db_session.add_all([own_time, own_note, others_time, edited_time])
+        await db_session.flush()
+        db_session.add(
+            MemoryRevision(
+                memory_id=edited_time.id,
+                context_id=context.id,
+                version=2,
+                kind="updated",
+                writer="api",
+                actor_user_id=target,
+                prior={"details": {"trigger": other_trigger, "by": "author"}},
+            )
+        )
+        await db_session.commit()
+        outside = text("SELECT id, to_jsonb(t) FROM memories AS t WHERE NOT (t.id = ANY(:changed))")
+        changed = [own_time.id, own_note.id, edited_time.id]
+        before = dict((await db_session.execute(outside, {"changed": changed})).all())
+
+        with patch("services.erasure_details.update_memory_payload_in_qdrant", AsyncMock()):
+            request = await AccountErasureService(db_session).admin_force_erase(
+                target_user_id=target,
+                initiator_user_id="admin-runner",
+                reason_code=REASON_USER_REQUEST_VIA_SUPPORT,
+                reason_detail="integration test (#2266)",
+            )
+
+        assert request.status == STATUS_COMPLETE
+        assert request.deleted_data_summary["postgres"]["memories_scrubbed"] == 2
+
+        async def row(memory_id):
+            return (
+                await db_session.execute(
+                    select(
+                        Memory.user_id,
+                        Memory.details,
+                        Memory.trigger_from,
+                        Memory.trigger_until,
+                        Memory.location_lat,
+                        Memory.version,
+                    ).where(Memory.id == memory_id)
+                )
+            ).one()
+
+        own = await row(own_time.id)
+        assert own.user_id == request.user_id != target  # the pseudonym
+        # the window only: the trigger's ``text`` (the subject's words) goes
+        assert own.details == {"trigger": trigger_window(trigger)}
+        assert "launch" not in repr(own.details)
+        assert (own.trigger_from, own.trigger_until) == (trigger["from"], trigger["until"])
+        assert own.location_lat is None
+        note = await row(own_note.id)
+        assert (note.details, note.location_lat) == (None, None)
+        # the author's value comes back verbatim (it has its own trigger)
+        edited = await row(edited_time.id)
+        assert (edited.details, edited.version) == ({"trigger": other_trigger, "by": "author"}, 3)
+        assert edited.trigger_from == other_trigger["from"]
+        assert dict((await db_session.execute(outside, {"changed": changed})).all()) == before
 
 
 class TestEarlierErasedMembersValue:
