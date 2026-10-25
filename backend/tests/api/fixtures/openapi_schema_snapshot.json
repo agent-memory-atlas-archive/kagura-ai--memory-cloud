@@ -5792,6 +5792,16 @@
               }
             ]
           },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "scope": {
             "type": "string"
           },
@@ -5866,6 +5876,7 @@
           "folded": {},
           "importance": {},
           "memory_id": {},
+          "observed_at": {},
           "scope": {},
           "score": {},
           "source_type": {},
@@ -6758,6 +6769,17 @@
                 "maximum": 1.0,
                 "minimum": 0.0,
                 "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "type": "string"
               },
               {
                 "type": "null"
@@ -7997,6 +8019,7 @@
           "incoming_has_more": {},
           "incoming_links": {},
           "memory_id": {},
+          "observed_at": {},
           "outgoing_has_more": {},
           "outgoing_links": {},
           "scope": {},
@@ -8284,6 +8307,17 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "type": "string"
               },
               {
                 "type": "null"
