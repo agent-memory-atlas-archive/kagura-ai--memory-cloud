@@ -1733,6 +1733,8 @@ class MemoryService:
         client: str = "unknown",
         current_context_id: UUID | None = None,
         current_workspace_id: UUID | None = None,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> UpdateMemoryResponse:
         """Update existing memory in-place or upsert by external_id.
 
@@ -1746,6 +1748,7 @@ class MemoryService:
             client: Client name
             current_context_id: Context UUID
             current_workspace_id: Workspace UUID
+            key_workspace_id: #963 pure key scope, or None.
 
         Returns:
             UpdateMemoryResponse
@@ -1754,11 +1757,20 @@ class MemoryService:
         # _update_in_place, and in the inner remember() of an upsert.
         if request.external_id:
             return await self._upsert_by_external_id(
-                request, user_id, client, current_context_id, current_workspace_id
+                request,
+                user_id,
+                client,
+                current_context_id,
+                current_workspace_id,
+                key_workspace_id=key_workspace_id,
             )
 
         return await self._update_in_place(
-            request, user_id, current_context_id, current_workspace_id
+            request,
+            user_id,
+            current_context_id,
+            current_workspace_id,
+            key_workspace_id=key_workspace_id,
         )
 
     async def _update_in_place(
@@ -1767,11 +1779,17 @@ class MemoryService:
         user_id: str,
         current_context_id: UUID | None = None,
         current_workspace_id: UUID | None = None,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> UpdateMemoryResponse:
         """In-place update by memory_id."""
         from utils.text import normalize_for_search
 
-        memory = await self._update_load_authorized(request.memory_id, user_id)
+        memory = await self._update_load_authorized(
+            request.memory_id,
+            user_id,
+            key_workspace_id=key_workspace_id,
+        )
         # #1941: after the access check, so the lock is no existence oracle.
         await self._ensure_capacity(
             user_id, workspace_id=memory.workspace_id, write_context_id=memory.context_id
@@ -2208,7 +2226,13 @@ class MemoryService:
             raise NotFoundException("Memory", str(memory_id))
         return memory
 
-    async def _update_load_authorized(self, memory_id: UUID, user_id: str) -> Any:
+    async def _update_load_authorized(
+        self,
+        memory_id: UUID,
+        user_id: str,
+        *,
+        key_workspace_id: UUID | None = None,
+    ) -> Any:
         """Load the update target, or 404 (MCP-reachable in-place update path).
 
         Unlike the PATCH sibling this does NOT distinguish tombstones: #1316
@@ -2216,8 +2240,15 @@ class MemoryService:
         deleted memory is uniformly "not found". Only #439's PATCH contract
         needs the 410.
 
+        Args:
+            memory_id: The update target.
+            user_id: The caller.
+            key_workspace_id: #963 pure key scope: a memory of another
+                workspace is not found.
+
         Raises:
-            NotFoundException: no such memory, or the caller may not write it.
+            NotFoundException: no such memory, the caller may not write it, or
+                it is outside ``key_workspace_id``.
         """
         from services.permission_service import (
             CallerId,
@@ -2243,6 +2274,7 @@ class MemoryService:
             # MCP-reachable path stay in parity (#1291/#1292).
             memory_type=memory.type,
             memory_source_type=memory.source_type,
+            key_workspace_id=key_workspace_id,
         )
         if not can_access:
             raise NotFoundException("Memory", str(memory_id))
@@ -2404,7 +2436,9 @@ class MemoryService:
             and await chunk_cascade_needed(self.db, memory.context_id),
         )
 
-    async def _patch_load_authorized(self, memory_id: UUID, user_id: str) -> Any:
+    async def _patch_load_authorized(
+        self, memory_id: UUID, user_id: str, *, key_workspace_id: UUID | None = None
+    ) -> Any:
         """Load the PATCH target, or raise the right not-available error (#439).
 
         The ORDER of the three gates is the security contract and must not be
@@ -2413,6 +2447,9 @@ class MemoryService:
         tombstone first would let anyone who guesses or harvests a UUID confirm
         "this memory was once real" — a GDPR-shaped leak. 410 is reserved for
         callers who already passed the permission check.
+
+        ``key_workspace_id`` is the #963 pure key scope: a memory of another
+        workspace is not found, ahead of the tombstone check like every deny.
 
         Raises:
             NotFoundException: no such memory, or the caller may not write it.
@@ -2445,6 +2482,7 @@ class MemoryService:
             # doctrine as reference/forget (#1299).
             memory_type=memory.type,
             memory_source_type=memory.source_type,
+            key_workspace_id=key_workspace_id,
         )
         if not can_access:
             raise NotFoundException("Memory", str(memory_id))
@@ -2724,6 +2762,8 @@ class MemoryService:
         memory_id: UUID,
         request: PatchMemoryRequest,
         user_id: str,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> ReferenceResponse:
         """Partial update of a memory by UUID (Issue #439).
 
@@ -2764,7 +2804,9 @@ class MemoryService:
         """
         from utils.text import normalize_for_search
 
-        memory = await self._patch_load_authorized(memory_id, user_id)
+        memory = await self._patch_load_authorized(
+            memory_id, user_id, key_workspace_id=key_workspace_id
+        )
         # #1941: after the access check, so the lock is no existence oracle.
         await self._ensure_capacity(
             user_id, workspace_id=memory.workspace_id, write_context_id=memory.context_id
@@ -2867,6 +2909,8 @@ class MemoryService:
         client: str = "unknown",
         current_context_id: UUID | None = None,
         current_workspace_id: UUID | None = None,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> UpdateMemoryResponse:
         """Upsert by external_id: remember new, then forget old if exists.
 
@@ -2935,6 +2979,7 @@ class MemoryService:
             client=client,
             current_context_id=current_context_id,
             current_workspace_id=current_workspace_id,
+            key_workspace_id=key_workspace_id,
             _skip_daily_quota=existing is not None,
         )
 
@@ -2955,6 +3000,7 @@ class MemoryService:
                 ForgetRequest(memory_id=match.id),
                 user_id=user_id,
                 current_context_id=current_context_id,
+                key_workspace_id=key_workspace_id,
                 _skip_binding_row_filter=True,
             )
             operation = "replaced"
@@ -2974,11 +3020,22 @@ class MemoryService:
             lint=result.lint,
         )
 
-    async def _load_readable_memory(self, memory_id: UUID, user_id: str) -> Memory:
+    async def _load_readable_memory(
+        self,
+        memory_id: UUID,
+        user_id: str,
+        *,
+        key_workspace_id: UUID | None = None,
+        context_id: UUID | None = None,
+    ) -> Memory:
         """The live memory ``user_id`` may read, the gate of ``reference`` and
         ``list_revisions`` (#2043): a tombstone, a missing row and a denied
         read are the same ``NotFoundException``; the capacity lock is checked
         after the access check, so it is no existence oracle (#1941).
+
+        A memory outside ``key_workspace_id`` (the #963 pure key scope) or,
+        when given, outside ``context_id`` (the context the caller named) is
+        not found either.
         """
         # #1316: repo.get() excludes soft-deleted rows by default — a forgotten
         # memory must not be readable by direct-id fetch during the retention
@@ -2989,8 +3046,14 @@ class MemoryService:
             raise NotFoundException("Memory", str(memory_id))
 
         if not await self._can_read_memory(
-            memory, user_id, memory_id=memory_id, memory_type=memory.type
+            memory,
+            user_id,
+            memory_id=memory_id,
+            memory_type=memory.type,
+            key_workspace_id=key_workspace_id,
         ):
+            raise NotFoundException("Memory", str(memory_id))
+        if context_id is not None and memory.context_id != context_id:
             raise NotFoundException("Memory", str(memory_id))
 
         # #1941: after the access check, so the lock is no existence oracle.
@@ -2998,7 +3061,13 @@ class MemoryService:
         return memory
 
     async def _can_read_memory(
-        self, memory: Memory, user_id: str, *, memory_id: UUID, memory_type: str
+        self,
+        memory: Memory,
+        user_id: str,
+        *,
+        memory_id: UUID,
+        memory_type: str | None,
+        key_workspace_id: UUID | None = None,
     ) -> bool:
         """The read gate of ``reference`` and ``list_revisions``, with the
         binding's per-memory filter (#1299) judged on ``memory_type``: the
@@ -3019,6 +3088,7 @@ class MemoryService:
             memory_id=memory_id,
             memory_type=memory_type,  # #1299: per-memory type/source filter
             memory_source_type=memory.source_type,
+            key_workspace_id=key_workspace_id,
         )
 
     async def list_revisions(
@@ -3029,6 +3099,7 @@ class MemoryService:
         before_id: int | None = None,
         limit: int = 20,
         context_id: UUID | None = None,
+        key_workspace_id: UUID | None = None,
     ) -> MemoryRevisionsResponse:
         """One page of a memory's revision log, newest first (#2043).
 
@@ -3045,22 +3116,25 @@ class MemoryService:
             context_id: The context the caller named (MCP); a memory of
                 another context is not found, so the envelope's context
                 fields always describe the memory's own context.
+            key_workspace_id: #963 pure key scope, or None.
 
         Raises:
             NotFoundException: No such live memory, no access, or not in
-                ``context_id``.
+                ``context_id`` / ``key_workspace_id``.
         """
         from services.identity_link_service import linked_user_ids
         from services.memory_versions import list_revision_rows, revision_item
 
-        memory = await self._load_readable_memory(memory_id, user_id)
-        if context_id is not None and memory.context_id != context_id:
-            raise NotFoundException("Memory", str(memory_id))
+        memory = await self._load_readable_memory(
+            memory_id, user_id, key_workspace_id=key_workspace_id, context_id=context_id
+        )
         rows, has_more = await list_revision_rows(
             self.db, memory.id, before_id=before_id, limit=limit
         )
         caller_ids = await linked_user_ids(self.db, user_id)
-        unreadable = await self._unreadable_edits(memory, user_id, rows)
+        unreadable = await self._unreadable_edits(
+            memory, user_id, rows, key_workspace_id=key_workspace_id
+        )
         revisions = []
         for row in rows:
             readable = row.version not in unreadable
@@ -3077,7 +3151,14 @@ class MemoryService:
             next_cursor=str(rows[-1].id) if has_more and rows else None,
         )
 
-    async def _unreadable_edits(self, memory: Memory, user_id: str, rows: list[Any]) -> set[int]:
+    async def _unreadable_edits(
+        self,
+        memory: Memory,
+        user_id: str,
+        rows: list[Any],
+        *,
+        key_workspace_id: UUID | None = None,
+    ) -> set[int]:
         """The versions of the ``updated`` events in ``rows`` that connect a
         version the caller may not read (#2169).
 
@@ -3107,7 +3188,11 @@ class MemoryService:
         async def readable(memory_type: str | None) -> bool:
             if memory_type not in verdicts:
                 verdicts[memory_type] = await self._can_read_memory(
-                    memory, user_id, memory_id=memory.id, memory_type=memory_type
+                    memory,
+                    user_id,
+                    memory_id=memory.id,
+                    memory_type=memory_type,
+                    key_workspace_id=key_workspace_id,
                 )
             return verdicts[memory_type]
 
@@ -3120,6 +3205,7 @@ class MemoryService:
         *,
         record_access: bool = True,
         version: int | None = None,
+        key_workspace_id: UUID | None = None,
     ) -> ReferenceResponse:
         """Get full memory details (Layer 3).
 
@@ -3140,6 +3226,9 @@ class MemoryService:
                 memory as it is. A historical read records no access stats.
                 An agent binding's per-memory type filter is judged on both
                 the live type and version N's (#2116).
+            key_workspace_id: #963 pure key scope: a memory of another
+                workspace is not found. None when the caller is not using a
+                workspace-scoped key.
 
         Returns:
             ReferenceResponse with full details
@@ -3150,9 +3239,13 @@ class MemoryService:
             UnknownVersionError: ``version`` is not a version of the memory
                 (a ``ValidationError``: 422 / ``validation_error``).
         """
-        memory = await self._load_readable_memory(memory_id, user_id)
+        memory = await self._load_readable_memory(
+            memory_id, user_id, key_workspace_id=key_workspace_id
+        )
         if version is not None and version != memory.version:
-            return await self._reference_historical(memory, user_id, version)
+            return await self._reference_historical(
+                memory, user_id, version, key_workspace_id=key_workspace_id
+            )
 
         # Snapshot ``updated_at`` before bumping access stats. #1317 removed
         # the column's ``onupdate=func.now()``, so ``update_access_stats`` no
@@ -3259,7 +3352,12 @@ class MemoryService:
         )
 
     async def _reference_historical(
-        self, memory: Memory, user_id: str, version: int
+        self,
+        memory: Memory,
+        user_id: str,
+        version: int,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> ReferenceResponse:
         """``reference(version=N)`` for an earlier version (#2043)."""
         from services.memory_versions import load_version
@@ -3277,7 +3375,11 @@ class MemoryService:
         if historical_type is None or (
             historical_type != memory.type
             and not await self._can_read_memory(
-                memory, user_id, memory_id=memory.id, memory_type=historical_type
+                memory,
+                user_id,
+                memory_id=memory.id,
+                memory_type=historical_type,
+                key_workspace_id=key_workspace_id,
             )
         ):
             raise NotFoundException("Memory", str(memory.id))
@@ -7122,6 +7224,7 @@ class MemoryService:
                     operation="forget",
                     memory_type=mtype,
                     memory_source_type=source,
+                    key_workspace_id=key_workspace_id,
                 )
             if not allowed_groups[group]:
                 return False
@@ -7270,6 +7373,9 @@ class MemoryService:
             request: Forget request (memory_id or query)
             user_id: User ID
             current_context_id: Current context UUID (Issue #82)
+            key_workspace_id: #963 pure key scope: the context and a
+                ``memory_id``'s own workspace must both be the key's (a
+                ``memory_id`` of another workspace: ``deleted_count=0``).
             _skip_binding_row_filter: INTERNAL maintenance callers only
                 (#1301) — the upsert replacement delete. Skips the #1299
                 per-memory type/source read filter while keeping the
@@ -7329,6 +7435,7 @@ class MemoryService:
                     # gate above still applies).
                     memory_type=None if _skip_binding_row_filter else memory.type,
                     memory_source_type=None if _skip_binding_row_filter else memory.source_type,
+                    key_workspace_id=key_workspace_id,
                 )
 
                 if not can_access:
@@ -7542,6 +7649,8 @@ class MemoryService:
         user_id: str,
         current_context_id: UUID | None = None,
         current_workspace_id: UUID | None = None,
+        *,
+        key_workspace_id: UUID | None = None,
     ) -> ExploreResponse:
         """Explore related memories via graph traversal with 3-level isolation.
 
@@ -7553,6 +7662,8 @@ class MemoryService:
             user_id: User ID
             current_context_id: Current context UUID
             current_workspace_id: Workspace ID
+            key_workspace_id: #963 pure key scope: a seed of another
+                workspace is not found.
 
         Returns:
             ExploreResponse with related memories
@@ -7605,6 +7716,7 @@ class MemoryService:
             memory_id=request.memory_id,
             memory_type=seed_memory.type,  # #1299: per-memory type/source filter
             memory_source_type=seed_memory.source_type,
+            key_workspace_id=key_workspace_id,
         )
 
         if not can_access:
