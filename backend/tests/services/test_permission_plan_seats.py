@@ -147,7 +147,7 @@ class TestContextRbac:
         with (
             _seat(_refused()) as seat,
             structlog.testing.capture_logs() as logs,
-            pytest.raises(AuthorizationError),
+            pytest.raises(NotFoundException),
         ):
             await service._check_context_access_rbac(USER, CTX, ContextRole.OWNER)
         seat.assert_not_awaited()
@@ -179,7 +179,7 @@ class TestContextRbac:
         ctx = _context(is_private=True)
         ctx.created_by = "someone-else"
         service.db.execute.return_value.scalar_one_or_none.return_value = ctx
-        with _seat(_refused()) as seat, pytest.raises(AuthorizationError):
+        with _seat(_refused()) as seat, pytest.raises(NotFoundException):
             await service._check_context_access_rbac(USER, CTX, ContextRole.VIEWER)
         seat.assert_not_awaited()
         service.workspace_service.get_member.assert_not_awaited()
@@ -293,7 +293,9 @@ class TestCanAccessMemory:
     def service(self):
         svc = PermissionService(MagicMock())
         svc.workspace_service.get_member = AsyncMock(
-            return_value=SimpleNamespace(id=7, user_id=USER, role=WorkspaceRole.MEMBER)
+            return_value=SimpleNamespace(
+                id=7, user_id=USER, role=WorkspaceRole.MEMBER, allowed_context_ids=[CTX]
+            )
         )
         return svc
 
@@ -345,8 +347,27 @@ class TestCanAccessMemory:
         seat.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_an_author_who_left_keeps_the_old_semantics(self, service) -> None:
+    async def test_the_owner_user_id_holder_reads_its_memory_without_a_row(self, service) -> None:
+        """The #1108 desync: the workspace's owner_user_id holder with no OWNER
+        row still reaches its own memories, as in the RBAC core."""
         service.workspace_service.get_member = AsyncMock(return_value=None)
+        service.db.get = AsyncMock(return_value=SimpleNamespace(owner_user_id=USER))
+        with patch(
+            "services.agent_binding_service.agent_binding_permits", AsyncMock(return_value=True)
+        ):
+            assert (
+                await service.can_access_memory(
+                    user_id=USER, memory_user_id=USER, workspace_id=WS, context_id=CTX
+                )
+                is True
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_author_who_left_the_workspace_is_refused(self, service) -> None:
+        """Writing a memory does not keep the context reachable: an author with
+        no membership row reaches nothing in the workspace."""
+        service.workspace_service.get_member = AsyncMock(return_value=None)
+        service.db.get = AsyncMock(return_value=SimpleNamespace(owner_user_id="someone-else"))
         with (
             _seat(_refused()) as seat,
             patch(
@@ -357,6 +378,6 @@ class TestCanAccessMemory:
                 await service.can_access_memory(
                     user_id=USER, memory_user_id=USER, workspace_id=WS, context_id=CTX
                 )
-                is True
+                is False
             )
         seat.assert_not_awaited()
