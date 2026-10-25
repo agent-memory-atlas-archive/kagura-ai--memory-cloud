@@ -11,7 +11,6 @@ from uuid import UUID
 from mcp.types import TextContent
 
 from mcp_server.tools._helpers import (
-    _check_viewer_permission,
     _ContextNotFoundError,
     _error_response,
     _log_tool_usage,
@@ -286,17 +285,18 @@ async def handle_create_edge(
     async for db in get_db():
         try:
             current_context_id = _resolve_context_id(args["context_id"])
-            context = await _resolve_context(db, user_id, current_context_id)
-
-            perm_error = await _check_viewer_permission(db, user_id, workspace_id, "create edges")
-            if perm_error:
-                return perm_error
+            # write_role: the member role on the context's own workspace, not
+            # the session's, before the capacity lock.
+            context = await _resolve_context(
+                db, user_id, current_context_id, write_role="create edges"
+            )
 
             # #1943: a content write — the context must hold a writable slot on the
             # plan. After the role gate, so a viewer still gets permission_denied.
             await plan_seats.ensure_context_writable(db, context)
 
-            ws_id = str(workspace_id) if workspace_id else str(context.workspace_id)
+            # The edge lives in the context's workspace, whatever the session's is.
+            ws_id = str(context.workspace_id)
             ctx_id = str(current_context_id)
 
             # Shared declared-edge core (#1321 duplicate contract + #1403 supersede
@@ -401,17 +401,18 @@ async def handle_update_edge(
     async for db in get_db():
         try:
             current_context_id = _resolve_context_id(args["context_id"])
-            context = await _resolve_context(db, user_id, current_context_id)
-
-            perm_error = await _check_viewer_permission(db, user_id, workspace_id, "update edges")
-            if perm_error:
-                return perm_error
+            # write_role: the member role on the context's own workspace, not
+            # the session's, before the capacity lock.
+            context = await _resolve_context(
+                db, user_id, current_context_id, write_role="update edges"
+            )
 
             # #1943: a content write — the context must hold a writable slot on the
             # plan. After the role gate, so a viewer still gets permission_denied.
             await plan_seats.ensure_context_writable(db, context)
 
-            ws_id = str(workspace_id) if workspace_id else str(context.workspace_id)
+            # The edge lives in the context's workspace, whatever the session's is.
+            ws_id = str(context.workspace_id)
             ctx_id = str(current_context_id)
 
             repo = NeuralEdgeRepository(db)
@@ -497,13 +498,14 @@ async def handle_delete_edge(
     async for db in get_db():
         try:
             current_context_id = _resolve_context_id(args["context_id"])
-            context = await _resolve_context(db, user_id, current_context_id)
+            # write_role: the member role on the context's own workspace, not
+            # the session's, before the capacity lock.
+            context = await _resolve_context(
+                db, user_id, current_context_id, write_role="delete edges"
+            )
 
-            perm_error = await _check_viewer_permission(db, user_id, workspace_id, "delete edges")
-            if perm_error:
-                return perm_error
-
-            ws_id = str(workspace_id) if workspace_id else str(context.workspace_id)
+            # The edge lives in the context's workspace, whatever the session's is.
+            ws_id = str(context.workspace_id)
             ctx_id = str(current_context_id)
 
             repo = NeuralEdgeRepository(db)

@@ -238,7 +238,7 @@ class _Resolvers:
             raise _locked()
         return _context(context_id)
 
-    async def check_write(self, _self, _user_id, context_id, *, capacity):
+    async def check_write(self, _self, _user_id, context_id, *, capacity, key_workspace_id=None):
         self.policies.append(capacity)
         if self.deny:
             raise NotFoundException("Context", str(context_id))
@@ -270,6 +270,11 @@ class _Resolvers:
                 new=lambda s, u, c: self.get_context(s, u, c),
             ),
             patch("mcp_server.tools._helpers.ensure_not_capacity_locked", self.lock),
+            # The write role a resolver checks before the lock: an owner.
+            patch(
+                "mcp_server.tools._helpers._get_workspace_member_role",
+                AsyncMock(return_value="owner"),
+            ),
         )
 
 

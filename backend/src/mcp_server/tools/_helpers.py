@@ -474,12 +474,31 @@ class _ContextNotFoundError(Exception):
         )
 
 
+class _WriteRoleRefusedError(_ContextNotFoundError):
+    """The caller reaches the context but may not write in it (a viewer).
+
+    A ``_ContextNotFoundError`` so every handler's existing resolver ``except``
+    answers it; its response is the ``permission_denied`` refusal of
+    ``_check_viewer_permission``, not a not-found.
+    """
+
+    def __init__(self, context_id: UUID, refusal: list[TextContent]):
+        super().__init__(context_id, "Write refused for this context.")
+        self.refusal = refusal
+
+    def to_response(self) -> ToolErrorContent:
+        if isinstance(self.refusal, ToolErrorContent):
+            return self.refusal
+        return ToolErrorContent(self.refusal)
+
+
 async def _resolve_context(
     db: "AsyncSession",
     user_id: str,
     context_id: UUID,
     *,
     operation: str | None = None,
+    write_role: str | None = None,
 ) -> Any:
     """Resolve and validate context access.
 
@@ -491,12 +510,19 @@ async def _resolve_context(
             (threaded by the memory write tools: remember / update / forget).
             ``None`` for callers outside that vocabulary — their binding
             denies stay log-only here.
+        write_role: The operation phrase of a write ("create memories") to
+            check the member role for, on the context's own workspace, after
+            every reach check and before the capacity lock, so a viewer is
+            told it is read-only rather than that the workspace is locked.
+            ``None`` skips it (the caller checks the role itself).
 
     Returns:
         Context object
 
     Raises:
         _ContextNotFoundError: If context not found or access denied
+        _WriteRoleRefusedError: ``write_role`` is set and the caller is a
+            viewer of the context's workspace (``permission_denied``)
         CapacityLockedError: #1954 — the running tool's policy is BLOCKED
             (``mcp_capacity_policy``) and the context's workspace is over its
             Free capacity; checked after every authorization step.
@@ -574,6 +600,13 @@ async def _resolve_context(
             raise _ContextNotFoundError(
                 context_id, "Context not found or you don't have access to it."
             )
+
+    # The member role for a write, on the context's own workspace (never the
+    # session's), once the caller is known to reach the context.
+    if write_role is not None:
+        refusal = await _check_viewer_permission(db, user_id, context.workspace_id, write_role)
+        if refusal:
+            raise _WriteRoleRefusedError(context_id, refusal)
 
     # #1954: the capacity-over lock, after every authorization step above, so
     # it never answers for a context the caller could not reach. Membership
@@ -873,23 +906,28 @@ async def _check_viewer_permission(
 ) -> list[TextContent] | None:
     """Check if user is a viewer (read-only). Returns error response if so, None otherwise.
 
+    A write tool that targets a context passes that context's own workspace
+    (``context.workspace_id`` from the resolver), never the session's: the
+    role that counts is the one in the workspace the write lands in.
+
     Args:
         db: Database session
         user_id: User ID
-        workspace_id: Workspace ID (None = skip check)
+        workspace_id: Workspace the write lands in. ``None`` is refused: there
+            is no role to check, so the write is not allowed.
         operation: Operation description for error message
 
     Returns:
-        Error response if viewer, None if allowed
+        Error response if viewer, not a member, or no workspace; None if allowed
     """
-    if not workspace_id:
-        return None
-
-    user_role = await _get_workspace_member_role(db, user_id, workspace_id)
+    user_role = (
+        await _get_workspace_member_role(db, user_id, workspace_id) if workspace_id else None
+    )
     if user_role is None:
-        # Caller is not a member of this workspace, OR the workspace is
+        # Caller is not a member of this workspace, the workspace is
         # soft-deleted (`_get_workspace_member_role` filters Workspace.deleted_at
-        # IS NULL). Either way: deny writes (fail-closed).
+        # IS NULL), or no workspace was given. Every case: deny writes
+        # (fail-closed).
         return _error_response(
             "permission_denied",
             f"Cannot {operation}: workspace not accessible.",
@@ -897,15 +935,22 @@ async def _check_viewer_permission(
             required_role="member",
             help="Verify the workspace is active and you are a member with at least 'member' role.",
         )
-    if user_role == "viewer":
-        return _error_response(
-            "permission_denied",
-            f"Viewers have read-only access. Cannot {operation}.",
-            your_role="viewer",
-            required_role="member",
-            help="Contact your workspace owner to upgrade your role to 'member' for write access.",
-        )
+    from services.permission_service import is_below_member_role
+
+    if is_below_member_role(user_role):
+        return _viewer_read_only_response(operation, your_role=str(user_role))
     return None
+
+
+def _viewer_read_only_response(operation: str, *, your_role: str = "viewer") -> ToolErrorContent:
+    """``permission_denied`` for a write by a workspace viewer (read-only)."""
+    return _error_response(
+        "permission_denied",
+        f"Viewers have read-only access. Cannot {operation}.",
+        your_role=your_role,
+        required_role="member",
+        help="Contact your workspace owner to upgrade your role to 'member' for write access.",
+    )
 
 
 # ============================================================================

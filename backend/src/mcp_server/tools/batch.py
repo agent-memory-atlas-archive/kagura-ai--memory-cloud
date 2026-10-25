@@ -27,7 +27,6 @@ from mcp_server.tools._arg_coercion import (
 )
 from mcp_server.tools._errors import is_caller_value_error
 from mcp_server.tools._helpers import (
-    _check_viewer_permission,
     _context_response_fields,
     _ContextNotFoundError,
     _dumps,
@@ -57,6 +56,7 @@ from services.memory_service import (
     DedupeUnavailableError,
     DuplicateCandidateError,
 )
+from services.permission_service import VIEWER_READ_ONLY_REASON
 from utils.exceptions import (
     AuthorizationError,
     ContentSizeExceededError,
@@ -161,6 +161,8 @@ def item_error(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, QuotaExceededError):
         return {"error": "quota_exceeded", "message": str(exc)}
     if isinstance(exc, AuthorizationError):
+        if exc.reason == VIEWER_READ_ONLY_REASON:
+            return {"error": "forbidden", "message": "viewers have read-only access"}
         return {
             "error": "forbidden",
             "message": "marking a memory as a tool guardrail needs the context editor role",
@@ -306,14 +308,13 @@ async def handle_remember_batch(
         context_id: UUID | None = None
         try:
             context_id = _resolve_context_id(args["context_id"])
-            perm_error = await _check_viewer_permission(
-                db, user_id, workspace_id, "create memories"
-            )
-            if perm_error:
-                return perm_error
             # operation="remember": the items are remembers, and the memory-access
             # audit vocabulary (MAE_OPERATIONS) has no batch entry.
-            context = await _resolve_context(db, user_id, context_id, operation="remember")
+            # write_role: the member role on the context's own workspace, not
+            # the session's.
+            context = await _resolve_context(
+                db, user_id, context_id, operation="remember", write_role="create memories"
+            )
             # Read now: a failing item rolls the session back, which expires
             # this instance (reading it afterwards would be a lazy load outside
             # the async greenlet).

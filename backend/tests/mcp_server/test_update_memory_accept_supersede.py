@@ -39,7 +39,7 @@ def _result(**overrides):
 
 
 @contextlib.contextmanager
-def _patched(service, *, role=None):
+def _patched(service, *, role="member"):
     db = AsyncMock()
 
     async def mock_get_db():
@@ -48,10 +48,23 @@ def _patched(service, *, role=None):
     context = SimpleNamespace(
         id=uuid4(), name="ctx", last_used_at=None, workspace_id=uuid4(), is_private=False
     )
+
+    async def resolve(db, user_id, context_id, *, operation=None, write_role=None):
+        # The resolver's own role step, on the context's workspace.
+        from mcp_server.tools import _helpers
+
+        if write_role is not None:
+            refusal = await _helpers._check_viewer_permission(
+                db, user_id, context.workspace_id, write_role
+            )
+            if refusal:
+                raise _helpers._WriteRoleRefusedError(context_id, refusal)
+        return context
+
     with (
         patch("db.base.get_db", new=mock_get_db),
-        patch("mcp_server.tools.memory._resolve_context", new=AsyncMock(return_value=context)),
-        patch("mcp_server.tools.edge._resolve_context", new=AsyncMock(return_value=context)),
+        patch("mcp_server.tools.memory._resolve_context", new=resolve),
+        patch("mcp_server.tools.edge._resolve_context", new=resolve),
         patch("mcp_server.tools.memory._context_response_fields", return_value={}),
         patch("mcp_server.tools.memory._touch_context_last_used", new=AsyncMock()),
         patch("mcp_server.tools.memory._log_tool_usage", new=AsyncMock()),
@@ -65,7 +78,7 @@ def _patched(service, *, role=None):
         yield db
 
 
-async def _call(service, args, *, role=None, workspace_id=None):
+async def _call(service, args, *, role="member", workspace_id=None):
     with _patched(service, role=role):
         result = await handle_update_memory(
             {"context_id": str(uuid4()), **args}, user_id="u1", workspace_id=workspace_id
