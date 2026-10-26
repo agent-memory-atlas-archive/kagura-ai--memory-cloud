@@ -44,6 +44,7 @@ from models.erasure import (
     ErasureRequest,
 )
 from services.account_erasure_service import AccountErasureService, _audit_salt
+from services.erasure_details import erasure_pseudonym
 from utils.datetime import to_naive_utc, utcnow
 from utils.exceptions import ErasureAlreadyInProgressError
 from utils.hashing import sha256_hex
@@ -120,6 +121,9 @@ async def erasure_scenario(db_session: AsyncSession):
         resource=f"user:{target_email}",
         old_value_hash="user",
         new_value_hash="admin",
+        # #2345: the subject's request metadata, cleared by the erasure
+        ip_address="203.0.113.5",
+        user_agent="ua",
     )
     db_session.add(prior_audit)
     await db_session.commit()
@@ -192,10 +196,18 @@ def patched_external_stores():
 
 @pytest_asyncio.fixture
 async def other_actors_audit(db_session: AsyncSession, erasure_scenario):
-    """#2287: audit rows the target's erasure must leave byte-identical — the
-    other member acting on the target (``resource`` names the target's
-    email: out of scope, the row's ``user_id`` is not the target's) and a
-    third account acting on itself."""
+    """Other actors' audit rows around the target (#2287, #2298), in order:
+
+    0. the other member acting on the target (``resource`` names the
+       target's email): only ``resource`` changes, to the email pseudonym —
+       the acting member's IP stays;
+    1. the target acting as an admin on the other member (``user_email`` is
+       the target's, ``user_id`` and ``resource`` the other's): ``user_email``
+       changes and the target's IP / user agent are cleared;
+    2. a third account acting on itself, with an IP: byte-identical;
+    3. a look-alike ``resource`` (the target's email plus a suffix):
+       byte-identical — exact values only, never a substring.
+    """
     target_email = erasure_scenario["target_email"]
     other = erasure_scenario["other_user_id"]
     rows = [
@@ -204,12 +216,29 @@ async def other_actors_audit(db_session: AsyncSession, erasure_scenario):
             user_id=other,
             action="role_assign",
             resource=f"user:{target_email}",
+            ip_address="198.51.100.20",
+            user_agent="admin-agent",
+        ),
+        AuditLog(
+            user_email=target_email,
+            user_id=other,
+            action="role_assign",
+            resource=f"user:{other}@example.com",
+            ip_address="198.51.100.21",
+            user_agent="target-agent",
         ),
         AuditLog(
             user_email="third@example.com",
             user_id=f"third_{uuid4().hex[:8]}",
             action="password_set",
             resource="user:third@example.com",
+            ip_address="198.51.100.22",
+        ),
+        AuditLog(
+            user_email=f"{other}@example.com",
+            user_id=other,
+            action="role_assign",
+            resource=f"user:{target_email}-x",
         ),
     ]
     db_session.add_all(rows)
@@ -272,6 +301,8 @@ class TestAdminForceEraseHappyPath:
             initiator_user_id="admin-runner",
             reason_code=REASON_USER_REQUEST_VIA_SUPPORT,
             reason_detail="integration test",
+            ip_address="203.0.113.9",
+            user_agent="agent",
         )
 
         # The erasure_requests row reached terminal complete with a summary.
@@ -284,9 +315,26 @@ class TestAdminForceEraseHappyPath:
         # target).
         assert request.deleted_data_summary["postgres"]["audit_logs_pseudonymized"] >= 1
         assert "audit_logs_pseudonymized" not in request.deleted_data_summary
-        # every other actor's audit rows are byte-identical (#2287), the
-        # admin's row about the target included (out of scope)
-        assert await _audit_rows_snapshot(db_session, other_actors_audit) == others_before
+        # #2298: the rows naming the target change in that one value only;
+        # every other actor's row is byte-identical
+        assert request.deleted_data_summary["postgres"]["audit_mentions_pseudonymized"] == 2
+        others_after = await _audit_rows_snapshot(db_session, other_actors_audit)
+        about, by_target, third, lookalike = other_actors_audit
+        email_pseudonym = erasure_pseudonym(target_email)
+        assert others_after[about] == {
+            **others_before[about],
+            "resource": f"user:{email_pseudonym}",
+        }
+        # the target was the actor there: their IP / UA go too (#2345)
+        assert others_after[by_target] == {
+            **others_before[by_target],
+            "user_email": email_pseudonym,
+            "ip_address": None,
+            "user_agent": None,
+        }
+        assert others_after[about]["ip_address"] == "198.51.100.20"  # the admin's
+        for row_id in (third, lookalike):
+            assert others_after[row_id] == others_before[row_id]
 
         # User row is gone.
         result = await db_session.execute(select(User).where(User.user_id == target_user_id))
@@ -322,6 +370,8 @@ class TestAdminForceEraseHappyPath:
         # the legal-retention table (Copilot loop 3 finding).
         assert target_email not in (prior.resource or "")
         assert target_user_id not in (prior.resource or "")
+        # #2345: the subject's IP / user agent leave their own rows
+        assert (prior.ip_address, prior.user_agent) == (None, None)
 
         # The new "account_erasure" audit row is also pseudonymized at
         # insert — guards against the regression PR-review caught
@@ -342,11 +392,47 @@ class TestAdminForceEraseHappyPath:
         # so it stays plaintext — the assertion below uses target_user_id,
         # which would only appear if self-service had leaked it.
         assert new_audit.user_metadata is not None
-        assert new_audit.user_metadata.get("initiated_by") != target_user_id
+        assert new_audit.user_metadata.get("initiated_by") == "admin-runner"
         # And no plaintext email/user_id anywhere else in user_metadata.
         metadata_repr = repr(new_audit.user_metadata)
         assert target_email not in metadata_repr
         assert target_user_id not in metadata_repr
+        # #2345: no request metadata on the row, the admin's included (the
+        # request row clears both too)
+        assert (new_audit.ip_address, new_audit.user_agent) == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_a_self_initiated_admin_request_pseudonymizes_initiated_by(
+        self, db_session: AsyncSession, erasure_scenario, patched_external_stores
+    ):
+        """#2345: ``initiated_by`` equal to the subject is pseudonymized on the
+        audit row like on the request row, though ``is_self_service`` is
+        False (the admin route refuses this; the service does not)."""
+        target_user_id = erasure_scenario["target_user_id"]
+
+        request = await AccountErasureService(db_session).admin_force_erase(
+            target_user_id=target_user_id,
+            initiator_user_id=target_user_id,
+            reason_code=REASON_USER_REQUEST_VIA_SUPPORT,
+            reason_detail="integration test (#2345)",
+            ip_address="203.0.113.9",
+            user_agent="agent",
+        )
+
+        pseudonym = erasure_pseudonym(target_user_id)
+        assert (request.user_id, request.initiated_by) == (pseudonym, pseudonym)
+        audit = (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "account_erasure",
+                    AuditLog.user_metadata["request_id"].as_string() == str(request.id),
+                )
+            )
+        ).scalar_one()
+        assert audit.user_metadata["is_self_service"] is False
+        assert audit.user_metadata["initiated_by"] == pseudonym
+        assert (audit.ip_address, audit.user_agent) == (None, None)
+        assert target_user_id not in repr(audit.user_metadata)
 
 
 class TestAuditLogFailureRollsThePostgresStepBack:
@@ -357,12 +443,21 @@ class TestAuditLogFailureRollsThePostgresStepBack:
     request can retry."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failing",
+        [
+            "services.account_erasure_service.AccountErasureService._pseudonymize_audit_logs",
+            # #2298: after the own rows' UPDATE ran in the transaction
+            "services.erasure_details.pseudonymize_audit_mentions",
+        ],
+    )
     async def test_an_audit_log_failure_rolls_the_postgres_step_back(
         self,
         db_session: AsyncSession,
         erasure_scenario,
         other_actors_audit,
         patched_external_stores,
+        failing: str,
     ):
         from models.erasure import FAILURE_AFTER_POSTGRES_COMMIT, STATUS_FAILED
 
@@ -370,11 +465,7 @@ class TestAuditLogFailureRollsThePostgresStepBack:
         tables = ("users", "audit_logs", "api_keys", "memories", "memory_revisions")
         before = {table: await _table_snapshot(db_session, table) for table in tables}
 
-        with patch.object(
-            AccountErasureService,
-            "_pseudonymize_audit_logs",
-            AsyncMock(side_effect=RuntimeError("audit_logs unavailable")),
-        ):
+        with patch(failing, AsyncMock(side_effect=RuntimeError("audit_logs unavailable"))):
             with pytest.raises(RuntimeError):
                 await AccountErasureService(db_session).admin_force_erase(
                     target_user_id=target,

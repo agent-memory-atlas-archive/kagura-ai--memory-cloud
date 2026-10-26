@@ -130,6 +130,7 @@ from services.billing_contract import (
 )
 from services.email_service import EmailService, get_email_service
 from services.erasure_details import (
+    ERASURE_AUDIT_ACTION,
     RestoreReport,
     StripCounts,
     erase_subject_details,
@@ -138,7 +139,7 @@ from services.erasure_details import (
     lock_subject_memories,
     locked_ids,
     payload_counts,
-    pseudonymize_audit_logs,
+    pseudonymize_audit_trail,
     pseudonymize_revision_actor,
     pseudonymized_request_values,
     strip_subject_details,
@@ -1241,7 +1242,9 @@ class AccountErasureService:
             postgres.update(payload_counts(erased.restore))
 
             # Step 4 (the audit_logs pseudonymize) runs inside the Postgres
-            # step since #2287: ``counts["audit_logs_pseudonymized"]``.
+            # step since #2287: ``counts["audit_logs_pseudonymized"]``, and the
+            # rows mentioning the subject since #2298:
+            # ``counts["audit_mentions_pseudonymized"]``.
 
             # Step 5: Redis cleanup (best-effort)
             step = "redis"
@@ -1927,11 +1930,14 @@ class AccountErasureService:
         # keeps its ids and can be retried) instead of leaving the raw sub and
         # email on the rows after the commit. Last before the user delete, so
         # nothing this transaction writes to audit_logs could be missed
-        # (nothing does today). No new lock order: these rows are the
-        # subject's alone and every other writer only inserts.
-        counts["audit_logs_pseudonymized"] = await self._pseudonymize_audit_logs(
-            user_id, target.email
-        )
+        # (nothing does today). #2298: other actors' rows that name the
+        # subject by an exact value (``user_email``, ``resource =
+        # 'user:'||email``) are rewritten in the same step, under one
+        # id-ordered lock over both sets; every other writer only inserts.
+        (
+            counts["audit_logs_pseudonymized"],
+            counts["audit_mentions_pseudonymized"],
+        ) = await self._pseudonymize_audit_logs(user_id, target.email)
         counts["users"] = 1  # deleted below, in this transaction
 
         # #2286: "this step committed", on the request row and in the same
@@ -2332,10 +2338,15 @@ class AccountErasureService:
         result = cast(CursorResult[Any], await self.db.execute(statement))
         return result.rowcount or 0
 
-    async def _pseudonymize_audit_logs(self, user_id: str, email: str) -> int:
-        """The subject's audit rows (``erasure_details.pseudonymize_audit_logs``),
-        in ``_delete_postgres``'s transaction (#2287)."""
-        return await pseudonymize_audit_logs(self.db, user_id, [email])
+    async def _pseudonymize_audit_logs(self, user_id: str, email: str) -> tuple[int, int]:
+        """The subject's audit rows and the rows mentioning them
+        (``erasure_details.pseudonymize_audit_trail``), in
+        ``_delete_postgres``'s transaction (#2287, #2298).
+
+        Returns:
+            ``(own rows, mentions)`` rowcounts.
+        """
+        return await pseudonymize_audit_trail(self.db, user_id, [email])
 
     async def _clear_redis(self, user_id: str) -> dict[str, int]:
         """Best-effort Redis cleanup. Failures are logged inside helpers."""
@@ -2362,28 +2373,30 @@ class AccountErasureService:
     ) -> None:
         """Append the canonical `account_erasure` audit row, fully pseudonymized.
 
-        This row is born AFTER the bulk pseudonymize step (Step 5) ran, so
-        we cannot rely on a later sweep to scrub it. Inline pseudonymization
-        guarantees no plaintext email or user_id ever lands in audit_logs
-        for this event — required for GDPR Art.5(1)(c) compliance.
+        This row is born AFTER the audit-log pseudonymize step ran (inside the
+        Postgres step), so we cannot rely on a later sweep to scrub it. Inline
+        pseudonymization guarantees no plaintext email or user_id ever lands
+        in audit_logs for this event — required for GDPR Art.5(1)(c)
+        compliance. The row carries no ``ip_address`` / ``user_agent``
+        (#2345): the request row clears both once the subject is erased, the
+        admin-initiated case included, and this row follows it.
         """
         # #2288: the same derivation as every other pseudonym of the subject
         user_pseudonym = erasure_pseudonym(target.user_id)
         email_pseudonym = erasure_pseudonym(target.email)
-        # Self-service `initiated_by` IS the subject's raw user_id (the
-        # user clicked their own delete button). Storing it verbatim in
-        # audit_logs.user_metadata would re-introduce a stable plaintext
-        # identifier for the erased user — a regression of the
-        # pseudonymization invariant the rest of this row enforces.
-        # Admin path `initiated_by` is the admin's user_id (NOT the
-        # erased subject), which is legitimate audit-trail information
-        # and stays plaintext.
-        initiated_by_value = user_pseudonym if request.is_self_service else request.initiated_by
+        # #2345: the request row's rule (``pseudonymized_request_values``):
+        # `initiated_by` is the pseudonym iff it is the subject's own sub —
+        # decided by comparing with the subject, not by `is_self_service`
+        # (an admin request the subject started themselves is the subject's
+        # sub too). Another admin's id is audit-trail evidence and stays.
+        initiated_by_value = (
+            user_pseudonym if request.initiated_by == request.user_id else request.initiated_by
+        )
         self.db.add(
             AuditLog(
                 user_email=email_pseudonym,
                 user_id=user_pseudonym,
-                action="account_erasure",
+                action=ERASURE_AUDIT_ACTION,
                 resource=f"user_pseudonym:{user_pseudonym[:16]}",
                 user_metadata={
                     "request_id": str(request.id),
@@ -2392,8 +2405,6 @@ class AccountErasureService:
                     "reason_code": request.reason_code,
                     "deleted_data_summary": summary,
                 },
-                ip_address=request.ip_address,
-                user_agent=request.user_agent,
             )
         )
         await self.db.commit()
