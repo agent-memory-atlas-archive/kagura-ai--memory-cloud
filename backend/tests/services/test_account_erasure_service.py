@@ -677,6 +677,14 @@ class TestConfirmSelfService:
 # ---------------------------------------------------------------------------
 
 
+def _lost_cas() -> MagicMock:
+    """The cancel's compare-and-set result when it matched nothing: no
+    ``RETURNING`` row (#2304)."""
+    result = MagicMock(rowcount=0)
+    result.first.return_value = None
+    return result
+
+
 def _cancel_update_params(svc: AccountErasureService) -> dict:
     """The params of the cancel's compare-and-set UPDATE (#2282 review)."""
     from sqlalchemy.sql.dml import Update
@@ -741,7 +749,7 @@ class TestCancelSelfService:
         claimed.id = request.id
         now_row = MagicMock()
         now_row.scalar_one_or_none.return_value = claimed
-        svc.db.execute = AsyncMock(side_effect=[MagicMock(rowcount=0), now_row])
+        svc.db.execute = AsyncMock(side_effect=[_lost_cas(), now_row])
 
         with pytest.raises(ErasureAlreadyInProgressError) as caught:
             await svc.cancel_self_service(user_id="u-1")
@@ -2733,6 +2741,8 @@ class TestAVectorStoreOutageReschedulesTheRequest:
         svc = _service()
         _stub_execute_steps(svc)
         order = _recording_execute(svc)
+        # #2304: the re-queue after the give-up has its own tests below
+        svc._requeue_after_vector_store_failure = AsyncMock()
         request = _execute_request(self_service=True)
         request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
 
@@ -3107,3 +3117,489 @@ async def test_admin_force_erase_forwards_the_reschedule():
     assert caught.value.status_code == 503
     assert caught.value.details["request_id"] == "r-1"
     svc._execute.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# #2304: re-queue embeddings after a cancelled or failed vector-store retry
+# ---------------------------------------------------------------------------
+
+
+def _spent_request(attempts: int | None) -> ErasureRequest:
+    """A self-service ``cooling_off`` request; ``attempts`` spent at step 1
+    (``None``: no ``retry`` block at all)."""
+    request = ErasureRequest(
+        user_id="u-1",
+        user_email_hash="x",
+        initiated_by="u-1",
+        is_self_service=True,
+        reason_code=REASON_SELF_SERVICE,
+        status=STATUS_COOLING_OFF,
+    )
+    request.id = uuid4()
+    if attempts is not None:
+        request.deleted_data_summary = {
+            "retry": {
+                "attempts": attempts,
+                "step": "vector_store",
+                "error_class": "QdrantError",
+                "last_attempt_at": "2026-10-01T12:00:00Z",
+            }
+        }
+    return request
+
+
+def _erasure_request_updates(order: list[Any]) -> list[Any]:
+    from sqlalchemy.sql.dml import Update
+
+    return [s for s in order if isinstance(s, Update) and str(s.table) == "erasure_requests"]
+
+
+def _summary_update_params(stmt: Any) -> dict[str, Any]:
+    """The JSONB merged into ``deleted_data_summary`` by the re-queue's
+    summary UPDATE, and its guard."""
+    from sqlalchemy.dialects import postgresql
+
+    compiled = stmt.compile(dialect=postgresql.dialect())
+    params = compiled.params
+    merged = [v for v in params.values() if isinstance(v, dict) and "retry" in v]
+    assert len(merged) == 1, params
+    return {"sql": str(compiled), "params": params, "merged": merged[0]}
+
+
+def _cas_returns(svc: AccountErasureService, summary: dict[str, Any] | None) -> None:
+    """The cancel's compare-and-set returns ``summary`` as the moved row's
+    (``RETURNING deleted_data_summary``, #2304); other statements as before."""
+    from sqlalchemy.sql.dml import Update
+
+    inner = svc.db.execute
+
+    async def _execute(stmt, *a, **k):
+        result = await inner(stmt, *a, **k)
+        if isinstance(stmt, Update) and stmt._returning:
+            result.first = MagicMock(return_value=SimpleNamespace(deleted_data_summary=summary))
+        return result
+
+    svc.db.execute = AsyncMock(side_effect=_execute)
+
+
+class TestRequeueAfterACancelledRetry:
+    @pytest.mark.asyncio
+    async def test_a_cancel_after_a_spent_attempt_requeues_after_the_commit(self):
+        from sqlalchemy.sql.dml import Update
+
+        svc = _service()
+        request = _spent_request(1)
+        svc._find_active_request = AsyncMock(return_value=request)
+        order = _recording_execute(svc)
+        _cas_returns(svc, request.deleted_data_summary)
+        svc.db.refresh = AsyncMock(side_effect=lambda row: order.append("refresh"))
+        requeue = AsyncMock(side_effect=lambda db, user_id: order.append("requeue") or 3)
+
+        with patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue):
+            result = await svc.cancel_self_service(user_id="u-1")
+
+        assert result is request
+        requeue.assert_awaited_once_with(svc.db, "u-1")
+        cas, summary_update = _erasure_request_updates(order)
+        assert order == [cas, "commit", "requeue", summary_update, "commit", "refresh"]
+        assert isinstance(cas, Update)
+        assert cas.compile().params["status"] == STATUS_CANCELLED
+        got = _summary_update_params(summary_update)
+        # guarded by id + the terminal status
+        assert got["params"]["id_1"] == request.id
+        assert got["params"]["status_1"] == STATUS_CANCELLED
+        retry = got["merged"]["retry"]
+        assert {k: v for k, v in retry.items() if k != "requeued_at"} == {
+            "attempts": 1,
+            "step": "vector_store",
+            "error_class": "QdrantError",
+            "last_attempt_at": "2026-10-01T12:00:00Z",
+            "embeddings_requeued": 3,
+        }
+        assert retry["requeued_at"].endswith("Z")
+        assert "u-1" not in repr(got["merged"])
+
+    @pytest.mark.parametrize("attempts", [None, 0])
+    @pytest.mark.asyncio
+    async def test_a_cancel_without_a_spent_attempt_requeues_nothing(self, attempts):
+        svc = _service()
+        request = _spent_request(attempts)
+        svc._find_active_request = AsyncMock(return_value=request)
+        order = _recording_execute(svc)
+        _cas_returns(svc, request.deleted_data_summary)
+        requeue = AsyncMock(return_value=0)
+
+        with patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue):
+            await svc.cancel_self_service(user_id="u-1")
+
+        requeue.assert_not_awaited()
+        assert len(_erasure_request_updates(order)) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_gate_reads_the_row_the_cancel_moved(self):
+        """A run that rescheduled the request between the cancel's read and
+        its compare-and-set spent an attempt: the CAS's ``RETURNING`` row
+        decides, not the earlier read."""
+        svc = _service()
+        request = _spent_request(None)  # read before the run
+        svc._find_active_request = AsyncMock(return_value=request)
+        order = _recording_execute(svc)
+        moved = _spent_request(1).deleted_data_summary
+        _cas_returns(svc, moved)
+        requeue = AsyncMock(return_value=2)
+
+        with patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue):
+            await svc.cancel_self_service(user_id="u-1")
+
+        requeue.assert_awaited_once_with(svc.db, "u-1")
+        cas, summary_update = _erasure_request_updates(order)
+        assert "RETURNING erasure_requests.deleted_data_summary" in str(cas)
+        retry = _summary_update_params(summary_update)["merged"]["retry"]
+        assert retry["attempts"] == 1
+        assert retry["embeddings_requeued"] == 2
+
+    @pytest.mark.asyncio
+    async def test_a_lost_cancel_requeues_nothing(self):
+        svc = _service()
+        svc._find_active_request = AsyncMock(return_value=_spent_request(2))
+        now_status = MagicMock()
+        # #2306: the lost compare-and-set re-reads the row as the caller's
+        now_status.scalar_one_or_none.return_value = MagicMock(status="in_progress")
+        svc.db.execute = AsyncMock(side_effect=[_lost_cas(), now_status])
+        requeue = AsyncMock(return_value=0)
+
+        with patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue):
+            with pytest.raises(ErasureAlreadyInProgressError):
+                await svc.cancel_self_service(user_id="u-1")
+
+        requeue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_requeue_does_not_fail_the_cancel(self):
+        svc = _service()
+        request = _spent_request(1)
+        svc._find_active_request = AsyncMock(return_value=request)
+        order = _recording_execute(svc)
+        _cas_returns(svc, request.deleted_data_summary)
+        requeue = AsyncMock(side_effect=ConnectionError("Key (user_id)=(u-1) lost"))
+
+        with (
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            result = await svc.cancel_self_service(user_id="u-1")
+
+        assert result is request
+        assert order[-1] == "rollback"
+        assert len(_erasure_request_updates(order)) == 1  # no summary write
+        log.error.assert_called_once_with(
+            "erasure_embeddings_requeue_failed",
+            request_id=str(request.id),
+            error_class="ConnectionError",
+        )
+        svc.db.refresh.assert_awaited_once_with(request)
+
+    @pytest.mark.asyncio
+    async def test_an_unrecorded_count_is_logged_not_raised(self):
+        svc = _service()
+        request = _spent_request(1)
+        svc._find_active_request = AsyncMock(return_value=request)
+        svc.db.execute = AsyncMock(side_effect=[MagicMock(rowcount=1), MagicMock(rowcount=0)])
+        _cas_returns(svc, request.deleted_data_summary)
+
+        with (
+            patch(
+                "services.account_erasure_service.requeue_subject_embeddings",
+                new=AsyncMock(return_value=2),
+            ),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            await svc.cancel_self_service(user_id="u-1")
+
+        log.warning.assert_called_once_with(
+            "erasure_embeddings_requeue_unrecorded", request_id=str(request.id), memories=2
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_requeue_logs_carry_no_account_id(self):
+        svc = _service()
+        request = _spent_request(1)
+        svc._find_active_request = AsyncMock(return_value=request)
+        svc.db.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+        _cas_returns(svc, request.deleted_data_summary)
+
+        with (
+            patch(
+                "services.account_erasure_service.requeue_subject_embeddings",
+                new=AsyncMock(return_value=4),
+            ),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            await svc.cancel_self_service(user_id="u-1")
+
+        requeued = [
+            c for c in log.info.call_args_list if c.args[0] == "erasure_embeddings_requeued"
+        ]
+        assert len(requeued) == 1
+        assert requeued[0].kwargs["memories"] == 4
+        assert "u-1" not in repr(requeued)
+
+
+class TestRequeueAfterTheLastAttempt:
+    @pytest.mark.asyncio
+    async def test_the_last_attempt_requeues_after_the_failure_commit(self):
+        from models.erasure import STATUS_FAILED
+        from utils.exceptions import QdrantError
+
+        svc = _service()
+        _stub_execute_steps(svc)
+        order = _recording_execute(svc)
+        request = _execute_request(self_service=True)
+        request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
+        requeue = AsyncMock(side_effect=lambda db, user_id: order.append("requeue") or 7)
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=QdrantError("connection refused")),
+            ),
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+        ):
+            with pytest.raises(QdrantError):
+                await svc._execute(request, _user())
+
+        requeue.assert_awaited_once_with(svc.db, "u-1")
+        failure, summary_update = _erasure_request_updates(order)
+        assert order[-6:] == ["rollback", failure, "commit", "requeue", summary_update, "commit"]
+        assert failure.compile().params["status"] == STATUS_FAILED
+        got = _summary_update_params(summary_update)
+        assert got["params"]["id_1"] == request.id
+        assert got["params"]["status_1"] == STATUS_FAILED
+        retry = got["merged"]["retry"]
+        assert retry["attempts"] == 4
+        assert retry["embeddings_requeued"] == 7
+
+    @pytest.mark.asyncio
+    async def test_a_stale_run_requeues_nothing(self):
+        """#2306: the failure UPDATE is guarded by this run's claim; when it
+        matched nothing (a newer run owns the row) nothing is re-queued."""
+        from utils.exceptions import QdrantError
+
+        svc = _service()
+        _stub_execute_steps(svc)
+        _recording_execute(svc, rowcount=0)
+        request = _execute_request(self_service=True)
+        request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
+        requeue = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=QdrantError("connection refused")),
+            ),
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            with pytest.raises(QdrantError):
+                await svc._execute(request, _user())
+
+        requeue.assert_not_awaited()
+        log.warning.assert_any_call("erasure_failure_handler_stale_run", request_id=str(request.id))
+
+    @pytest.mark.asyncio
+    async def test_a_failed_requeue_keeps_the_vector_store_error(self):
+        from utils.exceptions import QdrantError
+
+        svc = _service()
+        _stub_execute_steps(svc)
+        _recording_execute(svc)
+        request = _execute_request(self_service=True)
+        request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=QdrantError("connection refused")),
+            ),
+            patch(
+                "services.account_erasure_service.requeue_subject_embeddings",
+                new=AsyncMock(side_effect=RuntimeError("lock timeout")),
+            ),
+        ):
+            with pytest.raises(QdrantError):
+                await svc._execute(request, _user())
+
+    @pytest.mark.asyncio
+    async def test_a_rescheduled_attempt_requeues_nothing(self):
+        from utils.exceptions import ErasureRetryScheduledError, QdrantError
+
+        svc = _service()
+        _stub_execute_steps(svc)
+        _recording_execute(svc)
+        requeue = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=QdrantError("down")),
+            ),
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+        ):
+            with pytest.raises(ErasureRetryScheduledError):
+                await svc._execute(_execute_request(self_service=True), _user())
+
+        requeue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_another_error_at_step_one_requeues_nothing(self):
+        svc = _service()
+        _stub_execute_steps(svc)
+        _recording_execute(svc)
+        request = _execute_request(self_service=True)
+        request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
+        requeue = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=RuntimeError("bad config")),
+            ),
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+        ):
+            with pytest.raises(RuntimeError):
+                await svc._execute(request, _user())
+
+        requeue.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_vector_store_error_at_a_later_step_requeues_nothing(self):
+        from utils.exceptions import QdrantError
+
+        svc = _service()
+        _stub_execute_steps(svc)
+        svc._delete_postgres = AsyncMock(side_effect=QdrantError("down"))
+        _recording_execute(svc)
+        request = _execute_request(self_service=True)
+        request.deleted_data_summary = {"retry": {"attempts": 3, "step": "vector_store"}}
+        requeue = AsyncMock(return_value=0)
+
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(return_value={"kagura_memories": 0}),
+            ),
+            patch("services.account_erasure_service.requeue_subject_embeddings", new=requeue),
+        ):
+            with pytest.raises(QdrantError):
+                await svc._execute(request, _user())
+
+        requeue.assert_not_awaited()
+
+
+class TestRequeueSubjectEmbeddings:
+    @staticmethod
+    def _db(batches: list[list[Any]]) -> tuple[MagicMock, list[Any]]:
+        """A session recording statements and commits; each UPDATE returns
+        the next batch of ids."""
+        from sqlalchemy.sql.dml import Update
+
+        db = MagicMock()
+        order: list[Any] = []
+        pending = iter(batches)
+
+        def _execute(stmt, *a, **k):
+            order.append(stmt)
+            result = MagicMock()
+            if isinstance(stmt, Update):
+                result.scalars.return_value.all.return_value = next(pending)
+            return result
+
+        db.execute = AsyncMock(side_effect=_execute)
+        db.commit = AsyncMock(side_effect=lambda: order.append("commit"))
+        return db, order
+
+    @pytest.mark.asyncio
+    async def test_batches_on_a_keyset_until_a_short_one(self):
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.sql.elements import TextClause
+
+        from services.account_erasure_service import (
+            EMBEDDING_REQUEUE_BATCH,
+            requeue_subject_embeddings,
+        )
+
+        assert EMBEDDING_REQUEUE_BATCH == 500
+        first_ids = sorted(uuid4() for _ in range(500))
+        db, order = self._db([first_ids, [uuid4() for _ in range(3)]])
+
+        assert await requeue_subject_embeddings(db, "u-1") == 503
+
+        timeout1, first, commit1, timeout2, second, commit2 = order
+        assert (commit1, commit2) == ("commit", "commit")
+        for timeout in (timeout1, timeout2):
+            # each batch's transaction bounds its lock wait
+            assert isinstance(timeout, TextClause)
+            assert str(timeout) == "SET LOCAL lock_timeout = '5s'"
+        sqls = []
+        for stmt in (first, second):
+            assert str(stmt.table) == "memories"
+            assert stmt.get_execution_options()["synchronize_session"] is False
+            compiled = stmt.compile(dialect=postgresql.dialect())
+            sql = " ".join(str(compiled).split())
+            params = compiled.params
+            assert sql.startswith("UPDATE memories SET embedding_status=")
+            assert sql.endswith("RETURNING memories.id")
+            assert "memories.user_id = %(user_id_1)s" in sql
+            assert "memories.deleted_at IS NULL" in sql
+            assert "memories.embedding_status IN (__[POSTCOMPILE_embedding_status_1])" in sql
+            # a stale processing row with no budget left stays the sweep's
+            assert "NOT (memories.embedding_status = %(embedding_status_2)s" in sql
+            assert "memories.embedding_retry_count >=" in sql
+            assert "ORDER BY memories.id" in sql
+            assert "::INTEGER FOR NO KEY UPDATE" in sql
+            assert "resource_id" not in sql  # indexer rows are rebuilt too
+            assert params["user_id_1"] == "u-1"
+            assert list(params["embedding_status_1"]) == ["success", "processing"]
+            assert params["embedding_status_2"] == "processing"
+            assert params["embedding_status"] == "pending"
+            assert 500 in params.values()
+            # the status only: updated_at and the pipeline's fields stay
+            assert set(stmt._values) == {stmt.table.c.embedding_status}
+            sqls.append((sql, params))
+        # the second batch starts after the first's last id
+        assert "memories.id >" not in sqls[0][0]
+        assert "memories.id > %(id_1)s" in sqls[1][0]
+        assert sqls[1][1]["id_1"] == first_ids[-1]
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_requeue(self):
+        from services.account_erasure_service import requeue_subject_embeddings
+
+        db, order = self._db([[]])
+
+        assert await requeue_subject_embeddings(db, "u-1") == 0
+        assert len(order) == 3  # lock timeout, the UPDATE, its commit
+        db.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_rollback_does_not_escape(self):
+        svc = _service()
+        svc.db.rollback = AsyncMock(side_effect=ConnectionError("gone"))
+        request_id = uuid4()
+
+        with (
+            patch(
+                "services.account_erasure_service.requeue_subject_embeddings",
+                new=AsyncMock(side_effect=ConnectionError("gone")),
+            ),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            await svc._requeue_after_vector_store_failure(
+                request_id, "u-1", {"attempts": 1}, status=STATUS_CANCELLED
+            )
+
+        log.error.assert_called_once_with(
+            "erasure_embeddings_requeue_failed",
+            request_id=str(request_id),
+            error_class="ConnectionError",
+        )
