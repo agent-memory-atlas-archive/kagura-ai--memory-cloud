@@ -1110,8 +1110,9 @@ class AccountErasureService:
           a summary with ``postgres`` (written in the Postgres step's own
           transaction) means that step committed and the run was
           interrupted after it — ``failed`` with
-          ``INTERRUPTED_AFTER_POSTGRES_COMMIT``, the subject's Redis state
-          cleared best-effort, and the vector payloads of the memories its
+          ``INTERRUPTED_AFTER_POSTGRES_COMMIT``, the subject's points deleted
+          once more (step 3a, #2363) and its Redis state cleared, both
+          best-effort, and the vector payloads of the memories its
           restore put back are patched right after (#2302,
           ``_resync_interrupted_payloads``); without it nothing ran —
           ``complete`` with the ``user_row_already_absent`` note. Either way
@@ -1119,7 +1120,7 @@ class AccountErasureService:
           with ``postgres`` is closed that way even when a user row with its
           sub exists (#2302): the subject was deleted in that transaction,
           so the user row is an account registered again since — it is never
-          run against, and its Redis keys are kept.
+          run against, and its points and Redis keys are kept.
 
         - **Stale ``pending``** (``requested_at`` older than 1h + 5min
           grace): the Redis confirm token (TTL 1h) has expired and the
@@ -1304,14 +1305,17 @@ class AccountErasureService:
         becomes ``failed`` with ``INTERRUPTED_AFTER_POSTGRES_COMMIT`` (no
         completion time; ``memory_scrub_at`` stays in the summary), so
         ``finalized_erasure`` — the re-run, the erased-members set — treats
-        it as an erasure that ran. The subject's Redis state is cleared
-        best-effort here; the payload patch of restored memories is re-driven
-        by the caller right after this commit (#2302,
+        it as an erasure that ran. The subject's points are deleted once more
+        (step 3a, ``_delete_late_points``, #2363: the run may have died before
+        it) and its Redis state is cleared, both best-effort; the payload
+        patch of restored memories is re-driven by the caller right after
+        this commit (#2302,
         ``_resync_interrupted_payloads``); the ``account_erasure`` audit row
         and the completion email are not done. When ``user_row_exists`` (the
         sub was registered again after the Postgres commit, #2302), the same
-        close is written, but the Redis keys are the new account's: they are
-        kept, no ``redis`` key is added, and the log line is
+        close is written, but the points and the Redis keys are the new
+        account's: they are kept, no ``qdrant_after_commit`` or ``redis`` key
+        is added (#2362), and the log line is
         ``erasure_sweep_subject_reregistered``. Without ``postgres`` nothing was erased (the row was removed
         some other way, or the run was interrupted before the Postgres
         commit on a version that wrote the summary only after it): the
@@ -1348,6 +1352,11 @@ class AccountErasureService:
         values = pseudonymized_request_values(user_id, request.initiated_by)
         if ran:
             if not user_row_exists:
+                # step 3a once more (#2363): the run may have died between the
+                # Postgres commit and its late delete, leaving a point written
+                # under the raw sub after step 1. Never raises. Not when the
+                # sub was registered again: its points are the new account's.
+                summary.update(await self._delete_late_points(user_id, request_id))
                 redis = await self._clear_redis_best_effort(request_id, user_id)
                 if redis is not None:
                     summary["redis"] = redis
