@@ -12,6 +12,7 @@ import models.agent  # noqa: F401  # Issue #1274: Agent Registry (RFC-0002 P0-1)
 import models.agent_state  # noqa: F401  # Issue #889: agent session-state lane
 import models.analysis  # noqa: F401
 import models.beta_invite  # noqa: F401  # Issue #1581: closed-beta invite links
+import models.erasure  # noqa: F401  # Vector cleanup jobs reference erasure_requests.
 import models.file_objects  # noqa: F401  # Issue #485: file storage
 import models.llm_call_log  # noqa: F401  # Issue #474: comprehensive call ledger
 import models.llm_pricing  # noqa: F401
@@ -22,6 +23,7 @@ import models.retrieval_feedback  # noqa: F401  # Issue #888: retrieval feedback
 import models.secrets  # noqa: F401  # Issue #1128: zero-knowledge secret store
 import models.sleep  # noqa: F401
 import models.terms  # noqa: F401  # Issue #1665: terms-of-service acceptance history
+import models.vector_erasure  # noqa: F401
 import models.worker_app  # noqa: F401  # Issue #1315: worker app identities
 from models.config import ContextSearchConfig
 from models.file_objects import FileObject, WorkspaceStorageUsage

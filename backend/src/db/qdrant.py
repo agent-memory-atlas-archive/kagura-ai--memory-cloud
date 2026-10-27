@@ -29,6 +29,7 @@ from qdrant_client.models import (
     GeoPoint,
     GeoPolygon,
     GeoRadius,
+    HasIdCondition,
     IsEmptyCondition,
     MatchAny,
     MatchValue,
@@ -2501,7 +2502,9 @@ async def scroll_point_refs(
             return
 
 
-async def delete_user_points(user_id: str) -> dict[str, int]:
+async def delete_user_points(
+    user_id: str, *, protected_point_ids: list[str] | None = None
+) -> dict[str, int]:
     """Delete every point authored by a user across all kagura_memories collections.
 
     Issue #360 (GDPR Art.17 / APPI 第22条): the user-scoped variant of
@@ -2541,7 +2544,7 @@ async def delete_user_points(user_id: str) -> dict[str, int]:
         # #1336: the Lance backend now implements the cross-collection GDPR
         # erasure — the preview NotImplementedError left erased users'
         # vectors at rest on self-hosted Lite installs.
-        return await _store.delete_user_points(user_id)
+        return await _store.delete_user_points(user_id, protected_point_ids=protected_point_ids)
 
     # #2375: SDK errors can echo the raw user filter; emit only a digest/type.
     user_id_hash = sha256_hex(user_id)
@@ -2563,7 +2566,10 @@ async def delete_user_points(user_id: str) -> dict[str, int]:
         )
         raise QdrantError("Failed to list collections for user erasure") from None
 
-    user_filter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+    user_filter = Filter(
+        must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))],
+        must_not=[HasIdCondition(has_id=protected_point_ids)] if protected_point_ids else None,
+    )
 
     for collection_name in target_collections:
         try:
@@ -2673,3 +2679,104 @@ async def _admin_scroll_context_points(
         if next_offset is None:
             break
         offset = next_offset
+
+
+async def erasure_scope_points(
+    collection: str, memory_id: UUID, point_id: UUID
+) -> list[tuple[str, str]]:
+    """Read only identity fields for one captured erasure scope, never content."""
+    store = _active_store()
+    if store is not None:
+        return await store.erasure_scope_points(collection, [str(memory_id), str(point_id)])
+    client = get_qdrant_client()
+    scope = Filter(
+        should=[
+            HasIdCondition(has_id=[str(memory_id), str(point_id)]),
+            FieldCondition(key=CHUNK_OF_FIELD, match=MatchValue(value=str(memory_id))),
+        ]
+    )
+    result: list[tuple[str, str]] = []
+    offset = None
+    while True:
+        points, offset = await client.scroll(
+            collection_name=collection,
+            scroll_filter=scope,
+            offset=offset,
+            limit=256,
+            with_payload=["user_id"],
+            with_vectors=False,
+        )
+        result.extend(
+            (str(point.id), point.payload["user_id"])
+            for point in points
+            if point.payload and isinstance(point.payload.get("user_id"), str)
+        )
+        if offset is None:
+            return result
+
+
+async def erase_point_author(
+    collection: str, point_id: str, expected_author: str, *, replacement: str | None = None
+) -> None:
+    """CAS by point UUID AND observed author: never overwrite another writer."""
+    try:
+        store = _active_store()
+        if store is not None:
+            await store.erase_point_author(
+                collection, point_id, expected_author, replacement=replacement
+            )
+            return
+        client = get_qdrant_client()
+        selector = Filter(
+            must=[
+                HasIdCondition(has_id=[point_id]),
+                FieldCondition(key="user_id", match=MatchValue(value=expected_author)),
+            ]
+        )
+        if replacement is None:
+            await client.delete(collection_name=collection, points_selector=selector, wait=True)
+        else:
+            await client.set_payload(
+                collection_name=collection,
+                payload={"user_id": replacement},
+                points=selector,
+                wait=True,
+            )
+    except Exception as exc:
+        raise QdrantError(f"Vector erasure author update failed ({type(exc).__name__})") from exc
+
+
+async def erasure_point_identities(
+    collection: str,
+) -> AsyncIterator[list[tuple[str, str, str | None, datetime | None]]]:
+    """Counts-first historical scan: UUIDs and authors only, no document text."""
+    store = _active_store()
+    if store is not None:
+        yield await store.erasure_point_identities(collection)
+        return
+    client = get_qdrant_client()
+    offset = None
+    while True:
+        points, offset = await client.scroll(
+            collection_name=collection,
+            offset=offset,
+            limit=512,
+            with_payload=["user_id", "memory_id", CHUNK_OF_FIELD, "created_at", "indexed_at"],
+            with_vectors=False,
+        )
+        batch = []
+        for point in points:
+            payload = point.payload or {}
+            author = payload.get("user_id")
+            if isinstance(author, str):
+                batch.append(
+                    (
+                        str(point.id),
+                        author,
+                        payload.get(CHUNK_OF_FIELD) or payload.get("memory_id"),
+                        _payload_datetime(payload.get("created_at") or payload.get("indexed_at")),
+                    )
+                )
+        yield batch
+        if offset is None:
+            return

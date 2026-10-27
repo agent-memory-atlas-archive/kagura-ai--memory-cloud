@@ -27,6 +27,7 @@ if str(_BACKEND_SRC) not in sys.path:
 from cli import (  # noqa: E402
     apply_rerank_defaults,
     backfill_deleted_context_files,
+    cleanup_erased_vectors,
     observed_at_backfill,
     reprocess_erasures,
     restore_context,
@@ -127,6 +128,7 @@ _CLI_ARGV = [
     ),
     (apply_rerank_defaults, ["--all"]),
     (sweep_orphan_vectors, []),
+    (cleanup_erased_vectors, []),
     (sweep_orphan_objects, []),
     (restore_context, ["00000000-0000-0000-0000-000000000002"]),
     (backfill_deleted_context_files, []),
@@ -171,7 +173,7 @@ def test_every_one_shot_cli_is_covered_by_the_logging_tests():
 
 @pytest.mark.parametrize(("module", "argv"), _CLI_ARGV)
 def test_parse_enforces_the_cli_log_level_policy(module, argv):
-    if module is sweep_orphan_objects:
+    if module in (cleanup_erased_vectors, sweep_orphan_objects):
         module._parse(argv)
         for level in ("DEBUG", "INFO", "WARNING", "ERROR", "TRACE"):
             with pytest.raises(SystemExit):
@@ -186,11 +188,10 @@ def test_parse_enforces_the_cli_log_level_policy(module, argv):
 @pytest.mark.parametrize(("module", "argv"), _CLI_ARGV)
 async def test_main_configures_logging_before_the_scaffold_runs(module, argv, monkeypatch):
     order: list[str] = []
-    counts_only = module is sweep_orphan_objects
-    # Inventory keys may include private names. This CLI deliberately fixes
-    # its level to ERROR rather than offering the other CLIs' verbose flag.
-    if counts_only:
-        monkeypatch.setattr(module, "get_blob_storage", lambda: object())
+    counts_only = module in (cleanup_erased_vectors, sweep_orphan_objects)
+    # Both repair CLIs fix ERROR because private identifiers can reach adapters.
+    if module is sweep_orphan_objects:
+        monkeypatch.setattr(module, "get_blob_storage", object)
     expected_level = "ERROR" if counts_only else "WARNING"
     command_argv = argv if counts_only else [*argv, "--log-level", expected_level]
     with (
