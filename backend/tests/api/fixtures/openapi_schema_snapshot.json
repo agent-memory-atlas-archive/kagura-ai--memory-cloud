@@ -22416,6 +22416,21 @@
             }
           },
           {
+            "in": "query",
+            "name": "add_tools",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
