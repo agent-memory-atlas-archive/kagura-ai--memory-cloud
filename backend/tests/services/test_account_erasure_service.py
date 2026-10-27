@@ -2024,6 +2024,81 @@ class TestBillingContractBlocksErasure:
         assert order.index("finalize") < order.index("erasure_admin_override_billing_contract")
 
 
+class TestLatePointsDeletedAfterTheCommit:
+    """#2363: a run may write a point under the raw sub between step 1 and the
+    Postgres step's row locks and stamp ``success``; the subject's points are
+    deleted once more right after the Postgres commit, best-effort."""
+
+    @pytest.mark.asyncio
+    async def test_the_second_delete_follows_the_postgres_commit(self):
+        svc = _service()
+        svc._list_owned_workspaces = AsyncMock(return_value=[])
+        _stub_execute_steps(svc)
+        order: list[Any] = []
+
+        async def _delete(user_id: str) -> dict[str, int]:
+            order.append(("delete_user_points", user_id))
+            return {"kagura_memories": len(order)}
+
+        erased = svc._delete_postgres.return_value
+        svc._delete_postgres.side_effect = lambda *a, **k: order.append("postgres") or erased
+        svc._clear_redis = AsyncMock(side_effect=lambda *a: order.append("redis") or {})
+
+        with patch(
+            "services.account_erasure_service.delete_user_points",
+            new=AsyncMock(side_effect=_delete),
+        ):
+            await svc._execute(_execute_request(self_service=False), _user())
+
+        assert order == [
+            ("delete_user_points", "u-1"),
+            "postgres",
+            ("delete_user_points", "u-1"),
+            "redis",
+        ]
+        summary = svc._finalize.await_args.args[1]
+        assert summary["qdrant"] == {"kagura_memories": 1}
+        assert summary["qdrant_after_commit"] == {"kagura_memories": 3}
+        assert "qdrant_after_commit_failed" not in summary
+
+    @pytest.mark.asyncio
+    async def test_a_failed_second_delete_does_not_fail_the_erasure(self):
+        from utils.exceptions import QdrantError
+
+        svc = _service()
+        svc._list_owned_workspaces = AsyncMock(return_value=[])
+        _stub_execute_steps(svc)
+        calls = iter([{"kagura_memories": 2}, QdrantError("store down for u-1")])
+
+        async def _delete(user_id: str) -> dict[str, int]:
+            result = next(calls)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        request = _execute_request(self_service=False)
+        with (
+            patch(
+                "services.account_erasure_service.delete_user_points",
+                new=AsyncMock(side_effect=_delete),
+            ),
+            patch("services.account_erasure_service.logger") as log,
+        ):
+            await svc._execute(request, _user())
+
+        svc._finalize.assert_awaited_once()
+        summary = svc._finalize.await_args.args[1]
+        assert summary["qdrant_after_commit_failed"] == "QdrantError"
+        assert "qdrant_after_commit" not in summary
+        (warning,) = [
+            c
+            for c in log.warning.call_args_list
+            if c.args[0] == "erasure_late_points_delete_failed"
+        ]
+        # no account id, no exception text (it names the account)
+        assert warning.kwargs == {"request_id": str(request.id), "error_class": "QdrantError"}
+
+
 class TestFailureAfterThePostgresCommit:
     """#2268: a failure after ``_delete_postgres`` committed cannot be
     retried (the user row is gone) and the subject is erased in Postgres: the
@@ -2825,6 +2900,48 @@ class TestTheSweepNeverRunsAgainstAReRegisteredSub:
         with pytest.raises(ValueError):
             await svc._close_request_without_user(request, user_row_exists=True)
         svc.db.execute.assert_not_awaited()
+
+
+class TestQueuedSurvivorsLeaveTheEmbeddingQueue:
+    """#2363: the Postgres step takes the subject's surviving memories that
+    are still queued for an embedding out of the queue, by the raw sub, before
+    the scrub pseudonymizes them, and records how many."""
+
+    @pytest.mark.asyncio
+    async def test_the_dequeue_runs_between_the_tombstones_and_the_scrub(self):
+        svc = _delete_postgres_service()
+        order: list[Any] = []
+
+        def _step(name: str, result: int) -> AsyncMock:
+            async def _run(user_id: str) -> int:
+                order.append((name, user_id))
+                return result
+
+            return AsyncMock(side_effect=_run)
+
+        svc._delete_subject_tombstones = _step("tombstones", 1)
+        svc._dequeue_surviving_embeddings = _step("dequeue", 5)
+        svc._scrub_surviving_memories = _step("scrub", 9)
+        captured: list[Any] = []
+        svc.db.execute = AsyncMock(
+            side_effect=lambda stmt, *a, **k: captured.append(stmt) or MagicMock(rowcount=0)
+        )
+        request_id = uuid4()
+
+        counts = (await svc._delete_postgres(_user(), request_id=request_id)).counts
+
+        assert order == [("tombstones", "u-1"), ("dequeue", "u-1"), ("scrub", "u-1")]
+        assert counts["memories_embedding_dequeued"] == 5
+        assert counts["memories_scrubbed"] == 9
+        # the count rides in the in-transaction ``postgres`` summary (#2286)
+        (summary,) = [
+            v
+            for stmt in captured
+            if str(getattr(stmt, "table", "")) == "erasure_requests"
+            for v in stmt.compile().params.values()
+            if isinstance(v, dict) and "postgres" in v
+        ]
+        assert summary["postgres"]["memories_embedding_dequeued"] == 5
 
 
 class TestThePostgresStepRecordsItselfOnTheRequest:
