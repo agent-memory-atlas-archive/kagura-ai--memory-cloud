@@ -8,7 +8,7 @@ already stores the endpoint URL, so that is where the choice lives::
 
     /mcp/w/{workspace_id}?profile=core
     /mcp/w/{workspace_id}?tools=remember,recall,reference
-    /mcp/w/{workspace_id}?add_tools=create_edge
+    /mcp/w/{workspace_id}?add_tools=list_edges
 
 ``tools`` is an explicit allowlist and wins over ``profile``. With neither, the
 list is the ``core`` profile (#1849 — ``DEFAULT_PROFILE``); ``profile=full`` is
@@ -47,6 +47,7 @@ CORE_TOOLS: tuple[str, ...] = (
     "load_pinned",
     "forget",
     "explore",
+    "create_edge",
     "get_context_info",
     "list_contexts",
     "list_tags",
