@@ -27,11 +27,13 @@ from services.edge_service import (
     VALID_EDGE_TYPES,
     accept_supersede_candidate_if_matching,
     create_declared_edge,
+    ensure_supersedes_owned,
 )
 from services.edge_service import (
     edge_to_dict as _edge_to_dict,
 )
 from services.identity_link_service import link_set_reads
+from utils.exceptions import AuthorizationError
 from utils.response_budget import BudgetArgumentError, parse_limit
 
 # #1743: list_edges pages each direction. A hub memory can hold thousands of
@@ -345,6 +347,12 @@ async def handle_create_edge(
                     edge=result.edge, operation="updated", previous=result.previous
                 )
             return _success_response(edge=result.edge, operation="created")
+        except AuthorizationError as e:
+            await db.rollback()
+            await _log_tool_usage(
+                db, user_id, "create_edge", start_time, 403, current_context_id, workspace_id
+            )
+            return _error_response("permission_denied", e.message)
         except _ContextNotFoundError as e:
             await db.rollback()
             return e.to_response()
@@ -432,12 +440,26 @@ async def handle_update_edge(
                     f"No edge found from {args.get('source_id')} to {args.get('target_id')}.",
                 )
 
+            effective_type = new_edge_type or existing.edge_type
+            if effective_type == EDGE_TYPE_SUPERSEDES:
+                await execute_with_timeout(
+                    ensure_supersedes_owned(
+                        db,
+                        user_id=user_id,
+                        source_id=source_uuid,
+                        target_id=target_uuid,
+                        workspace_id=ws_id,
+                        context_id=ctx_id,
+                    ),
+                    operation_name="update_edge",
+                )
+
             edge = await execute_with_timeout(
                 repo.create_or_update_edge(
                     user_id=user_id,
                     src_id=source_uuid,
                     dst_id=target_uuid,
-                    edge_type=new_edge_type or existing.edge_type,
+                    edge_type=effective_type,
                     weight=new_weight if new_weight is not None else existing.weight,
                     confidence=existing.confidence,
                     workspace_id=ws_id,
@@ -468,6 +490,12 @@ async def handle_update_edge(
             await db.commit()
 
             return _success_response(edge=_edge_to_dict(edge))
+        except AuthorizationError as e:
+            await db.rollback()
+            await _log_tool_usage(
+                db, user_id, "update_edge", start_time, 403, current_context_id, workspace_id
+            )
+            return _error_response("permission_denied", e.message)
         except _ContextNotFoundError as e:
             await db.rollback()
             return e.to_response()
