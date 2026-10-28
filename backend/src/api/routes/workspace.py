@@ -32,11 +32,13 @@ from api.routes.usage import (
     calculate_usage_status,
 )
 from auth.dependencies import get_user_from_api_key_or_session
+from auth.workspace_roles import reachable_context_ids
 from db.base import get_db
 from models.auth import Context, User, Workspace, WorkspaceMember
 from models.auth import UsageStats as UsageStatsModel
 from models.memory import Memory
 from services.memory_counts import count_live_memories
+from services.plan_seats import member_seat_suspended
 from utils.datetime import to_utc_iso, utcnow
 from utils.exceptions import AuthenticationError
 
@@ -51,7 +53,7 @@ router = APIRouter(prefix="/workspace", tags=["workspace"])
 
 
 class PrivateContextAggregation(BaseModel):
-    """Aggregated statistics for inaccessible private contexts.
+    """Aggregated statistics for contexts the caller cannot open.
 
     Single Collection Migration: storage_mb removed (memory count only).
     """
@@ -90,7 +92,9 @@ class WorkspaceStatsResponse(BaseModel):
     total_memories: int  # ALL contexts (for rate limit purposes)
     context_count: int  # ALL contexts
     contexts: list[ContextStats]  # Only accessible contexts
-    private_aggregation: PrivateContextAggregation | None = None  # Inaccessible private contexts
+    private_aggregation: PrivateContextAggregation | None = (
+        None  # Inaccessible contexts (privacy or reach)
+    )
     plan_name: str  # Issue #149: Plan tier display
     # #1496: totals across the contexts this caller can see. Additive with
     # defaults so an older frontend is unaffected.
@@ -137,10 +141,13 @@ async def get_workspace_stats(
         raise AuthenticationError("User ID not found in session")
 
     try:
-        # Issue #65: Single JOIN replaces 2 sequential queries
+        # The authenticated request selects the workspace. A scoped key must
+        # not inherit the account's dashboard selection (#963, #2325).
+        workspace_id = user.get("api_key_workspace_id") or user.get("current_workspace_id")
+        # Keep the stored selection for legacy principals without this field.
         user_workspace_result = await db.execute(
             select(User, Workspace)
-            .join(Workspace, User.current_workspace_id == Workspace.id)
+            .join(Workspace, Workspace.id == (workspace_id or User.current_workspace_id))
             .where(User.user_id == user_id)
         )
         row = user_workspace_result.one_or_none()
@@ -153,13 +160,11 @@ async def get_workspace_stats(
                 plan_name="free",
             )
 
-        db_user, workspace = row
+        _, workspace = row
 
         contexts_result = await db.execute(
             select(Context)
-            .where(
-                Context.workspace_id == db_user.current_workspace_id, Context.deleted_at.is_(None)
-            )
+            .where(Context.workspace_id == workspace.id, Context.deleted_at.is_(None))
             .order_by(Context.created_at)
         )
         contexts_list = contexts_result.scalars().all()
@@ -174,6 +179,26 @@ async def get_workspace_stats(
 
         # Issue #165: Check if user is workspace owner
         is_workspace_owner = workspace.owner_user_id == user_id
+
+        # #2325: the member context access list decides which contexts are
+        # listed by name, as on every context path; the others aggregate
+        # with the private ones below. No membership row reaches nothing.
+        member = (
+            await db.execute(
+                select(WorkspaceMember).where(
+                    WorkspaceMember.workspace_id == workspace.id,
+                    WorkspaceMember.user_id == user_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if is_workspace_owner:
+            reachable = None
+        elif member is None or await member_seat_suspended(db, workspace, member):
+            # As in the context resolvers, losing a plan seat removes reach
+            # (#1943). Keep quota totals, but expose no context names or health.
+            reachable = frozenset()
+        else:
+            reachable = reachable_context_ids(member.role, member.allowed_context_ids)
 
         # Query 2: Get memory stats for all contexts (privacy-aware)
         # Issue #204: Extracted to service layer for testability
@@ -225,7 +250,7 @@ async def get_workspace_stats(
                 is_workspace_owner  # Owner sees everything
                 or not context.is_private  # Shared contexts visible to all
                 or context.created_by == user_id  # Creator sees own private contexts
-            )
+            ) and (reachable is None or context.id in reachable)
 
             if is_accessible:
                 # Fetch creator's name (only for accessible contexts)
@@ -255,7 +280,7 @@ async def get_workspace_stats(
                 total_stalled += stalled
                 total_erased += erased_by_context.get(str(context.id), 0)
             else:
-                # Aggregate inaccessible private contexts
+                # Aggregate contexts excluded by privacy or reach
                 inaccessible_count += 1
                 inaccessible_memories += memory_count
 

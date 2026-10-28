@@ -18,6 +18,9 @@ from models.memory import Memory
 from services.capacity_lock import CapacityPolicy
 from utils.exceptions import NotFoundException
 
+pytestmark = pytest.mark.usefixtures("reach_everything")
+
+
 MOCK_USER = {"user_id": "test_user_123"}
 
 
@@ -82,8 +85,40 @@ class TestListMemoriesContextFilter:
     """Issue #431: context_id filter on GET /memory/list."""
 
     @pytest.mark.asyncio
+    async def test_no_context_id_applies_the_reach_filter_to_both_queries(self):
+        """Without context_id the rows are the caller's own in the contexts the
+        caller reaches (#2325): the membership read's predicate is in the count
+        and the page alike, and a workspace-scoped key passes its workspace."""
+        mem = _mock_memory_row()
+        mock_db = _db_with_rows(total=1, rows=[mem])
+        ws_id = uuid4()
+        reach = AsyncMock(return_value=Memory.workspace_id == ws_id)
+
+        with patch("api.routes.memory.reachable_memory_filter", reach):
+            response = await list_memories(
+                user={"user_id": "test_user_123", "api_key_workspace_id": ws_id},
+                db=mock_db,
+                scope=None,
+                type=None,
+                context_id=None,
+                q=None,
+                tags=None,
+                limit=50,
+                offset=0,
+            )
+
+        assert response.total == 1
+        reach.assert_awaited_once_with(mock_db, "test_user_123", key_workspace_id=ws_id)
+        count_sql, count_params = _where_sql_and_params(mock_db, 0)
+        page_sql, page_params = _where_sql_and_params(mock_db, 1)
+        assert "memories.workspace_id = :workspace_id_1" in count_sql
+        assert count_sql == page_sql and count_params == page_params
+        assert ws_id in count_params.values()
+
+    @pytest.mark.asyncio
     async def test_no_context_id_skips_permission_check(self):
-        """Without context_id, legacy behavior holds — no PermissionService call."""
+        """Without context_id the context resolver is not consulted (the reach
+        read is stubbed by the module fixture)."""
         mem = _mock_memory_row()
         mock_db = _db_with_rows(total=1, rows=[mem])
 

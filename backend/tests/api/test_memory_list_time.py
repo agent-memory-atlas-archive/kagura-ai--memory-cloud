@@ -16,6 +16,9 @@ from fastapi import HTTPException
 from api.routes.memory import list_memories, patch_memory
 from models.schemas import PatchMemoryRequest
 
+pytestmark = pytest.mark.usefixtures("reach_everything")
+
+
 MOCK_USER = {"user_id": "test_user_123"}
 
 

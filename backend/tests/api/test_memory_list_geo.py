@@ -15,6 +15,9 @@ import pytest
 
 from api.routes.memory import list_memories
 
+pytestmark = pytest.mark.usefixtures("reach_everything")
+
+
 MOCK_USER = {"user_id": "test_user_123"}
 
 
