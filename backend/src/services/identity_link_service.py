@@ -515,27 +515,17 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
     Returns:
         ``{"contexts_handed_over": n, "identity_links_removed": n}``.
     """
-    from auth.workspace_roles import WorkspaceRole, reaches_context
-    from models.auth import Context, WorkspaceMember
+    from models.auth import Context
     from models.memory import Memory
     from services.erasure_details import locked_ids
 
     await lock_identity_links(db)
-    link_rows = list(
-        (
-            await db.execute(
-                select(IdentityLink).where(IdentityLink.user_id.in_(linked_ids_subquery(user_id)))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    others = sorted(row.user_id for row in link_rows if row.user_id != user_id)
+    link_rows, others = await _link_set(db, user_id)
     handed_over: list[uuid.UUID] = []
     if others:
         # Every context the subject created, locked in id order before any
         # memory (#2278): the caller rewrites or deletes all of them next.
-        created = (
+        created = list(
             (
                 await db.execute(
                     select(Context)
@@ -547,56 +537,11 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
             .scalars()
             .all()
         )
-        contexts = [c for c in created if c.is_private and c.deleted_at is None]
-        for context in contexts:
-            authors = set(
-                (
-                    await db.execute(
-                        select(Memory.user_id)
-                        .where(
-                            Memory.context_id == context.id,
-                            Memory.user_id.in_(others),
-                            Memory.deleted_at.is_(None),
-                        )
-                        .distinct()
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if not authors:
-                continue
-            members = (
-                (
-                    await db.execute(
-                        select(WorkspaceMember).where(
-                            WorkspaceMember.workspace_id == context.workspace_id,
-                            WorkspaceMember.user_id.in_(authors),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
-            def rank(member: WorkspaceMember, context_id: uuid.UUID = context.id) -> int | None:
-                """0 for a workspace owner/admin, 1 for a member whose whitelist
-                names the context, None for an account that could not own it."""
-                if member.role in (WorkspaceRole.OWNER, WorkspaceRole.ADMIN):
-                    return 0
-                if member.role == WorkspaceRole.MEMBER and reaches_context(
-                    member.role, member.allowed_context_ids, context_id
-                ):
-                    return 1
-                return None
-
-            eligible = sorted(
-                ((rank(m), m.user_id) for m in members if rank(m) is not None),
-            )
-            if not eligible:
-                continue
-            context.created_by = eligible[0][1]
-            handed_over.append(context.id)
+        takeovers = await private_context_takeovers(db, created, others)
+        for context in created:
+            if context.id in takeovers:
+                context.created_by = takeovers[context.id]
+                handed_over.append(context.id)
         if handed_over:
             # One statement over every handed-over context, its rows locked in
             # id order (#2278), like every other multi-row memories write.
@@ -615,3 +560,96 @@ async def hand_over_private_contexts(db: AsyncSession, user_id: str) -> dict[str
 
     removed = await _remove_from_set(db, user_id, link_rows) if link_rows else 0
     return {"contexts_handed_over": len(handed_over), "identity_links_removed": removed}
+
+
+async def private_context_takeovers(
+    db: AsyncSession, contexts: list[Any], others: list[str]
+) -> dict[uuid.UUID, str]:
+    """Which of ``contexts`` (the ones the leaving account created) a linked
+    account in ``others`` takes over under the rule of
+    ``hand_over_private_contexts``, and who: ``{context_id: new_creator}``.
+    Only live private contexts qualify.
+    Read-only: ``hand_over_private_contexts`` applies it, and administrative
+    deletion reads it to tell what still needs a successor (#2417)."""
+    from auth.workspace_roles import WorkspaceRole, reaches_context
+    from models.auth import WorkspaceMember
+    from models.memory import Memory
+
+    takeovers: dict[uuid.UUID, str] = {}
+    if not others:
+        return takeovers
+    for context in contexts:
+        if not context.is_private or context.deleted_at is not None:
+            continue
+        authors = set(
+            (
+                await db.execute(
+                    select(Memory.user_id)
+                    .where(
+                        Memory.context_id == context.id,
+                        Memory.user_id.in_(others),
+                        Memory.deleted_at.is_(None),
+                    )
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not authors:
+            continue
+        members = (
+            (
+                await db.execute(
+                    select(WorkspaceMember).where(
+                        WorkspaceMember.workspace_id == context.workspace_id,
+                        WorkspaceMember.user_id.in_(authors),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        def rank(member: WorkspaceMember, context_id: uuid.UUID = context.id) -> int | None:
+            """0 for a workspace owner/admin, 1 for a member whose whitelist
+            names the context, None for an account that could not own it."""
+            if member.role in (WorkspaceRole.OWNER, WorkspaceRole.ADMIN):
+                return 0
+            if member.role == WorkspaceRole.MEMBER and reaches_context(
+                member.role, member.allowed_context_ids, context_id
+            ):
+                return 1
+            return None
+
+        eligible = sorted(
+            ((rank(m), m.user_id) for m in members if rank(m) is not None),
+        )
+        if eligible:
+            takeovers[context.id] = eligible[0][1]
+    return takeovers
+
+
+async def _link_set(db: AsyncSession, user_id: str) -> tuple[list[IdentityLink], list[str]]:
+    """The rows of ``user_id``'s link set and, sorted, the other accounts in it
+    — the one definition the hand-over and its prediction share."""
+    link_rows = list(
+        (
+            await db.execute(
+                select(IdentityLink).where(IdentityLink.user_id.in_(linked_ids_subquery(user_id)))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return link_rows, sorted(row.user_id for row in link_rows if row.user_id != user_id)
+
+
+async def predict_private_context_takeovers(
+    db: AsyncSession, user_id: str, contexts: list[Any]
+) -> dict[uuid.UUID, str]:
+    """What ``hand_over_private_contexts`` would do with ``contexts`` (the
+    subject's created contexts, locked by the caller), without writing. Call
+    it under ``lock_identity_links`` so the link set cannot change in between."""
+    _, others = await _link_set(db, user_id)
+    return await private_context_takeovers(db, contexts, others)

@@ -108,8 +108,10 @@ python -m src.cli.reset_password
 # Delete admin (for re-creation). When other users exist, a workspace the admin
 # owns that they are in needs --transfer-to (one of its members) to take it
 # over; without it the command lists them and stops. A workspace only the
-# admin is in is deleted with it (#2371). Surviving contexts pass to a linked
-# contributor or their workspace owner. Ownership notifications follow commit.
+# admin is in is deleted with it (#2371). Contexts the admin created pass to
+# their workspace owner, except a private one: a linked contributor who wrote
+# in it takes it over, and one nobody else wrote in is deleted (#2417).
+# Ownership notifications follow commit.
 # --workspace-transfer overrides --transfer-to for an individual workspace;
 # repeat it when different workspaces have different successors.
 # --yes skips the confirmation prompt.
